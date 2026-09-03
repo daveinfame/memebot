@@ -1,6 +1,5 @@
 /* ============================================================
-   MEMEBOT v2 — copy trading de memecoins (Solana)
-  ... (todo tu código original igual)
+   MEMEBOT v2 — copy trading de memecoins (Solana) + POSTGRES
    ============================================================ */
 
 import "dotenv/config";
@@ -9,19 +8,21 @@ import path from "node:path";
 import axios from "axios";
 import { Telegraf } from "telegraf";
 import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
+import pkg from "pg";
+const { Pool } = pkg;
 
 /* ================= configuración (.env) ================= */
 const HELIUS_API_KEY = (process.env.HELIUS_API_KEY || "").trim();
 const RPC_URL = HELIUS_API_KEY
- ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
+? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
   : "https://api.mainnet-beta.solana.com";
 
 const DEFAULT_TRADE_SOL = Number(process.env.TRADE_SOL || 0.1);
 const WALLETS_ENV = (process.env.WALLETS || "")
- .split(",")
- .map((s) => s.trim())
- .filter(Boolean)
- .map((s) => {
+.split(",")
+.map((s) => s.trim())
+.filter(Boolean)
+.map((s) => {
     const [addr, alias, sol] = s.split("=");
     const address = addr.trim();
     return {
@@ -45,6 +46,49 @@ const AUTO_USDC_ON = (process.env.AUTO_USDC || "true")!== "false";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const STATE_FILE = path.join(process.cwd(), "state.json");
 
+/* ================= POSTGRES (NUEVO - PERSISTENTE) ================= */
+let pool = null;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  });
+  console.log("🐘 DATABASE_URL detectado -> usando Postgres");
+} else {
+  console.log("⚠️ Sin DATABASE_URL -> usando state.json local");
+}
+
+async function initDB() {
+  if (!pool) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_state (
+        id INT PRIMARY KEY,
+        data JSONB NOT NULL
+      );
+    `);
+    const res = await pool.query("SELECT data FROM bot_state WHERE id = 1");
+    if (res.rows.length === 0) {
+      const initial = {
+        version: 2,
+        reserva: RESERVA_INICIAL,
+        usdc: 0,
+        startedAt: Date.now(),
+        positions: {},
+        wallets: {},
+        tgSubs: [],
+        customWallets: [],
+      };
+      await pool.query("INSERT INTO bot_state (id, data) VALUES (1, $1)", [initial]);
+      console.log("✅ Postgres conectado - tabla bot_state creada");
+    } else {
+      console.log("✅ Postgres conectado - tablas listas");
+    }
+  } catch (e) {
+    console.log(`❌ Error initDB: ${e.message}`);
+  }
+}
+
 /* ================= consola (color + timestamps) ================= */
 const C = {
   g: "\x1b[32m", r: "\x1b[31m", y: "\x1b[33m", c: "\x1b[36m",
@@ -60,16 +104,14 @@ const say = {
 };
 
 const BANNER = `
-${C.g}${C.b} ███╗ ███╗███████╗███╗ ███╗███████╗██████╗ ██████╗ ████████╗
+ ███╗ ███╗███████╗███╗ ███╗███████╗██████╗ ██████╗ ████████╗
  ████╗ ████║██╔════╝████╗ ████║██╔════╝██╔══██╗██╔═══██╗╚══██╔══╝
  ██╔████╔██║█████╗ ██╔████╔██║█████╗ ██████╔╝██║ ██║ ██║
- ██║╚██╔╝██║██╔══╝ ██║╚██╔╝██║██╔══╝ ██╔══██╗██║ ██║ ██║
+ ██║╚██╔╝██║██╔══╝ ██╔══██╗██║ ██║ ██║
  ██║ ╚═╝ ██║███████╗██║ ╚═╝ ██║███████╗██████╔╝╚██████╔╝ ██║
- ╚═╝ ╚═╝╚══════╝╚═╝ ╚═╝╚══════╝╚═════╝ ╚═════╝ ╚═╝${C.x}
- ${C.d}copy trading · solana · telegram + discord · paper trading${C.x}`;
-
-/* ================= estado persistente (paper) ================= */
-function loadState() {
+ copy trading + postgres`;
+/* ================= estado persistente (paper) - CON POSTGRES ================= */
+function loadStateFile() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -93,15 +135,32 @@ function loadState() {
     customWallets: [],
   };
 }
-let state = loadState();
 
-function saveState() {
+async function loadStateDB() {
+  if (!pool) return null;
+  try {
+    const res = await pool.query("SELECT data FROM bot_state WHERE id = 1");
+    if (res.rows.length > 0) return res.rows[0].data;
+  } catch (e) {
+    say.warn(`Postgres load falló, usando archivo: ${e.message}`);
+  }
+  return null;
+}
+
+async function saveState() {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    say.err(`no se pudo guardar state.json: ${e.message}`);
+  } catch {}
+  if (pool) {
+    try {
+      await pool.query("UPDATE bot_state SET data = $1 WHERE id = 1", [state]);
+    } catch (e) {
+      say.err(`no se pudo guardar en Postgres: ${e.message}`);
+    }
   }
 }
+
+let state = loadStateFile();
 
 function getAllWallets() {
   return [...WALLETS_ENV,...(state.customWallets || [])];
@@ -267,7 +326,7 @@ async function notify({ title, lines, color, hash }) {
   say.trade(`${title} ${C.d}${lines.map((l) => l.replace(/<[^>]+>/g, "")).join(" · ")}${C.x}`);
   if (tgBot) {
     const text = [`<b>${title}</b>`,...lines, hash? `🔗 <a href="${solscan(hash)}">ver en Solscan</a>` : null]
-     .filter(Boolean).join("\n");
+    .filter(Boolean).join("\n");
     const targets = [...new Set([...state.tgSubs,...(TELEGRAM_CHAT_ID? [TELEGRAM_CHAT_ID] : [])])];
     for (const chat of targets) {
       try {
@@ -281,10 +340,10 @@ async function notify({ title, lines, color, hash }) {
   if (discordReady && DISCORD_CHANNEL_ID) {
     try {
       const embed = new EmbedBuilder()
-       .setTitle(title)
-       .setDescription(lines.join("\n"))
-       .setColor(color)
-       .setTimestamp();
+      .setTitle(title)
+      .setDescription(lines.join("\n"))
+      .setColor(color)
+      .setTimestamp();
       if (hash) embed.setURL(solscan(hash));
       await discordClient.channels.cache.get(DISCORD_CHANNEL_ID)?.send({ embeds: [embed] });
     } catch {}
@@ -302,7 +361,7 @@ async function applyEvent(w, ev) {
   if (ev.type === "buy") {
     if (SNAPSHOT_ON && ws.snapshotIgnored.includes(ev.mint)) {
       ws.stats.ignored++;
-      saveState();
+      await saveState();
       return notify({
         title: `🚫 R0 · ${w.alias} operó $${esc(symbol)} (ya lo tenía) → IGNORADO`,
         lines: [`Contrato: <code>${ev.mint}</code>`],
@@ -311,12 +370,12 @@ async function applyEvent(w, ev) {
     }
     if (ws.dusted.includes(ev.mint)) {
       ws.dusted = ws.dusted.filter((m) => m!== ev.mint);
-      saveState();
+      await saveState();
       say.info(`${w.alias} habilitó $${symbol}: compra válida pagando SOL (sale de cuarentena R0.5)`);
     }
     if (state.positions[ev.mint]) {
       ws.stats.ignored++;
-      saveState();
+      await saveState();
       return notify({
         title: `🚫 R2 · ${w.alias} promedió $${esc(symbol)} → IGNORADO (posición abierta)`,
         lines: [`El bot mantiene su entrada original (first-in).`],
@@ -343,7 +402,7 @@ async function applyEvent(w, ev) {
     };
     state.reserva -= size;
     ws.stats.copies++;
-    saveState();
+    await saveState();
     return notify({
       title: `🟢 R1 · ${w.alias} COMPRÓ $${esc(symbol)} — BOT ENTRÓ`,
       lines: [
@@ -358,15 +417,15 @@ async function applyEvent(w, ev) {
   if (ev.type === "dust") {
     if (ANTI_DUST_ON &&!ws.dusted.includes(ev.mint)) ws.dusted.push(ev.mint);
     ws.stats.dust++;
-    saveState();
+    await saveState();
     say.info(`${C.y}R0.5 dust:${C.x} ${w.alias} recibió $${symbol} SIN pagar SOL → en cuarentena (${ev.mint})`);
     return;
   }
 
   if (ws.snapshotIgnored.includes(ev.mint) && ev.postBalance <= 0) {
     ws.snapshotIgnored = ws.snapshotIgnored.filter((m) => m!== ev.mint);
-    saveState();
-    say.info(`R0: ${w.alias} vendió 100% de $${symbol} → liberado de TOKENS_IGNORADOS`);
+    await saveState();
+    say.info(`R0: ${w.alias} vendió 100% de $${symbol} → liberado`);
   }
   const open = state.positions[ev.mint];
   if (!open) return;
@@ -380,28 +439,27 @@ async function applyEvent(w, ev) {
     state.reserva += open.amountSol;
     state.usdc += gain;
     ws.stats.usdcSecured += gain;
-    r5Line = `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b> → swap a USDC (<b>+${gain.toFixed(2)} USDC</b> asegurados)`;
+    r5Line = `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b> → USDC (<b>+${gain.toFixed(2)} USDC</b>)`;
   } else {
     state.reserva += open.amountSol + pnlSol;
     r5Line = pnlSol >= 0
-     ? `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b> (auto-USDC desactivado, queda en reserva)`
-      : `💸 R5 PÉRDIDA: <b>−${Math.abs(pnlSol).toFixed(4)} SOL</b> (la reserva queda más pequeña)`;
+    ? `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b>`
+      : `💸 R5 PÉRDIDA: <b>−${Math.abs(pnlSol).toFixed(4)} SOL</b>`;
   }
   delete state.positions[ev.mint];
   ws.stats.pnlSol += pnlSol;
-  saveState();
+  await saveState();
   const win = pnlSol >= 0;
   return notify({
     title: `${win? "🟢" : "🔴"} R3 · ${w.alias} VENDIÓ $${esc(symbol)} — BOT CERRÓ 100%`,
     lines: [
       `PnL: <b>${win? "+" : "−"}${Math.abs(pnlPct).toFixed(1)}%</b> (${win? "+" : "−"}${Math.abs(pnlSol).toFixed(4)} SOL${usd(Math.abs(pnlSol), solUsd)})`,
       r5Line,
-      `Reserva: ${state.reserva.toFixed(4)} SOL · USDC asegurado: ${state.usdc.toFixed(2)}`,
+      `Reserva: ${state.reserva.toFixed(4)} SOL · USDC: ${state.usdc.toFixed(2)}`,
     ],
     color: win? GREEN : RED, hash: ev.txHash,
   });
 }
-
 /* ================= vigilancia ================= */
 const seenSigs = new Set();
 async function pollWallet(w) {
@@ -414,10 +472,10 @@ async function pollWallet(w) {
     return;
   }
   const fresh = (sigs?? [])
-   .filter((s) =>!s.err &&!seenSigs.has(s.signature))
-   .filter((s) => (s.blockTime?? 0) * 1000 > ws.lastBlockTime)
-   .sort((a, b) => (a.blockTime?? 0) - (b.blockTime?? 0))
-   .slice(0, 10);
+ .filter((s) =>!s.err &&!seenSigs.has(s.signature))
+ .filter((s) => (s.blockTime?? 0) * 1000 > ws.lastBlockTime)
+ .sort((a, b) => (a.blockTime?? 0) - (b.blockTime?? 0))
+ .slice(0, 10);
   for (const s of fresh) {
     seenSigs.add(s.signature);
     let tx = null;
@@ -462,7 +520,7 @@ async function snapshotWallet(w) {
     }
     ws.snapshotIgnored = mints;
     ws.lastBlockTime = Date.now();
-    saveState();
+    await saveState();
     say.ok(`R0 snapshot de ${w.alias}: ${mints.length} token(s) en TOKENS_IGNORADOS`);
   } catch (e) {
     ws.lastBlockTime = Date.now();
@@ -486,13 +544,14 @@ function startTelegram() {
   }
   tgBot = new Telegraf(TELEGRAM_TOKEN);
 
-  tgBot.command("start", (ctx) => {
+  tgBot.command("start", async (ctx) => {
     if (!state.tgSubs.includes(ctx.chat.id)) {
       state.tgSubs.push(ctx.chat.id);
-      saveState();
+      await saveState();
     }
+    const dbStatus = pool? "PostgreSQL Connected ✅" : "Local file";
     ctx.reply(
-      "🟢 <b>MEMEBOT conectado</b>\nEste chat recibirá las señales.\n\n/estado · /pos · /wallets\n/add DIRECCION ALIAS 0.25\n/remove ALIAS o DIRECCION",
+      `🟢 <b>MEMEBOT conectado</b> - DB: ${dbStatus}\nEste chat recibirá las señales.\n\n/estado · /pos · /wallets\n/add DIRECCION ALIAS 0.25\n/remove ALIAS o DIRECCION`,
       { parse_mode: "HTML" },
     );
     say.ok(`Telegram: chat ${ctx.chat.id} suscrito`);
@@ -505,7 +564,6 @@ function startTelegram() {
     ),
   );
 
-  // NUEVO: /add
   tgBot.command("add", async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const address = parts[1];
@@ -521,14 +579,13 @@ function startTelegram() {
 
     const newWallet = { address, alias, tradeSol: sol > 0? sol : DEFAULT_TRADE_SOL };
     state.customWallets.push(newWallet);
-    saveState();
+    await saveState();
     await snapshotWallet(newWallet);
-    ctx.reply(`✅ Agregada: <b>${esc(alias)}</b>\n<code>${address}</code>\nTrade: ${newWallet.tradeSol} SOL`, { parse_mode: "HTML" });
+    ctx.reply(`✅ Agregada: <b>${esc(alias)}</b>\n<code>${address}</code>\nTrade: ${newWallet.tradeSol} SOL\n💾 Guardado en Postgres`, { parse_mode: "HTML" });
     say.ok(`Wallet agregada por Telegram: ${alias} (${address})`);
   });
 
-  // NUEVO: /remove
-  tgBot.command("remove", (ctx) => {
+  tgBot.command("remove", async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const target = parts[1];
     if (!target) return ctx.reply("Uso: /remove ALIAS o DIRECCION");
@@ -536,20 +593,20 @@ function startTelegram() {
     const before = state.customWallets.length;
     state.customWallets = state.customWallets.filter(w => w.address!== target && w.alias!== target);
 
-    // También permitir borrar de las ENV (solo de estado visual)
     if (before === state.customWallets.length) {
       return ctx.reply(`No encontré ${target} en las agregadas por Telegram. Las de Railway (WALLETS) se borran desde Railway.`);
     }
-    saveState();
-    ctx.reply(`🗑️ Eliminada: ${esc(target)}`);
+    await saveState();
+    ctx.reply(`🗑️ Eliminada: ${esc(target)} - guardado en Postgres`);
   });
 
   tgBot.command("estado", async (ctx) => {
     const solUsd = await getSolUsd();
     const open = Object.values(state.positions);
     const invested = open.reduce((a, p) => a + p.amountSol, 0);
+    const dbInfo = pool? "🐘 Postgres" : "📁 Archivo local";
     ctx.reply(
-      `<b>📊 ESTADO (paper)</b>\n` +
+      `<b>📊 ESTADO (paper) - ${dbInfo}</b>\n` +
       `Reserva: <b>${state.reserva.toFixed(4)} SOL</b>${usd(state.reserva, solUsd)}\n` +
       `Invertido: ${invested.toFixed(4)} SOL en ${open.length} posición(es)\n` +
       `USDC asegurado (R5): <b>${state.usdc.toFixed(2)}</b>\n` +
@@ -572,26 +629,26 @@ function startTelegram() {
     ctx.reply(
       all.map((w) => {
         const st = state.wallets[w.address]?.stats?? { copies: 0, ignored: 0, pnlSol: 0 };
-        const origin = WALLETS_ENV.some(x=>x.address===w.address)? "Railway" : "Telegram";
+        const origin = WALLETS_ENV.some(x=>x.address===w.address)? "Railway" : "Telegram/Postgres";
         return `• <b>${esc(w.alias)}</b> [${origin}] — ${w.tradeSol} SOL/trade · ${st.copies} copias · PnL ${st.pnlSol.toFixed(4)}`;
       }).join("\n") || "Sin wallets.",
       { parse_mode: "HTML" },
     );
   });
 
-  tgBot.command("reset", (ctx) => {
+  tgBot.command("reset", async (ctx) => {
     state.reserva = RESERVA_INICIAL;
     state.usdc = 0;
     state.positions = {};
     for (const a of Object.keys(state.wallets)) {
       state.wallets[a].stats = { copies: 0, ignored: 0, dust: 0, pnlSol: 0, usdcSecured: 0 };
     }
-    saveState();
-    ctx.reply(`🔄 Tesorería reiniciada: ${RESERVA_INICIAL} SOL paper.`);
+    await saveState();
+    ctx.reply(`🔄 Tesorería reiniciada: ${RESERVA_INICIAL} SOL paper. Guardado en Postgres`);
     say.warn("tesorería paper reiniciada por comando /reset");
   });
 
-  tgBot.launch().then(() => say.ok("Telegram en vivo (long-polling) con /add y /remove"));
+  tgBot.launch().then(() => say.ok("Telegram en vivo + Postgres ✅"));
   tgBot.catch((e) => say.err(`telegram: ${e.message}`));
 }
 
@@ -613,20 +670,29 @@ function startDiscord() {
 
 /* ================= arranque ================= */
 console.log(BANNER);
-say.info(`RPC: ${HELIUS_API_KEY? "Helius privado" : "público"}`);
-say.info(`Wallets ENV: ${WALLETS_ENV.length} + Telegram: ${state.customWallets.length} = Total ${getAllWallets().length}`);
-say.info(`Tesorería paper: ${state.reserva.toFixed(4)} SOL · USDC ${state.usdc.toFixed(2)}`);
-
-if (!getAllWallets().length) {
-  say.err("SIN WALLETS — usa /add en Telegram o define WALLETS en Railway");
-} else {
-  say.ok(`ESCUCHANDO ${getAllWallets().length} WALLET(S): [${getAllWallets().map((w) => w.alias).join(", ")}]`);
-}
-
-startTelegram();
-startDiscord();
 
 const boot = async () => {
+  await initDB();
+  if (pool) {
+    const dbState = await loadStateDB();
+    if (dbState) {
+      state = dbState;
+      say.ok(`DB: PostgreSQL Connected ✅ - Estado cargado desde Postgres (${state.customWallets.length} wallets)`);
+    }
+  }
+  say.info(`RPC: ${HELIUS_API_KEY? "Helius privado" : "público"}`);
+  say.info(`Wallets ENV: ${WALLETS_ENV.length} + Telegram: ${state.customWallets.length} = Total ${getAllWallets().length}`);
+  say.info(`Tesorería paper: ${state.reserva.toFixed(4)} SOL · USDC ${state.usdc.toFixed(2)}`);
+
+  if (!getAllWallets().length) {
+    say.err("SIN WALLETS — usa /add en Telegram o define WALLETS en Railway");
+  } else {
+    say.ok(`ESCUCHANDO ${getAllWallets().length} WALLET(S): [${getAllWallets().map((w) => w.alias).join(", ")}]`);
+  }
+
+  startTelegram();
+  startDiscord();
+
   for (const w of getAllWallets()) await snapshotWallet(w);
   say.ok(`vigilancia activa — /add DIRECCION ALIAS 0.25 para agregar más`);
   setInterval(() => {
@@ -635,11 +701,12 @@ const boot = async () => {
 };
 boot();
 
-const shutdown = () => {
+const shutdown = async () => {
   say.info("guardando estado…");
-  saveState();
+  await saveState();
   try { tgBot?.stop(); } catch {}
   try { discordClient?.destroy(); } catch {}
+  try { await pool?.end(); } catch {}
   process.exit(0);
 };
 process.once("SIGINT", shutdown);
