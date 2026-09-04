@@ -648,10 +648,14 @@ async function startTelegram() {
     say.warn("tesorería paper reiniciada por comando /reset");
   });
 
+    // FIX 409 - doble limpieza
+ try { await tgBot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch {}
   try {
-    await tgBot.telegram.deleteWebhook({ drop_pending_updates: true });
+    const t = process.env.BOT_TOKEN;
+if (t) await axios.get('https://api.telegram.org/bot' + t + '/deleteWebhook?drop_pending_updates=true');
     say.ok("Webhook limpiado - fix 409");
   } catch {}
+  await new Promise(r => setTimeout(r, 1500));
   tgBot.launch({ dropPendingUpdates: true }).then(() => say.ok("Telegram en vivo + Postgres ✅"));
   tgBot.catch((e) => say.err(`telegram: ${e.message}`));
 }
