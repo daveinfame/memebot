@@ -53,7 +53,7 @@ function getAllWallets() { return [...WALLETS_ENV,...(state.customWallets || [])
 function getWalletsByChain(chain) { return getAllWallets().filter(w => (w.chain||"solana").toLowerCase() === chain.toLowerCase()); }
 function walletState(addr, chain="solana") { const key = `${chain}:${addr.toLowerCase()}`; if (!state.wallets[key]) { state.wallets[key] = { lastBlockTime: 0, lastTxHash: null, snapshotIgnored: [], dusted: [], stats: { copies: 0, ignored: 0, dust: 0, pnlSol: 0, usdcSecured: 0 } }; } return state.wallets[key]; }
 const http = axios.create({ timeout: 15000 });
-// === v3.4 PRECIO REAL EVM + TOKEN-TRANSFERS ===
+// === v3.4.1 FIX 403 ROBINHOOD - USA RPC DIRECTO, NO BLOCKSCOUT ===
 const dexCache = new Map();
 async function getDexPrice(tokenAddress){
   const key = tokenAddress.toLowerCase();
@@ -68,17 +68,7 @@ async function getDexPrice(tokenAddress){
   }catch(e){}
   return null;
 }
-async function getEvmTokenFromTx(chain, txHash, wallet){
-  try{
-    let url="";
-    if(chain==="base") url=`https://base.blockscout.com/api/v2/transactions/${txHash}/token-transfers`;
-    else if(chain==="bsc") url=`https://www.bscscan.com/api/v2/transactions/${txHash}/token-transfers`;
-    else if(chain==="robinhood") url=`https://robinhoodchain.blockscout.com/api/v2/transactions/${txHash}/token-transfers`;
-    else if(chain==="hyperevm"||chain==="hyperliquid") url=`https://www.hyperevmscan.io/api/v2/transactions/${txHash}/token-transfers`;
-    if(url){ const {data}=await http.get(url,{timeout:8000}); const t=data?.items?.[0]||data?.result?.[0]; if(t?.token?.address) return {address:t.token.address,symbol:t.token.symbol}; if(t?.contractAddress) return {address:t.contractAddress,symbol:t.tokenSymbol}; }
-  }catch(e){}
-  return null;
-}
+async function getEvmTokenFromTx(chain, txHash, wallet){ return null; }
 async function rpc(method, params) { const { data } = await http.post(RPC_URL, { jsonrpc: "2.0", id: 1, method, params }); if (data.error) throw new Error(data.error.message?? "RPC error"); return data.result; }
 const tickerCache = new Map();
 async function getTicker(mint) { if (tickerCache.has(mint)) return tickerCache.get(mint); if (HELIUS_API_KEY) { try { const asset = await rpc("getAsset", { id: mint }); const sym = asset?.content?.metadata?.symbol; if (typeof sym === "string" && sym.trim()) { tickerCache.set(mint, sym.trim()); return sym.trim(); } } catch {} } try { const { data } = await http.get(`https://tokens.jup.ag/token/${mint}`); if (data && typeof data.symbol === "string" && data.symbol.trim()) { tickerCache.set(mint, data.symbol.trim()); return data.symbol.trim(); } } catch {} tickerCache.set(mint, "UNKNOWN"); return "UNKNOWN"; }
@@ -99,55 +89,57 @@ async function notify({ title, lines, color, hash, chain = "solana" }) { const e
 const GREEN = 0x00ff41, RED = 0xff4d4d, YELLOW = 0xffd93d, CYAN = 0x5fd9f2;
 async function applyEvent(w, ev) { const ws = walletState(w.address, "solana"); const solUsd = await getSolUsd(); const symbol = await getTicker(ev.mint); if (ev.type === "buy") { if (SNAPSHOT_ON && ws.snapshotIgnored.includes(ev.mint)) { ws.stats.ignored++; await saveState(); return notify({ title: `🚫 R0 · ${w.alias} operó $${esc(symbol)} (ya lo tenía) → IGNORADO`, lines: [`Contrato: <code>${ev.mint}</code>`], color: YELLOW, hash: ev.txHash, chain: "solana" }); } if (ws.dusted.includes(ev.mint)) { ws.dusted = ws.dusted.filter((m) => m!== ev.mint); await saveState(); say.info(`${w.alias} habilitó $${symbol}`); } if (state.positions[ev.mint]) { ws.stats.ignored++; await saveState(); return notify({ title: `🚫 R2 · ${w.alias} promedió $${esc(symbol)} → IGNORADO`, lines: [`El bot mantiene su entrada original.`], color: YELLOW, hash: ev.txHash, chain: "solana" }); } const size = Math.min(Number(w.tradeAmount), ev.solAmount); if (state.reserva < size) { return notify({ title: `⚠️ R1 · RESERVA BAJA — no se copió $${esc(symbol)}`, lines: [`${w.alias} compró ${ev.solAmount.toFixed(4)} SOL${usd(ev.solAmount, solUsd)}`, `Reserva: ${state.reserva.toFixed(4)} SOL`], color: RED, hash: ev.txHash, chain: "solana" }); } const entryPrice = ev.solAmount / ev.tokenAmount; state.positions[ev.mint] = { wallet: w.address, alias: w.alias, symbol, chain: "solana", entryPrice, amountSol: size, tokenAmount: size / entryPrice, openedAt: Date.now() }; state.reserva -= size; ws.stats.copies++; await saveState(); return notify({ title: `🟢 R1 · ${w.alias} COMPRÓ $${esc(symbol)} — BOT ENTRÓ [SOL]`, lines: [`${w.alias} pagó: <b>${ev.solAmount.toFixed(4)} SOL</b>${usd(ev.solAmount, solUsd)}`, `🤖 Bot: <b>${size.toFixed(4)} SOL</b> @ ${entryPrice.toExponential(3)}`, `Contrato: <code>${ev.mint}</code>`], color: GREEN, hash: ev.txHash, chain: "solana" }); } if (ev.type === "dust") { if (ANTI_DUST_ON &&!ws.dusted.includes(ev.mint)) ws.dusted.push(ev.mint); ws.stats.dust++; await saveState(); return; } if (ws.snapshotIgnored.includes(ev.mint) && ev.postBalance <= 0) { ws.snapshotIgnored = ws.snapshotIgnored.filter((m) => m!== ev.mint); await saveState(); } const open = state.positions[ev.mint]; if (!open) return; const exitPrice = ev.tokenAmount > 0? ev.solAmount / ev.tokenAmount : open.entryPrice; const proceeds = open.amountSol * (exitPrice / open.entryPrice); const pnlSol = proceeds - open.amountSol; const pnlPct = (exitPrice / open.entryPrice - 1) * 100; let r5Line; if (pnlSol > 0 && AUTO_USDC_ON) { const gain = pnlSol * (solUsd?? 0); state.reserva += open.amountSol; state.usdc += gain; ws.stats.usdcSecured += gain; r5Line = `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b>`; } else { state.reserva += open.amountSol + pnlSol; r5Line = pnlSol >= 0? `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b>` : `💸 R5 PÉRDIDA: <b>−${Math.abs(pnlSol).toFixed(4)} SOL</b>`; } delete state.positions[ev.mint]; ws.stats.pnlSol += pnlSol; if(!state.pnl.solana) state.pnl.solana={pnlSol:0,wins:0,losses:0,trades:0,usdc:0}; state.pnl.solana.pnlSol+=pnlSol; state.pnl.solana.trades++; if(pnlSol>=0) state.pnl.solana.wins++; else state.pnl.solana.losses++; if(pnlSol>0) state.pnl.solana.usdc+= pnlSol*(solUsd||0); const wKey = `${w.alias}|solana`; if(!state.byWallet[wKey]) state.byWallet[wKey]={alias:w.alias, chain:"solana", pnl:0, wins:0, losses:0, trades:0}; state.byWallet[wKey].pnl+=pnlSol; state.byWallet[wKey].trades++; if(pnlSol>=0) state.byWallet[wKey].wins++; else state.byWallet[wKey].losses++; await saveState(); const win = pnlSol >= 0; return notify({ title: `${win? "🟢" : "🔴"} R3 · ${w.alias} VENDIÓ $${esc(symbol)} — BOT CERRÓ`, lines: [`PnL: <b>${win? "+" : "−"}${Math.abs(pnlPct).toFixed(1)}%</b>`, r5Line, `Reserva: ${state.reserva.toFixed(4)} SOL`], color: win? GREEN : RED, hash: ev.txHash, chain: "solana" }); }
 
-// === v3.4 FIX TOTAL EVM - TOKEN TRANSFERS ===
 const seenEvmTx = new Set();
+const lastRobinhoodBlock = {};
+
 async function pollEvmWallet(w) {
   const chain = (w.chain || "base").toLowerCase();
   const ws = walletState(w.address, chain);
   try {
     let transfers = [];
-    // ENDPOINTS TOKEN-TRANSFERS - no necesitan API key, es lo que usa Pump
-    if (chain === "base") {
+
+    if (chain === "robinhood") {
+      // FIX 403: usar RPC directo, no Blockscout
+      try {
+        const client = clients.robinhood;
+        const currentBlock = await client.getBlockNumber();
+        const fromBlock = lastRobinhoodBlock[w.address] || (currentBlock - 5000n); // últimas 5000 bloques ~ 1h
+        const logs = await client.getLogs({
+          fromBlock,
+          toBlock: currentBlock,
+          events: [{ type: "event", name: "Transfer", inputs: [{ name: "from", type: "address", indexed: true }, { name: "to", type: "address", indexed: true }, { name: "value", type: "uint256" }] }],
+          args: {}
+        });
+        // Filtrar solo donde esta wallet es from o to
+        const myLogs = logs.filter(l => l.args.from?.toLowerCase()===w.address.toLowerCase() || l.args.to?.toLowerCase()===w.address.toLowerCase());
+        console.log(`[ROBINHOOD RPC] ${w.alias} bloques ${fromBlock}->${currentBlock} logs:${myLogs.length}`);
+        transfers = myLogs.map(l=>({ hash: l.transactionHash, timeStamp: Math.floor(Date.now()/1000), token: l.address, symbol: "TOKEN", from: l.args.from?.toLowerCase(), to: l.args.to?.toLowerCase(), isBuy: l.args.to?.toLowerCase()===w.address.toLowerCase() }));
+        lastRobinhoodBlock[w.address] = currentBlock;
+      } catch(e){ console.log(`[ROB RPC ERR] ${w.alias} ${e.message}`); }
+    }
+    else if (chain === "base") {
       try { const { data } = await http.get(`https://base.blockscout.com/api/v2/addresses/${w.address}/token-transfers?items_count=20`); if(data.items) transfers = data.items.map(it=>({ hash: it.transaction_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol, from: it.from?.hash?.toLowerCase(), to: it.to?.hash?.toLowerCase(), isBuy: it.to?.hash?.toLowerCase()===w.address.toLowerCase() })); } catch {}
-      if(!transfers.length){ try{ const {data}=await http.get(`https://api.basescan.org/api?module=account&action=tokentx&address=${w.address}&sort=desc`); if(data.result) transfers=data.result.slice(0,10).map(it=>({hash:it.hash,timeStamp:Number(it.timeStamp),token:it.contractAddress,symbol:it.tokenSymbol,from:it.from?.toLowerCase(),to:it.to?.toLowerCase(),isBuy:it.to?.toLowerCase()===w.address.toLowerCase()})); }catch{} }
     }
     else if (chain === "bsc") {
       try { const {data}=await http.get(`https://api.bscscan.com/api?module=account&action=tokentx&address=${w.address}&sort=desc`); if(data.result) transfers=data.result.slice(0,15).map(it=>({hash:it.hash,timeStamp:Number(it.timeStamp),token:it.contractAddress,symbol:it.tokenSymbol,from:it.from?.toLowerCase(),to:it.to?.toLowerCase(),isBuy:it.to?.toLowerCase()===w.address.toLowerCase()})); } catch {}
-    }
-    else if (chain === "robinhood") {
-      try {
-        const { data } = await http.get(`https://robinhoodchain.blockscout.com/api/v2/addresses/${w.address}/token-transfers?items_count=20`);
-        if(data.items) transfers = data.items.map(it=>({ hash: it.transaction_hash||it.tx_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol, from: it.from?.hash?.toLowerCase()||it.from_address_hash?.toLowerCase(), to: it.to?.hash?.toLowerCase()||it.to_address_hash?.toLowerCase(), isBuy: (it.to?.hash?.toLowerCase()||it.to_address_hash?.toLowerCase())===w.address.toLowerCase() }));
-        console.log(`[ROBINHOOD] ${w.alias} -> ${transfers.length} transfers`);
-      } catch(e){ console.log(`[ROB ERR] ${w.alias} ${e.message}`); }
     }
     else if (chain === "hyperevm" || chain === "hyperliquid") {
       try { const { data } = await http.get(`https://www.hyperevmscan.io/api/v2/addresses/${w.address}/token-transfers?items_count=20`); if(data.items) transfers = data.items.map(it=>({ hash: it.transaction_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol, from: it.from?.hash?.toLowerCase(), to: it.to?.hash?.toLowerCase(), isBuy: it.to?.hash?.toLowerCase()===w.address.toLowerCase() })); } catch {}
     }
 
-    // Ordenar de más viejo a más nuevo para respetar las de 7:34
     transfers = transfers.filter(t=>t.hash && t.token).sort((a,b)=>a.timeStamp-b.timeStamp);
-
     for (const tx of transfers) {
       const uniq = `${tx.hash}:${tx.token}:${tx.isBuy}`;
       if (seenEvmTx.has(uniq)) continue;
-      const tsTxMs = Number(tx.timeStamp||0)*1000;
-      // FIX: en el arranque permitimos 1h atrás para recuperar Sapphy 7:34 y Dior 7:34
-      const allowOld = Date.now() - ws.lastBlockTime > 60000; // si es primer poll después de reinicio
-      if (tsTxMs && tsTxMs <= ws.lastBlockTime &&!allowOld) continue;
-
       seenEvmTx.add(uniq);
-      ws.lastBlockTime = Math.max(ws.lastBlockTime, tsTxMs || Date.now());
-      ws.stats.copies++;
-
+      ws.lastBlockTime = Math.max(ws.lastBlockTime, Date.now());
       try{
         if(!state.evmPositions) state.evmPositions={};
         const tokenAddr = tx.token;
         const priceData = await getDexPrice(tokenAddr);
         const allKeys = Object.keys(state.evmPositions).filter(k=>k.startsWith(`${chain}:${w.address.toLowerCase()}:`));
         const openForToken = allKeys.find(k=> state.evmPositions[k].token?.toLowerCase()===tokenAddr.toLowerCase());
-
-        if(!tx.isBuy){ // VENTA
+        if(!tx.isBuy){
           if(!openForToken) continue;
           const openPos = state.evmPositions[openForToken];
           const entryPrice = openPos.entryPriceUsd||0;
@@ -160,8 +152,8 @@ async function pollEvmWallet(w) {
           state.pnl[chain].pnl+=pnlAmt; state.pnl[chain].trades++; if(pnlAmt>=0) state.pnl[chain].wins++; else state.pnl[chain].losses++;
           const wKey2=`${w.alias}|${chain}`; if(!state.byWallet[wKey2]) state.byWallet[wKey2]={alias:w.alias,chain,pnl:0,wins:0,losses:0,trades:0}; state.byWallet[wKey2].pnl+=pnlAmt; state.byWallet[wKey2].trades++; if(pnlAmt>=0) state.byWallet[wKey2].wins++; else state.byWallet[wKey2].losses++;
           await notify({ title: `${pnlAmt>=0?'🟢':'🔴'} [${chain.toUpperCase()}] ${w.alias} VENDIÓ $${esc(tx.symbol||openPos.symbol||'TOKEN')} — REAL`, lines: [`Token: <code>${tokenAddr.slice(0,10)}...</code>`, `Entrada: $${entryPrice?entryPrice.toFixed(6):'?.??'} → Salida: $${exitPrice?exitPrice.toFixed(6):'?.??'}`, `PnL: <b>${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}%</b>`, `Tx: <code>${tx.hash.slice(0,12)}…</code>`], color: pnlAmt>=0?GREEN:RED, hash: tx.hash, chain });
-        } else { // COMPRA - primera vez siempre es compra
-          if(openForToken) continue; // ya la tenemos
+        } else {
+          if(openForToken) continue;
           state.evmPositions[`${chain}:${w.address.toLowerCase()}:${tokenAddr.toLowerCase()}`]={wallet:w.address, alias:w.alias, chain, amount:w.tradeAmount, token: tokenAddr, symbol: tx.symbol||priceData?.symbol||"UNKNOWN", entryPriceUsd: priceData?.price||0, openedAt:Date.now(), txHash:tx.hash};
           await notify({ title: `🟢 [${chain.toUpperCase()}] ${w.alias} COMPRÓ $${esc(tx.symbol||priceData?.symbol||'TOKEN')} — BOT ENTRÓ`, lines: [`Token: <code>${tokenAddr.slice(0,12)}...</code>`, `Precio: $${priceData?.price?priceData.price.toFixed(8):'?.??'}`, `Monto: <b>${w.tradeAmount} ${chain==='bsc'?'BNB':'ETH'}</b>`, `Tx: <code>${tx.hash.slice(0,12)}…</code>`], color: CYAN, hash: tx.hash, chain });
         }
