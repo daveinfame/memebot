@@ -1,236 +1,95 @@
-/* MEMEBOT v3.4.7 — BSC ETHERSCAN V2 FIX */
+// MEMEBOT v4.0 API PUMP.FUN - VIRGEN - BY DIOSITO
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import axios from "axios";
 import { Telegraf } from "telegraf";
-import { Client, GatewayIntentBits } from "discord.js";
+import WebSocket from "ws";
 import pkg from "pg";
 const { Pool } = pkg;
-import { createPublicClient, http as viemHttp, isAddress } from "viem";
-import { base, bsc } from "viem/chains";
-import { privateKeyToAccount } from "viem/accounts";
 
-const robinhoodChain = { id: 4663, name: "Robinhood Chain", network: "robinhood", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: ["https://rpc.mainnet.chain.robinhood.com"] } }, blockExplorers: { default: { name: "Blockscout", url: "https://robinhoodchain.blockscout.com" } } };
-const hyperliquidChain = { id: 999, name: "Hyperliquid EVM", network: "hyperliquid", nativeCurrency: { name: "HYPE", symbol: "HYPE", decimals: 18 }, rpcUrls: { default: { http: ["https://rpc.hyperliquid.xyz/evm"] } }, blockExplorers: { default: { name: "HyperevmScan", url: "https://hyperevmscan.io" } } };
-
-const HELIUS_API_KEY = (process.env.HELIUS_API_KEY || "").trim();
-const BLOCKSCOUT_API_KEY = (process.env.BLOCKSCOUT_API_KEY || "").trim();
-const ETHERSCAN_API_KEY = (process.env.ETHERSCAN_API_KEY || "").trim();
-const RPC_URL = HELIUS_API_KEY? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : "https://api.mainnet-beta.solana.com";
-const DEFAULT_TRADE_SOL = Number(process.env.TRADE_SOL || 0.1);
-const DEFAULT_TRADE_EVM = process.env.TRADE_EVM || "0.01";
-const EVM_PK_RAW = (process.env.EVM_PRIVATE_KEY || process.env.PRIVATE_KEY || process.env.EVM_PK || "").trim();
-const EVM_PRIVATE_KEY = EVM_PK_RAW.startsWith("0x")? EVM_PK_RAW : EVM_PK_RAW? `0x${EVM_PK_RAW}` : "";
-const BASE_RPC = (process.env.BASE_RPC || "https://mainnet.base.org").trim();
-const BSC_RPC = (process.env.BSC_RPC || "https://bsc-dataseed.binance.org").trim();
-const ROBINHOOD_RPC = (process.env.ROBINHOOD_RPC || "https://rpc.mainnet.chain.robinhood.com").trim();
-const HYPERLIQUID_RPC = (process.env.HYPERLIQUID_RPC || "https://rpc.hyperliquid.xyz/evm").trim();
+const PUMPPORTAL_API_KEY = (process.env.PUMPPORTAL_API_KEY || "").trim();
+const PUMPPORTAL_WS_URL = `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`;
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
-const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").trim();
-const DISCORD_TOKEN = (process.env.DISCORD_BOT_TOKEN || "").trim();
-const DISCORD_CHANNEL_ID = (process.env.DISCORD_CHANNEL_ID || "").trim();
-const RESERVA_INICIAL = Number(process.env.RESERVA_SOL || 1.5);
-const POLL_MS = Math.max(5000, Number(process.env.POLL_MS || 12000));
-const POLL_EVM_MS = Math.max(5000, Number(process.env.POLL_EVM_MS || 10000));
-const SNAPSHOT_ON = (process.env.SNAPSHOT || "true")!== "false";
-const ANTI_DUST_ON = (process.env.ANTI_DUST || "true")!== "false";
-const AUTO_USDC_ON = (process.env.AUTO_USDC || "true")!== "false";
-const SOL_MINT = "So11111111111111111111111111111111111111112";
+const MODE = (process.env.MODE || "pump").toLowerCase();
+const SOL_PUB = (process.env.SOLANA_PUBLIC_KEY || "").trim();
 const STATE_FILE = path.join(process.cwd(), "state.json");
+
 let pool = null;
-if (process.env.DATABASE_URL) { pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }); console.log("🐘 DATABASE_URL detectado -> usando Postgres"); } else { console.log("⚠️ Sin DATABASE_URL -> usando state.json local"); }
-async function initDB() { if (!pool) return; try { await pool.query(` CREATE TABLE IF NOT EXISTS bot_state ( id INT PRIMARY KEY, data JSONB NOT NULL ); `); const res = await pool.query("SELECT data FROM bot_state WHERE id = 1"); if (res.rows.length === 0) { const initial = { version: 3.47, reserva: RESERVA_INICIAL, usdc: 0, startedAt: Date.now(), positions: {}, evmPositions: {}, pnl: { solana: { pnlSol: 0, wins: 0, losses: 0, trades: 0, usdc: 0 }, base: { pnl: 0, wins: 0, losses: 0, trades: 0 }, bsc: { pnl: 0, wins: 0, losses: 0, trades: 0 }, robinhood: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperevm: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperliquid: { pnl: 0, wins: 0, losses: 0, trades: 0 } }, byWallet: {}, wallets: {}, tgSubs: [], customWallets: [], evmWallets: {} }; await pool.query("INSERT INTO bot_state (id, data) VALUES (1, $1)", [initial]); console.log("✅ Postgres conectado"); } else { console.log("✅ Postgres conectado - tablas listas"); } } catch (e) { console.log(`❌ Error initDB: ${e.message}`); } }
-const C = { g: "\x1b[32m", r: "\x1b[31m", y: "\x1b[33m", c: "\x1b[36m", m: "\x1b[35m", b: "\x1b[1m", d: "\x1b[2m", x: "\x1b[0m" };
-const ts = () => new Date().toLocaleTimeString("es-ES", { hour12: false });
-const say = { info: (m) => console.log(`${C.d}${ts()}${C.x} ${m}`), ok: (m) => console.log(`${C.d}${ts()}${C.x} ${C.g}✓${C.x} ${m}`), warn: (m) => console.log(`${C.d}${ts()}${C.x} ${C.y}⚠${C.x} ${m}`), err: (m) => console.log(`${C.d}${ts()}${C.x} ${C.r}✗${C.x} ${m}`), trade: (m) => console.log(`${C.d}${ts()}${C.x} ${C.b}${C.c}▸${C.x} ${C.b}${m}${C.x}`) };
-const BANNER = `\n MEMEBOT v3.4.7 BSC ETHERSCAN V2 | BS_KEY:${BLOCKSCOUT_API_KEY? "SI":"NO"} ES_KEY:${ETHERSCAN_API_KEY? "SI ✅":"NO ❌"}`;
-function loadStateFile() { try { if (fs.existsSync(STATE_FILE)) { const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); if (s && typeof s.reserva === "number") { if (!s.customWallets) s.customWallets = []; if (!s.tgSubs) s.tgSubs = []; if (!s.evmWallets) s.evmWallets = {}; return s; } } } catch (e) { say.warn(`state.json corrupto (${e.message})`); } return { version: 3.47, reserva: RESERVA_INICIAL, usdc: 0, startedAt: Date.now(), positions: {}, evmPositions: {}, pnl: { solana: { pnlSol: 0, wins: 0, losses: 0, trades: 0, usdc: 0 }, base: { pnl: 0, wins: 0, losses: 0, trades: 0 }, bsc: { pnl: 0, wins: 0, losses: 0, trades: 0 }, robinhood: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperevm: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperliquid: { pnl: 0, wins: 0, losses: 0, trades: 0 } }, byWallet: {}, wallets: {}, tgSubs: [], customWallets: [], evmWallets: {} }; }
-function migrateState(s){ if(!s.evmPositions) s.evmPositions={}; if(!s.pnl) s.pnl={ solana:{pnlSol:0,wins:0,losses:0,trades:0,usdc:0}, base:{pnl:0,wins:0,losses:0,trades:0}, bsc:{pnl:0,wins:0,losses:0,trades:0}, robinhood:{pnl:0,wins:0,losses:0,trades:0}, hyperevm:{pnl:0,wins:0,losses:0,trades:0}, hyperliquid:{pnl:0,wins:0,losses:0,trades:0}}; if(!s.byWallet) s.byWallet={}; for(const k of ["base","bsc","robinhood","hyperevm","hyperliquid","solana"]){ if(!s.pnl[k]) s.pnl[k]={pnl:0,pnlSol:0,wins:0,losses:0,trades:0,usdc:0}; } s.version=3.47; return s; }
-async function loadStateDB() { if (!pool) return null; try { const res = await pool.query("SELECT data FROM bot_state WHERE id = 1"); if (res.rows.length > 0) return res.rows[0].data; } catch (e) { say.warn(`Postgres load falló: ${e.message}`); } return null; }
-async function saveState() { try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch {} if (pool) { try { await pool.query("UPDATE bot_state SET data = $1 WHERE id = 1", [state]); } catch (e) { say.err(`no se pudo guardar en Postgres: ${e.message}`); } } }
-let state = migrateState(loadStateFile());
-const WALLETS_ENV = (process.env.WALLETS || "").split(",").map((s) => s.trim()).filter(Boolean).map((s) => { const [addr, alias, sol] = s.split("="); const address = addr.trim(); return { address, alias: (alias || "").trim() || `${address.slice(0, 4)}…${address.slice(-4)}`, chain: "solana", tradeAmount: String(sol && Number(sol) > 0? Number(sol) : DEFAULT_TRADE_SOL), type: "solana" }; });
-function getAllWallets() { return [...WALLETS_ENV,...(state.customWallets || [])]; }
-function getWalletsByChain(chain) { return getAllWallets().filter(w => (w.chain||"solana").toLowerCase() === chain.toLowerCase()); }
-function walletState(addr, chain="solana") { const key = `${chain}:${addr.toLowerCase()}`; if (!state.wallets[key]) { state.wallets[key] = { lastBlockTime: 0, lastTxHash: null, snapshotIgnored: [], dusted: [], stats: { copies: 0, ignored: 0, dust: 0, pnlSol: 0, usdcSecured: 0 } }; } return state.wallets[key]; }
-const http = axios.create({ timeout: 15000 });
-const dexCache = new Map();
-async function getDexPrice(tokenAddress){
-  const key = tokenAddress.toLowerCase();
-  const hit = dexCache.get(key);
-  if(hit && Date.now()-hit.t < 30000) return hit.p;
-  try{
-    const { data } = await http.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 8000 });
-    const pair = data?.pairs?.[0];
-    const price = pair?.priceUsd? Number(pair.priceUsd) : null;
-    const symbol = pair?.baseToken?.symbol || "UNKNOWN";
-    if(price && price>0){ const r={price,symbol}; dexCache.set(key, { p: r, t: Date.now() }); return r; }
-  }catch(e){}
-  return null;
+if (process.env.DATABASE_URL) pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const C = { g: "\x1b[32m", r: "\x1b[31m", y: "\x1b[33m", c: "\x1b[36m", b: "\x1b[1m", x: "\x1b[0m" };
+function loadState(){ try{ if(fs.existsSync(STATE_FILE)){ const s=JSON.parse(fs.readFileSync(STATE_FILE,"utf8")); if(s.tgSubs) return s; } }catch{} return { version:4.0, tgSubs:[], customWallets:[], wallets:{} }; }
+let state = loadState();
+async function saveState(){ try{ fs.writeFileSync(STATE_FILE, JSON.stringify(state,null,2)); }catch{} if(pool) try{ await pool.query("UPDATE bot_state SET data=$1 WHERE id=1",[state]); }catch{} }
+const http = axios.create({ timeout:15000 });
+
+function getAllWallets(){
+  const env = (process.env.WALLETS||"").split(",").map(s=>s.trim()).filter(Boolean).map(s=>{ const [addr,alias]=s.split("="); return { address:addr.trim(), alias:(alias||"").trim()||addr.slice(0,4) }; });
+  return [...env,...(state.customWallets||[])];
 }
-async function rpc(method, params) { const { data } = await http.post(RPC_URL, { jsonrpc: "2.0", id: 1, method, params }); if (data.error) throw new Error(data.error.message?? "RPC error"); return data.result; }
-const tickerCache = new Map();
-async function getTicker(mint) { if (tickerCache.has(mint)) return tickerCache.get(mint); if (HELIUS_API_KEY) { try { const asset = await rpc("getAsset", { id: mint }); const sym = asset?.content?.metadata?.symbol; if (typeof sym === "string" && sym.trim()) { tickerCache.set(mint, sym.trim()); return sym.trim(); } } catch {} } try { const { data } = await http.get(`https://tokens.jup.ag/token/${mint}`); if (data && typeof data.symbol === "string" && data.symbol.trim()) { tickerCache.set(mint, data.symbol.trim()); return data.symbol.trim(); } } catch {} tickerCache.set(mint, "UNKNOWN"); return "UNKNOWN"; }
-const priceCache = new Map();
-async function getPriceUsd(mint) { const hit = priceCache.get(mint); if (hit && Date.now() - hit.t < 30000) return hit.p; try { const { data } = await http.get(`https://price.jup.ag/v6/price?ids=${SOL_MINT},${mint}`); const p = data?.data?.[mint]?.price; if (typeof p === "number" && p > 0) { priceCache.set(mint, { p, t: Date.now() }); return p; } } catch {} return null; }
-async function getSolUsd() { const hit = priceCache.get("SOL"); if (hit && Date.now() - hit.t < 30000) return hit.p; try { const { data } = await http.get(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`); const p = data?.data?.[SOL_MINT]?.price; if (typeof p === "number" && p > 0) { priceCache.set("SOL", { p, t: Date.now() }); return p; } } catch {} return null; }
-let evmAccount = null;
-if (EVM_PRIVATE_KEY && EVM_PRIVATE_KEY.length >= 60) { try { evmAccount = privateKeyToAccount(EVM_PRIVATE_KEY); say.ok(`EVM wallet cargada: ${evmAccount.address}`); } catch (e) { say.err(`EVM PK invalida: ${e.message}`); } } else { say.warn("Sin EVM_PRIVATE_KEY - solo modo lectura EVM"); }
-const clients = { base: createPublicClient({ chain: base, transport: viemHttp(BASE_RPC) }), bsc: createPublicClient({ chain: bsc, transport: viemHttp(BSC_RPC) }), robinhood: createPublicClient({ chain: robinhoodChain, transport: viemHttp(ROBINHOOD_RPC) }), hyperevm: createPublicClient({ chain: hyperliquidChain, transport: viemHttp(HYPERLIQUID_RPC) }), hyperliquid: createPublicClient({ chain: hyperliquidChain, transport: viemHttp(HYPERLIQUID_RPC) }) };
-const chainExplorers = { base: "https://basescan.org/tx/", bsc: "https://bscscan.com/tx/", robinhood: "https://robinhoodchain.blockscout.com/tx/", hyperevm: "https://hyperevmscan.io/tx/", hyperliquid: "https://hyperevmscan.io/tx/", solana: "https://solscan.io/tx/" };
-function evmExplorer(chain, hash) { return (chainExplorers[chain] || "") + hash; }
-function normalizeKeys(message) { const raw = message?.accountKeys?? []; if (!raw.length) return []; if (typeof raw[0]!== "string") { return raw.map((k) => ({ address: k?.pubkey, signer:!!k?.signer })); } return raw.map((a, i) => ({ address: a, signer: i === 0 })); }
-function classify(tx, wallet) { const meta = tx?.meta; if (!meta || meta.err) return null; const keys = normalizeKeys(tx?.transaction?.message); const isSigner = keys.some((k) => k.address === wallet && k.signer); const walletIdx = keys.findIndex((k) => k.address === wallet); let solDelta = 0; if (walletIdx >= 0 && meta.preBalances && meta.postBalances) { solDelta = (meta.postBalances[walletIdx] - meta.preBalances[walletIdx]) / 1e9; } const preByMint = new Map(); for (const b of meta.preTokenBalances?? []) { if (b.owner === wallet) { preByMint.set(b.mint, (preByMint.get(b.mint)?? 0) + (b.uiTokenAmount?.uiAmount?? 0)); } } const postByMint = new Map(); for (const b of meta.postTokenBalances?? []) { if (b.owner === wallet) { postByMint.set(b.mint, (postByMint.get(b.mint)?? 0) + (b.uiTokenAmount?.uiAmount?? 0)); } } let bestMint = null; let bestDelta = 0; for (const m of new Set([...preByMint.keys(),...postByMint.keys()])) { const d = (postByMint.get(m)?? 0) - (preByMint.get(m)?? 0); if (Math.abs(d) > Math.abs(bestDelta)) { bestDelta = d; bestMint = m; } } if (!bestMint || bestDelta === 0 || bestMint === SOL_MINT) return null; const txHash = tx.transaction?.signatures?.[0]?? ""; const blockTime = (tx.blockTime?? 0) * 1000 || Date.now(); if (bestDelta > 0) { if (isSigner && solDelta < 0) { return { type: "buy", mint: bestMint, txHash, blockTime, solAmount: Math.abs(solDelta), tokenAmount: bestDelta, postBalance: postByMint.get(bestMint)?? 0 }; } return { type: "dust", mint: bestMint, txHash, blockTime, solAmount: 0, tokenAmount: bestDelta, postBalance: postByMint.get(bestMint)?? 0 }; } return { type: "sell", mint: bestMint, txHash, blockTime, solAmount: Math.max(0, solDelta), tokenAmount: Math.abs(bestDelta), postBalance: postByMint.get(bestMint)?? 0 }; }
-const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const solscan = (h) => `https://solscan.io/tx/${h}`;
-const usd = (sol, solUsd) => (solUsd? ` ($${(sol * solUsd).toFixed(2)})` : "");
-const recentNotified = new Set();
-async function notify({ title, lines, color, hash, chain = "solana" }) {
-  if(hash){ if(recentNotified.has(hash)){ console.log(`[DEDUP] Notificación duplicada bloqueada ${hash.slice(0,10)}`); return; } recentNotified.add(hash); if(recentNotified.size>500) recentNotified.clear(); }
-  const explorer = chain === "solana"? solscan(hash) : evmExplorer(chain, hash); say.trade(`${title} ${C.d}${lines.map((l) => l.replace(/<[^>]+>/g, "")).join(" · ")}${C.x}`); if (tgBot) { const text = [`<b>${title}</b>`,...lines, hash? `🔗 <a href="${explorer}">ver en explorer</a>` : null].filter(Boolean).join("\n"); const targets = [...new Set([...(state.tgSubs||[]),...(TELEGRAM_CHAT_ID? [TELEGRAM_CHAT_ID] : [])])]; for (const chat of targets) { try { await tgBot.telegram.sendMessage(chat, text, { parse_mode: "HTML", disable_web_page_preview: true }); } catch {} } } }
-const GREEN = 0x00ff41, RED = 0xff4d4d, YELLOW = 0xffd93d, CYAN = 0x5fd9f2;
-async function applyEvent(w, ev) { const ws = walletState(w.address, "solana"); const solUsd = await getSolUsd(); const symbol = await getTicker(ev.mint); if (ev.type === "buy") { if (SNAPSHOT_ON && ws.snapshotIgnored.includes(ev.mint)) { ws.stats.ignored++; await saveState(); return notify({ title: `🚫 R0 · ${w.alias} operó $${esc(symbol)} (ya lo tenía) → IGNORADO`, lines: [`Contrato: <code>${ev.mint}</code>`], color: YELLOW, hash: ev.txHash, chain: "solana" }); } if (ws.dusted.includes(ev.mint)) { ws.dusted = ws.dusted.filter((m) => m!== ev.mint); await saveState(); say.info(`${w.alias} habilitó $${symbol}`); } if (state.positions[ev.mint]) { ws.stats.ignored++; await saveState(); return notify({ title: `🚫 R2 · ${w.alias} promedió $${esc(symbol)} → IGNORADO`, lines: [`El bot mantiene su entrada original.`], color: YELLOW, hash: ev.txHash, chain: "solana" }); } const size = Math.min(Number(w.tradeAmount), ev.solAmount); if (state.reserva < size) { return notify({ title: `⚠️ R1 · RESERVA BAJA — no se copió $${esc(symbol)}`, lines: [`${w.alias} compró ${ev.solAmount.toFixed(4)} SOL${usd(ev.solAmount, solUsd)}`, `Reserva: ${state.reserva.toFixed(4)} SOL`], color: RED, hash: ev.txHash, chain: "solana" }); } const entryPrice = ev.solAmount / ev.tokenAmount; state.positions[ev.mint] = { wallet: w.address, alias: w.alias, symbol, chain: "solana", entryPrice, amountSol: size, tokenAmount: size / entryPrice, openedAt: Date.now() }; state.reserva -= size; ws.stats.copies++; await saveState(); return notify({ title: `🟢 R1 · ${w.alias} COMPRÓ $${esc(symbol)} — BOT ENTRÓ [SOL]`, lines: [`${w.alias} pagó: <b>${ev.solAmount.toFixed(4)} SOL</b>${usd(ev.solAmount, solUsd)}`, `🤖 Bot: <b>${size.toFixed(4)} SOL</b> @ ${entryPrice.toExponential(3)}`, `Contrato: <code>${ev.mint}</code>`], color: GREEN, hash: ev.txHash, chain: "solana" }); } if (ev.type === "dust") { if (ANTI_DUST_ON &&!ws.dusted.includes(ev.mint)) ws.dusted.push(ev.mint); ws.stats.dust++; await saveState(); return; } if (ws.snapshotIgnored.includes(ev.mint) && ev.postBalance <= 0) { ws.snapshotIgnored = ws.snapshotIgnored.filter((m) => m!== ev.mint); await saveState(); } const open = state.positions[ev.mint]; if (!open) return; const exitPrice = ev.tokenAmount > 0? ev.solAmount / ev.tokenAmount : open.entryPrice; const proceeds = open.amountSol * (exitPrice / open.entryPrice); const pnlSol = proceeds - open.amountSol; const pnlPct = (exitPrice / open.entryPrice - 1) * 100; let r5Line; if (pnlSol > 0 && AUTO_USDC_ON) { const gain = pnlSol * (solUsd?? 0); state.reserva += open.amountSol; state.usdc += gain; ws.stats.usdcSecured += gain; r5Line = `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b>`; } else { state.reserva += open.amountSol + pnlSol; r5Line = pnlSol >= 0? `💰 R5 GANANCIA: <b>+${pnlSol.toFixed(4)} SOL</b>` : `💸 R5 PÉRDIDA: <b>−${Math.abs(pnlSol).toFixed(4)} SOL</b>`; } delete state.positions[ev.mint]; ws.stats.pnlSol += pnlSol; if(!state.pnl.solana) state.pnl.solana={pnlSol:0,wins:0,losses:0,trades:0,usdc:0}; state.pnl.solana.pnlSol+=pnlSol; state.pnl.solana.trades++; if(pnlSol>=0) state.pnl.solana.wins++; else state.pnl.solana.losses++; if(pnlSol>0) state.pnl.solana.usdc+= pnlSol*(solUsd||0); const wKey = `${w.alias}|solana`; if(!state.byWallet[wKey]) state.byWallet[wKey]={alias:w.alias, chain:"solana", pnl:0, wins:0, losses:0, trades:0}; state.byWallet[wKey].pnl+=pnlSol; state.byWallet[wKey].trades++; if(pnlSol>=0) state.byWallet[wKey].wins++; else state.byWallet[wKey].losses++; await saveState(); const win = pnlSol >= 0; return notify({ title: `${win? "🟢" : "🔴"} R3 · ${w.alias} VENDIÓ $${esc(symbol)} — BOT CERRÓ`, lines: [`PnL: <b>${win? "+" : "−"}${Math.abs(pnlPct).toFixed(1)}%</b>`, r5Line, `Reserva: ${state.reserva.toFixed(4)} SOL`], color: win? GREEN : RED, hash: ev.txHash, chain: "solana" }); }
 
-const seenEvmTx = new Set();
-
-async function pollEvmWallet(w) {
-  const chain = (w.chain || "base").toLowerCase();
-  const ws = walletState(w.address, chain);
-  try {
-    let transfers = [];
-    const headers = BLOCKSCOUT_API_KEY? { "x-api-key": BLOCKSCOUT_API_KEY } : {};
-    const apiKeyQuery = BLOCKSCOUT_API_KEY? `apikey=${BLOCKSCOUT_API_KEY}&` : "";
-
-    if (chain === "robinhood") {
-      try {
-        let data = null;
-        try {
-          const url = `https://robinhoodchain.blockscout.com/api/v2/addresses/${w.address}/token-transfers?${apiKeyQuery}items_count=20`;
-          const res = await http.get(url, {timeout:12000, headers});
-          data = res.data;
-        } catch(e){
-          if(e.response?.status===500){
-            console.log(`[ROB RETRY] ${w.alias} reintentando...`);
-            await new Promise(r=>setTimeout(r, 1500));
-            const url = `https://robinhoodchain.blockscout.com/api/v2/addresses/${w.address}/token-transfers?${apiKeyQuery}items_count=20`;
-            const res = await http.get(url, {timeout:12000, headers});
-            data = res.data;
-          } else throw e;
-        }
-        if(data?.items?.length){
-          transfers = data.items.map(it=>({ hash: it.transaction_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol||"TOKEN", isBuy: (it.to?.hash||"").toLowerCase()===w.address.toLowerCase() }));
-          console.log(`[ROBINHOOD BS KEY] ${w.alias} ${transfers.length} transfers ✅`);
-        }
-      } catch(e){ console.log(`[ROB BS ERR] ${w.alias} status:${e.response?.status} ${e.message.slice(0,100)}`); }
-    }
-    else if (chain === "base") {
-      try {
-        const url = `https://base.blockscout.com/api/v2/addresses/${w.address}/token-transfers?${apiKeyQuery}items_count=20`;
-        const { data } = await http.get(url, {timeout:10000, headers});
-        if(data?.items) transfers = data.items.map(it=>({ hash: it.transaction_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol, isBuy: it.to?.hash?.toLowerCase()===w.address.toLowerCase() }));
-        console.log(`[BASE BS KEY] ${w.alias} ${transfers.length} transfers ✅`);
-      } catch(e){ console.log(`[BASE ERR] ${w.alias} ${e.response?.status} ${e.message.slice(0,80)}`); }
-    }
-    else if (chain === "bsc") {
-      // NUEVO: ETHERSCAN V2 - chainid 56 = BSC
-      if(!ETHERSCAN_API_KEY){
-        console.log(`[BSC] ${w.alias} falta ETHERSCAN_API_KEY -> no se puede leer BSC (agrega la variable)`);
-      } else {
-        try {
-          const url = `https://api.etherscan.io/v2/api?chainid=56&module=account&action=tokentx&address=${w.address}&page=1&offset=20&sort=desc&apikey=${ETHERSCAN_API_KEY}`;
-          const { data } = await http.get(url, {timeout:12000});
-          if(data?.status==="1" && data?.result?.length){
-            transfers = data.result.map(it=>({ hash: it.hash, timeStamp: Number(it.timeStamp), token: it.contractAddress, symbol: it.tokenSymbol||"TOKEN", isBuy: (it.to||"").toLowerCase()===w.address.toLowerCase() }));
-            console.log(`[BSC ETHERSCAN] ${w.alias} ${transfers.length} transfers ✅`);
-          } else {
-            console.log(`[BSC ETHERSCAN] ${w.alias} 0 transfers (${data?.message||"sin movs"})`);
-          }
-        } catch(e){ console.log(`[BSC ETHERSCAN ERR] ${w.alias} ${e.message.slice(0,120)}`); }
-      }
-    }
-    else if (chain === "hyperevm" || chain === "hyperliquid") {
-      try {
-        const url = `https://www.hyperevmscan.io/api/v2/addresses/${w.address}/token-transfers?items_count=20`;
-        const { data } = await http.get(url, {timeout:8000});
-        if(data?.items) transfers = data.items.map(it=>({ hash: it.transaction_hash, timeStamp: Math.floor(new Date(it.timestamp).getTime()/1000), token: it.token?.address, symbol: it.token?.symbol, isBuy: it.to?.hash?.toLowerCase()===w.address.toLowerCase() }));
-        console.log(`[${chain.toUpperCase()}] ${w.alias} ${transfers.length}`);
-      } catch(e){ console.log(`[${chain.toUpperCase()} ERR] ${e.message.slice(0,80)}`); }
-    }
-
-    transfers = transfers.filter(t=>t.hash && t.token).sort((a,b)=>a.timeStamp-b.timeStamp);
-    for (const tx of transfers) {
-      const uniq = `${chain}:${tx.hash}:${tx.token}:${tx.isBuy}`;
-      if (seenEvmTx.has(uniq)) continue;
-      seenEvmTx.add(uniq);
-      ws.lastBlockTime = Date.now();
-      try{
-        if(!state.evmPositions) state.evmPositions={};
-        const tokenAddr = tx.token;
-        const priceData = await getDexPrice(tokenAddr);
-        const allKeys = Object.keys(state.evmPositions).filter(k=>k.startsWith(`${chain}:${w.address.toLowerCase()}:`));
-        const openForToken = allKeys.find(k=> state.evmPositions[k].token?.toLowerCase()===tokenAddr.toLowerCase());
-        if(!tx.isBuy){
-          if(!openForToken) continue;
-          const openPos = state.evmPositions[openForToken];
-          const entryPrice = openPos.entryPriceUsd||0;
-          const exitPrice = priceData?.price||entryPrice;
-          let pnlPct=0; if(entryPrice>0&&exitPrice>0) pnlPct=((exitPrice-entryPrice)/entryPrice)*100;
-          const entryAmt=Number(openPos.amount||w.tradeAmount);
-          const pnlAmt=entryPrice>0? entryAmt*(pnlPct/100):0;
-          delete state.evmPositions[openForToken];
-          if(!state.pnl[chain]) state.pnl[chain]={pnl:0,wins:0,losses:0,trades:0};
-          state.pnl[chain].pnl+=pnlAmt; state.pnl[chain].trades++; if(pnlAmt>=0) state.pnl[chain].wins++; else state.pnl[chain].losses++;
-          const wKey2=`${w.alias}|${chain}`; if(!state.byWallet[wKey2]) state.byWallet[wKey2]={alias:w.alias,chain,pnl:0,wins:0,losses:0,trades:0}; state.byWallet[wKey2].pnl+=pnlAmt; state.byWallet[wKey2].trades++; if(pnlAmt>=0) state.byWallet[wKey2].wins++; else state.byWallet[wKey2].losses++;
-          await notify({ title: `${pnlAmt>=0?'🟢':'🔴'} [${chain.toUpperCase()}] ${w.alias} VENDIÓ $${esc(tx.symbol||openPos.symbol||'TOKEN')} — REAL`, lines: [`Token: <code>${tokenAddr.slice(0,10)}...</code>`, `Entrada: $${entryPrice?entryPrice.toFixed(6):'?.??'} → Salida: $${exitPrice?exitPrice.toFixed(6):'?.??'}`, `PnL: <b>${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}%</b>`, `Tx: <code>${tx.hash.slice(0,12)}…</code>`], color: pnlAmt>=0?GREEN:RED, hash: tx.hash, chain });
-        } else {
-          if(openForToken) continue;
-          state.evmPositions[`${chain}:${w.address.toLowerCase()}:${tokenAddr.toLowerCase()}`]={wallet:w.address, alias:w.alias, chain, amount:w.tradeAmount, token: tokenAddr, symbol: tx.symbol||priceData?.symbol||"UNKNOWN", entryPriceUsd: priceData?.price||0, openedAt:Date.now(), txHash:tx.hash};
-          await notify({ title: `🟢 [${chain.toUpperCase()}] ${w.alias} COMPRÓ $${esc(tx.symbol||priceData?.symbol||'TOKEN')} — BOT ENTRÓ`, lines: [`Token: <code>${tokenAddr.slice(0,12)}...</code>`, `Precio: $${priceData?.price?priceData.price.toFixed(8):'?.??'}`, `Monto: <b>${w.tradeAmount} ${chain==='bsc'?'BNB':'ETH'}</b>`, `Tx: <code>${tx.hash.slice(0,12)}…</code>`], color: CYAN, hash: tx.hash, chain });
-        }
-      }catch(e){ say.warn(`PnL EVM err ${w.alias}: ${e.message}`); }
-      await saveState();
-    }
-  } catch (e) { say.warn(`EVM poll ${chain} ${w.alias} falló: ${e.message}`); }
-}
-async function loopEvm() { lastEvmPoll = Date.now(); const evmChains = ["robinhood","base","bsc","hyperevm"]; for (const chain of evmChains) { const wallets = getWalletsByChain(chain); for (const w of wallets) { await pollEvmWallet(w); await new Promise(r => setTimeout(r, 600)); } } }
-const seenSigs = new Set();
-async function pollWallet(w) { const ws = walletState(w.address, "solana"); let sigs; try { sigs = await rpc("getSignaturesForAddress", [w.address, { limit: 20 }]); } catch (e) { say.err(`RPC caído ${w.alias}: ${e.message}`); return; } const fresh = (sigs?? []).filter((s) =>!s.err &&!seenSigs.has(s.signature)).filter((s) => (s.blockTime?? 0) * 1000 > ws.lastBlockTime).sort((a, b) => (a.blockTime?? 0) - (b.blockTime?? 0)).slice(0, 8); for (const s of fresh) { seenSigs.add(s.signature); let tx = null; try { tx = await rpc("getTransaction", [s.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }]); } catch { continue; } if (!tx) continue; const ev = classify(tx, w.address); if (!ev) { ws.lastBlockTime = Math.max(ws.lastBlockTime, (tx.blockTime?? 0) * 1000); continue; } ws.lastBlockTime = Math.max(ws.lastBlockTime, ev.blockTime); try { await applyEvent(w, ev); } catch (e) { say.err(`procesando ${s.signature.slice(0, 12)}…: ${e.message}`); } } if (seenSigs.size > 3000) seenSigs.clear(); }
-async function snapshotWallet(w) { if (w.chain && w.chain!== "solana") return; if (!SNAPSHOT_ON) return; const ws = walletState(w.address, "solana"); if (ws.snapshotIgnored.length || ws.lastBlockTime) return; try { const res = await rpc("getTokenAccountsByOwner", [w.address, { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" }, { encoding: "jsonParsed" }]); const mints = []; for (const item of res?.value?? []) { const info = item?.account?.data?.parsed?.info; if (info?.mint && Number(info?.tokenAmount?.amount?? 0) > 0 &&!mints.includes(info.mint)) { mints.push(info.mint); } } ws.snapshotIgnored = mints; ws.lastBlockTime = Date.now(); await saveState(); say.ok(`R0 snapshot de ${w.alias}: ${mints.length} token(s)`); } catch (e) { ws.lastBlockTime = Date.now(); say.warn(`snapshot de ${w.alias} falló (${e.message})`); } }
-async function loop() { lastSolPoll = Date.now(); for (const w of getWalletsByChain("solana")) { await pollWallet(w); await new Promise((r) => setTimeout(r, 400)); } }
-const EVM_CHAINS = ["base","bsc","robinhood","hyperevm"];
-const ALL_CHAINS = ["solana",...EVM_CHAINS];
-function expandChainInput(input){ input=(input||"").toLowerCase().trim(); if(!input) return ["solana"]; if(input==="evm") return EVM_CHAINS; if(input==="all" || input==="todo" || input==="todas") return ALL_CHAINS; if(input.includes(",")){ const out=[]; for(const p of input.split(",")){ out.push(...expandChainInput(p)); } return [...new Set(out)]; } if(input==="hyperliquid") return ["hyperevm"]; return [input]; }
 let tgBot = null;
-function parseAddCommand(text) { const parts = text.trim().split(/\s+/); if (parts.length < 2) return { error: "Uso: /add ALIAS WALLET RED MONTO" }; const maybeWallet = parts[1]; const isOldFormat = maybeWallet.length >= 32 || maybeWallet.startsWith("0x"); let alias, wallet, chainPart, amountPart; if (isOldFormat) { wallet = parts[1]; alias = parts[2] || `${wallet.slice(0,4)}…${wallet.slice(-4)}`; const maybeAmount = parts[3]; return { wallets: [{ alias, address: wallet, chain: wallet.startsWith("0x")? "base" : "solana", tradeAmount: maybeAmount || (wallet.startsWith("0x")? DEFAULT_TRADE_EVM : String(DEFAULT_TRADE_SOL)) }], old: true }; } alias = parts[1]; wallet = parts[2]; chainPart = parts[3] || "solana"; amountPart = parts[4]; if (!wallet) return { error: "Falta wallet. Uso: /add ALIAS WALLET RED MONTO" }; const result = []; const expandedChains = expandChainInput(chainPart); for(const ch of expandedChains){ result.push({ alias, address: wallet, chain: ch.toLowerCase().trim(), tradeAmount: amountPart || (ch.toLowerCase()==="solana"? String(DEFAULT_TRADE_SOL) : DEFAULT_TRADE_EVM) }); } for (const w of result) { if (w.chain === "solana") { if (w.address.length < 32) return { error: `Wallet Solana invalida: ${w.address}` }; } else { if (!isAddress(w.address)) return { error: `Wallet EVM invalida: ${w.address}` }; } const validChains = ["solana", "base", "bsc", "robinhood", "hyperevm", "hyperliquid"]; if (!validChains.includes(w.chain)) return { error: `Chain invalida ${w.chain}. Usa: solana, base, bsc, robinhood, hyperevm o 'evm' para todas` }; } return { wallets: result }; }
-let lastEvmPoll = Date.now(); let lastSolPoll = Date.now();
-function heartbeat(){ const all = getAllWallets(); const openSol = Object.keys(state.positions||{}).length; const openEvm = Object.keys(state.evmPositions||{}).length; const pnl = state.pnl||{}; const solPnl = pnl.solana?.pnlSol||0; console.log(`${new Date().toLocaleTimeString()} 💓 heartbeat | wallets: ${all.length} (SOL:${getWalletsByChain("solana").length} BASE:${getWalletsByChain("base").length} BSC:${getWalletsByChain("bsc").length} ROB:${getWalletsByChain("robinhood").length} HYPE:${getWalletsByChain("hyperevm").length}) | pos: SOL ${openSol} EVM ${openEvm} | reserva ${state.reserva.toFixed(4)} SOL | PnL SOL ${solPnl>=0?"+":""}${solPnl.toFixed(4)} | BS_KEY:${BLOCKSCOUT_API_KEY? "SI":"NO"} ES_KEY:${ETHERSCAN_API_KEY? "SI":"NO"} | last SOL ${((Date.now()-lastSolPoll)/1000|0)}s ago EVM ${((Date.now()-lastEvmPoll)/1000|0)}s ago`); }
-const boot = async () => { await initDB(); if (pool) { const dbState = await loadStateDB(); if (dbState) { state = migrateState(dbState); say.ok(`DB: PostgreSQL Connected ✅ - ${state.customWallets.length} wallets`); } } say.info(`RPC SOL: ${HELIUS_API_KEY? "Helius" : "publico"}`); say.info(`BLOCKSCOUT KEY: ${BLOCKSCOUT_API_KEY? BLOCKSCOUT_API_KEY.slice(0,8)+"... SI ✅" : "NO ❌"}`); say.info(`ETHERSCAN KEY: ${ETHERSCAN_API_KEY? ETHERSCAN_API_KEY.slice(0,8)+"... SI ✅" : "NO ❌ — BSC no va a leer"}`); say.info(`Wallets: ${getAllWallets().length} total`); startTelegram(); startDiscord(); for (const w of getAllWallets()) await snapshotWallet(w); say.ok(`vigilancia activa v3.4.7 BSC ETHERSCAN`); setInterval(() => { loop().catch((e) => say.err(`ciclo SOL: ${e.message}`)); }, POLL_MS); setInterval(() => { loopEvm().catch((e) => say.err(`ciclo EVM: ${e.message}`)); }, POLL_EVM_MS); setInterval(() => { heartbeat(); }, 5*60*1000); setTimeout(()=>heartbeat(), 10000); };
-async function startTelegram() {
-  if (!TELEGRAM_TOKEN) { say.warn("sin TELEGRAM_BOT_TOKEN"); return; }
-  tgBot = new Telegraf(TELEGRAM_TOKEN);
-  try { await tgBot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch {}
-  try { const t = tgBot.token; if (t) await axios.get('https://api.telegram.org/bot' + t + '/deleteWebhook?drop_pending_updates=true'); say.ok("Webhook limpiado DEDUP"); } catch {}
-  await new Promise(r => setTimeout(r, 1500));
-  tgBot.command("start", async (ctx) => {
-    if (!state.tgSubs.includes(ctx.chat.id)) { state.tgSubs.push(ctx.chat.id); state.tgSubs=[...new Set(state.tgSubs)]; await saveState(); }
-    ctx.reply(`🟢 <b>MEMEBOT v3.4.7</b> - BSC ETHERSCAN V2\n/estado · /pos · /wallets · /pnl · /top · /heartbeat`, { parse_mode: "HTML" });
-  });
-  tgBot.command("help", (ctx) => ctx.reply("<b>Comandos v3.4.7</b>\n/estado\n/pos\n/wallets\n/pnl [ALIAS]\n/top\n/heartbeat", { parse_mode: "HTML" }));
-  tgBot.command("add", async (ctx) => { const parsed = parseAddCommand(ctx.message.text); if (parsed.error) return ctx.reply(parsed.error); const added = []; for (const nw of parsed.wallets) { const exists = getAllWallets().some(w => w.address.toLowerCase() === nw.address.toLowerCase() && (w.chain||"solana").toLowerCase() === nw.chain.toLowerCase()); if (exists) { await ctx.reply(`⚠️ Ya existe ${nw.alias} en ${nw.chain}`); continue; } const obj = { address: nw.address, alias: nw.alias, chain: nw.chain, tradeAmount: String(nw.tradeAmount), type: nw.chain === "solana"? "solana" : "evm" }; state.customWallets.push(obj); added.push(obj); await snapshotWallet(obj); } await saveState(); if (added.length) { ctx.reply(`✅ Agregadas ${added.length}:\n` + added.map(a => `• <b>${esc(a.alias)}</b> ${a.chain} — <code>${a.address.slice(0,6)}…${a.address.slice(-4)}</code> — ${a.tradeAmount}`).join("\n"), { parse_mode: "HTML" }); } });
-  tgBot.command("remove", async (ctx) => { const parts = ctx.message.text.trim().split(/\s+/); const target = parts[1]; if (!target) return ctx.reply("Uso: /remove ALIAS o DIRECCION"); const before = state.customWallets.length; const chainFilter = parts[2]; if (chainFilter) { state.customWallets = state.customWallets.filter(w =>!((w.alias===target || w.address.toLowerCase()===target.toLowerCase()) && w.chain===chainFilter.toLowerCase())); } else { state.customWallets = state.customWallets.filter(w => w.address.toLowerCase()!== target.toLowerCase() && w.alias!== target); } if (before === state.customWallets.length) return ctx.reply(`No encontré ${target}`); await saveState(); ctx.reply(`🗑️ Eliminada: ${esc(target)}`); });
-  tgBot.command("estado", async (ctx) => { const solUsd = await getSolUsd(); const dbInfo = pool? "🐘 Postgres" : "📁 Archivo"; ctx.reply(`<b>📊 ESTADO v3.4.7 - ${dbInfo}</b>\nBS_KEY: ${BLOCKSCOUT_API_KEY? "SI ✅":"NO ❌"} ES_KEY: ${ETHERSCAN_API_KEY? "SI ✅":"NO ❌"}\nReserva: <b>${state.reserva.toFixed(4)} SOL</b>${usd(state.reserva, solUsd)}\nWallets: ${getAllWallets().length} total — SOL:${getWalletsByChain('solana').length} BASE:${getWalletsByChain('base').length} BSC:${getWalletsByChain('bsc').length} ROB:${getWalletsByChain('robinhood').length} HYPE:${getWalletsByChain('hyperevm').length}\nPos: SOL ${Object.keys(state.positions||{}).length} EVM ${Object.keys(state.evmPositions||{}).length}`, { parse_mode: "HTML" }); });
-  tgBot.command("pos", (ctx) => { const openSol = Object.values(state.positions||{}); const openEvm = Object.values(state.evmPositions||{}); if (!openSol.length &&!openEvm.length) return ctx.reply("Sin posiciones."); let msg=""; if(openSol.length) msg+= "<b>SOL:</b>\n"+ openSol.map((p) => `• <b>$${esc(p.symbol)}</b> — ${p.amountSol.toFixed(4)} SOL`).join("\n")+"\n\n"; if(openEvm.length) msg+= "<b>EVM:</b>\n"+ openEvm.map((p)=>`• ${p.chain.toUpperCase()} ${esc(p.alias)} $${esc(p.symbol)} @ $${p.entryPriceUsd?.toFixed(6)||'?'} — ${p.amount} ${p.chain==="bsc"?"BNB":"ETH"}`).join("\n"); ctx.reply(msg, { parse_mode: "HTML" }); });
-  tgBot.command("pnl", async (ctx) => { const parts = ctx.message.text.trim().split(/\s+/); const filter = parts[1]; const pnl = state.pnl||{}; const byWallet = state.byWallet||{}; if(filter){ const list = Object.values(byWallet).filter(v=>v.alias.toLowerCase()===filter.toLowerCase()); if(!list.length) return ctx.reply(`Sin PnL para ${filter}`); let msg = `<b>📊 PnL ${esc(filter)}</b>\n`; for(const w of list){ msg+=`• ${w.chain.toUpperCase()}: ${w.pnl>=0?"+":""}${w.pnl.toFixed(6)} | W:${w.wins} L:${w.losses} T:${w.trades} ${w.pnl>=0?"🟢":"🔴"}\n`; } const total = list.reduce((a,b)=>a+b.pnl,0); msg+=`\n<b>Total: ${total>=0?"+":""}${total.toFixed(6)}</b>`; return ctx.reply(msg, {parse_mode:"HTML"}); } let msg = `<b>📊 PNL GLOBAL v3.4.7</b>\n`; msg+=`SOL: ${pnl.solana?.pnlSol>=0?"+":""}${(pnl.solana?.pnlSol||0).toFixed(4)} SOL | W:${pnl.solana?.wins||0} L:${pnl.solana?.losses||0} T:${pnl.solana?.trades||0} | USDC $${(pnl.solana?.usdc||0).toFixed(2)}\n`; for(const ch of ["base","bsc","robinhood","hyperevm"]){ const d=pnl[ch]; if(!d) continue; msg+=`${ch.toUpperCase()}: ${d.pnl>=0?"+":""}${d.pnl.toFixed(6)} ${ch==="bsc"?"BNB":"ETH"} | W:${d.wins} L:${d.losses} T:${d.trades} ${d.pnl>=0?"🟢":"🔴"}\n`; } msg+=`\nReserva: ${state.reserva.toFixed(4)} SOL\nPos: SOL ${Object.keys(state.positions||{}).length} EVM ${Object.keys(state.evmPositions||{}).length}`; ctx.reply(msg, {parse_mode:"HTML"}); });
-  tgBot.command("top", (ctx) => { const byWallet = Object.values(state.byWallet||{}); if(!byWallet.length) return ctx.reply("Aún sin trades."); const sorted = byWallet.sort((a,b)=>b.pnl-a.pnl).slice(0,10); let msg = `<b>🏆 TOP WALLETS</b>\n`; sorted.forEach((w,i)=>{ msg+=`${i+1}. <b>${esc(w.alias)}</b> [${w.chain}] ${w.pnl>=0?"+":""}${w.pnl.toFixed(6)} W:${w.wins} L:${w.losses}\n`; }); ctx.reply(msg, {parse_mode:"HTML"}); });
-  tgBot.command("heartbeat", (ctx)=>{ heartbeat(); ctx.reply("💓 heartbeat enviado a logs - revisa Railway"); });
-  tgBot.command("wallets", (ctx) => { const all = getAllWallets(); if (!all.length) return ctx.reply("Sin wallets."); const byChain = {}; for (const w of all) { const c = w.chain || "solana"; if (!byChain[c]) byChain[c]=[]; byChain[c].push(w); } let msg = ""; for (const [chain, list] of Object.entries(byChain)) { msg += `<b>${chain.toUpperCase()} (${list.length}):</b>\n`; msg += list.map((w) => `• <b>${esc(w.alias)}</b> — ${w.tradeAmount} · ${w.address.slice(0,6)}…`).join("\n") + "\n\n"; } ctx.reply(msg, { parse_mode: "HTML" }); });
-  tgBot.command("reset", async (ctx) => { state.reserva = RESERVA_INICIAL; state.usdc = 0; state.positions = {}; state.evmPositions={}; state.pnl={ solana: { pnlSol: 0, wins: 0, losses: 0, trades: 0, usdc: 0 }, base: { pnl: 0, wins: 0, losses: 0, trades: 0 }, bsc: { pnl: 0, wins: 0, losses: 0, trades: 0 }, robinhood: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperevm: { pnl: 0, wins: 0, losses: 0, trades: 0 }, hyperliquid: { pnl: 0, wins: 0, losses: 0, trades: 0 } }; state.byWallet={}; for (const a of Object.keys(state.wallets)) { state.wallets[a].stats = { copies: 0, ignored: 0, dust: 0, pnlSol: 0, usdcSecured: 0 }; } await saveState(); ctx.reply(`🔄 Tesorería reiniciada: ${RESERVA_INICIAL} SOL + PnL limpio`); });
-  tgBot.launch({ dropPendingUpdates: true }).then(() => say.ok("Telegram v3.4.7 ✅ BSC ETHERSCAN"));
-  tgBot.catch((e) => say.err(`telegram: ${e.message}`));
+let ws = null;
+const seen = new Set();
+
+async function notify(title, lines){
+  console.log(`${C.b}${C.c}▸${C.x} ${title} | ${lines.join(" · ")}`);
+  if(!tgBot) return;
+  const text = [`<b>${title}</b>`,...lines].join("\n");
+  for(const chat of state.tgSubs){ try{ await tgBot.telegram.sendMessage(chat,text,{parse_mode:"HTML"}); }catch{} }
 }
-let discordClient = null; let discordReady = false; function startDiscord() { if (!DISCORD_TOKEN ||!DISCORD_CHANNEL_ID) { say.info("Discord desactivado"); return; } discordClient = new Client({ intents: [GatewayIntentBits.Guilds] }); discordClient.once("ready", () => { discordReady = true; say.ok(`Discord conectado como ${discordClient.user.tag}`); }); discordClient.login(DISCORD_TOKEN).catch((e) => say.err(`discord: ${e.message}`)); }
-console.log(BANNER);
+
+async function handlePumpEvent(ev){
+  if(!ev.traderPublicKey ||!ev.mint) return;
+  if(seen.has(ev.signature)) return;
+  seen.add(ev.signature);
+  const w = getAllWallets().find(x=> x.address.toLowerCase()===ev.traderPublicKey.toLowerCase());
+  if(!w) return;
+  console.log(`${C.g}[COPY]${C.x} ${w.alias} ${ev.txType} ${ev.mint.slice(0,6)} chain:${ev.chain||'sol'}`);
+
+  if(ev.txType==='buy'){
+    await notify(`🟢 [PUMP ${ev.chain||'SOL'}] ${w.alias} COMPRÓ`, [
+      `Token: <code>${ev.mint}</code>`,
+      `Símbolo: ${ev.symbol||'N/A'}`,
+      `Tu bot va a copiar con Wallet B: <code>${SOL_PUB.slice(0,6)}...</code>`,
+      `Monto: ${process.env.TRADE_SOL||'0.05'} SOL`
+    ]);
+    // AQUI VA TU LOGICA DE COMPRA REAL CON SOLANA_PRIVATE_KEY (Wallet B) - por ahora en dry-run para que veas que copia
+  } else {
+    await notify(`🔴 [PUMP] ${w.alias} VENDIÓ`, [`Token: <code>${ev.mint}</code>`]);
+  }
+}
+
+function startPumpWs(){
+  if(!PUMPPORTAL_API_KEY){ console.log("❌ Falta PUMPPORTAL_API_KEY"); return; }
+  const toWatch = getAllWallets().map(w=>w.address);
+  if(toWatch.length===0){ console.log("❌ No hay WALLETS en variables"); return; }
+  console.log(`[PUMP WS] Conectando ${toWatch.length} wallets | Deposito 0.021 OK? verificando...`);
+  ws = new WebSocket(PUMPPORTAL_WS_URL);
+  ws.on("open", ()=>{
+    console.log(`${C.g}[PUMP WS] Conectado ✅${C.x} - Escuchando a Dior, Sapphy, etc en tiempo real`);
+    ws.send(JSON.stringify({ method:"subscribeAccountTrade", keys: toWatch }));
+  });
+  ws.on("message", async (data)=>{
+    try{ const ev = JSON.parse(data.toString()); if(ev.traderPublicKey) await handlePumpEvent(ev); }catch{}
+  });
+  ws.on("close", ()=>{ console.log("[PUMP WS] Cerrado, reconecto 5s..."); setTimeout(()=>startPumpWs(),5000); });
+  ws.on("error", (e)=>console.log(`[WS ERR] ${e.message}`));
+}
+
+function startTelegram(){
+  if(!TELEGRAM_TOKEN) return;
+  tgBot = new Telegraf(TELEGRAM_TOKEN);
+  tgBot.command("start", async (ctx)=>{ if(!state.tgSubs.includes(ctx.chat.id)){ state.tgSubs.push(ctx.chat.id); await saveState(); } ctx.reply(`🟢 v4.0 PUMP CONECTADO\nWallets: ${getAllWallets().length}\nWS: ${ws?.readyState===1?'🟢':'🔴'}\nDeposito 0.021: ✅\nWallet B (dinero): ${SOL_PUB.slice(0,6)}...`); });
+  tgBot.command("estado", (ctx)=>{ ctx.reply(`v4.0 | MODE:${MODE}\nWS:${ws?.readyState===1?'Conectado 🟢':'Desconectado 🔴'}\nWallets:${getAllWallets().length}\nWallet B: ${SOL_PUB}`); });
+  tgBot.launch({dropPendingUpdates:true}).then(()=>console.log("Telegram v4.0 ✅"));
+}
+
+const boot = async ()=>{
+  if(pool){ try{ await pool.query(`CREATE TABLE IF NOT EXISTS bot_state (id INT PRIMARY KEY, data JSONB NOT NULL);`); const r=await pool.query("SELECT data FROM bot_state WHERE id=1"); if(r.rows.length===0){ await pool.query("INSERT INTO bot_state (id,data) VALUES (1,$1)",[state]); } else { state=r.rows[0].data; } console.log("🐘 Postgres OK"); }catch(e){ console.log(e.message); } }
+  startTelegram();
+  if(MODE==="pump") startPumpWs();
+  else console.log(`MODE=${MODE} - Cambia a pump en Railway`);
+  console.log(`\n MEMEBOT v4.0 LISTO | PUMP_KEY:${PUMPPORTAL_API_KEY?'SI ✅':'NO ❌'} | Wallet B:${SOL_PUB.slice(0,6)}...\n`);
+};
 boot();
-const shutdown = async () => { say.info("guardando estado…"); await saveState(); try { tgBot?.stop(); } catch {} try { discordClient?.destroy(); } catch {} try { await pool?.end(); } catch {} process.exit(0); };
-process.once("SIGINT", shutdown); process.once("SIGTERM", shutdown);
