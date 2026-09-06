@@ -17,74 +17,68 @@ async function loadState(){
   try{
     const r = await pool.query(`SELECT data FROM bot_state WHERE id='main'`);
     if(!r.rows.length) return { wallets:[], notifyChats:[] };
-    return r.rows[0].data;
+    const d = r.rows[0].data;
+    return typeof d === 'string'? JSON.parse(d) : d;
   }catch{ return { wallets:[], notifyChats:[] }; }
 }
-async function saveState(s){ await pool.query(`INSERT INTO bot_state(id,data) VALUES('main',$1) ON CONFLICT(id) DO UPDATE SET data=$1`,[s]); }
+async function saveState(s){
+  try{
+    const json = JSON.stringify(s);
+    await pool.query(`INSERT INTO bot_state(id, data) VALUES('main', $1::jsonb) ON CONFLICT(id) DO UPDATE SET data=$1::jsonb`, [json]);
+  }catch(e){ console.error('saveState error', e.message); }
+}
 
 let state = await initDB().then(()=>loadState());
-const save = () => saveState(state).catch(console.error);
-const addChat = (id) => { if(!state.notifyChats.includes(id)){ state.notifyChats.push(id); save(); } };
+console.log('LOADED', state.wallets?.length||0);
+const save = () => saveState(state);
+const addChat = (id) => {
+  if(!state.notifyChats) state.notifyChats=[];
+  if(!state.notifyChats.includes(id)){ state.notifyChats.push(id); save(); }
+};
 
-// COMMANDS
-bot.start((ctx)=>{ addChat(ctx.chat.id); ctx.reply('Bot v4.5 MULTICHAIN ONLINE 🟢 SOL+EVM por Pump.fun'); });
-bot.command('help', (ctx)=>{ addChat(ctx.chat.id); ctx.reply(`/add alias address amount chain\nchain = sol | evm | base | bnb | eth\nEj: /add sapphy 0x123 0.01 evm\n/wallets\n/set alias amount chain\nLIVE=${LIVE_TRADING?'REAL':'PAPER'}`); });
-
+bot.start((ctx)=>{ addChat(ctx.chat.id); ctx.reply('Bot v4.5.1 FIX MULTICHAIN ONLINE 🟢'); });
+bot.command('help', (ctx)=>{ addChat(ctx.chat.id); ctx.reply('/add alias address amount chain (sol/evm/base/bnb/eth)\n/wallets\nLIVE='+ (LIVE_TRADING?'REAL':'PAPER')); });
 bot.command('wallets', (ctx)=>{
   addChat(ctx.chat.id);
   if(!state.wallets.length) return ctx.reply('Vacío');
   let m=''; const by={};
   state.wallets.forEach(w=>{ (by[w.alias]=by[w.alias]||[]).push(w); });
   for(const a in by){ m+=`\n${a}:\n`; by[a].forEach(w=>m+=` - [${w.chain}] ${w.address.slice(0,8)}.. ${w.amount}\n`); }
-  ctx.reply(m);
+  ctx.reply(m||'Vacío');
 });
-
 bot.command('add', (ctx)=>{
   addChat(ctx.chat.id);
   const p=ctx.message.text.split(' ').filter(Boolean);
   if(p.length<5) return ctx.reply('Uso: /add alias address amount chain');
-  const [_,alias,address,amt,chainRaw]=p;
-  const chain=chainRaw.toLowerCase();
-  const amount=parseFloat(amt);
-  state.wallets=state.wallets.filter(w=>!(w.alias===alias.toLowerCase() && w.address===address && w.chain===chain));
-  state.wallets.push({alias:alias.toLowerCase(), address, amount, chain});
+  const alias=p[1].toLowerCase(), address=p[2], amount=parseFloat(p[3]), chain=p[4].toLowerCase();
+  state.wallets=state.wallets.filter(w=>!(w.alias===alias && w.address===address && w.chain===chain));
+  state.wallets.push({alias,address,amount,chain});
   save(); ctx.reply(`Guardada ${alias} [${chain}] ${amount}`);
 });
-bot.command('set', (ctx)=>{
-  addChat(ctx.chat.id);
-  const p=ctx.message.text.split(' ').filter(Boolean);
-  if(p.length<4) return ctx.reply('Uso: /set alias amount chain');
-  const alias=p[1].toLowerCase(), amount=parseFloat(p[2]), chain=p[3].toLowerCase();
-  let c=0; state.wallets.forEach(w=>{ if(w.alias===alias && w.chain===chain){ w.amount=amount; c++; } });
-  save(); ctx.reply(`Update ${c} wallets`);
-});
 
-// WS MULTICHAIN
 function connect(){
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', ()=>{
-    console.log('WS Pump multichain conectado');
-    const keys = state.wallets.map(w=>w.address);
-    const uniq = [...new Set(keys)];
-    if(uniq.length) ws.send(JSON.stringify({method:"subscribeAccountTrade", keys:uniq}));
+    console.log('WS conectado');
+    const keys=[...new Set(state.wallets.map(w=>w.address))];
+    if(keys.length) ws.send(JSON.stringify({method:"subscribeAccountTrade", keys}));
   });
   ws.on('message', async (d)=>{
     try{
-      const t = JSON.parse(d.toString());
-      const trader = t.traderPublicKey || t.trader || t.wallet || t.account;
+      const t=JSON.parse(d.toString());
+      const trader=(t.traderPublicKey||t.trader||'').toString();
       if(!trader) return;
-      const matches = state.wallets.filter(w=>w.address.toLowerCase()===trader.toLowerCase());
-      if(!matches.length) return;
+      const matches=state.wallets.filter(w=>w.address.toLowerCase()===trader.toLowerCase());
       for(const w of matches){
-        const msg=`🧪 [${w.chain.toUpperCase()}] ${w.alias} ${ (t.txType||'TRADE')} ${ (t.mint||t.token||'').toString().slice(0,6)} por ${t.solAmount||t.amount||''} -> hubiera copiado ${w.amount} [${w.chain}] ${LIVE_TRADING?'REAL':'(PAPER)'}`;
+        const msg=`🧪 [${w.chain.toUpperCase()}] ${w.alias} compro ${(t.mint||'').slice(0,6)} -> hubiera copiado ${w.amount}`;
         console.log(msg);
-        for(const chatId of state.notifyChats){ try{ await bot.telegram.sendMessage(chatId, msg); }catch{} }
+        for(const id of state.notifyChats){ try{ await bot.telegram.sendMessage(id, msg); }catch{} }
       }
-    }catch(e){ console.error(e.message); }
+    }catch{}
   });
   ws.on('close', ()=>setTimeout(connect,5000));
-  ws.on('error', (e)=>console.error('WS err', e.message));
+  ws.on('error', (e)=>console.error(e.message));
 }
 connect();
 bot.launch();
-console.log('Bot v4.5 MULTICHAIN LIVE=',LIVE_TRADING);
+console.log('Bot v4.5.1 LIVE', LIVE_TRADING);
