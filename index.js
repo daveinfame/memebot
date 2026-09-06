@@ -1,173 +1,167 @@
-import 'dotenv/config';
 import { Telegraf } from 'telegraf';
 import pg from 'pg';
 import WebSocket from 'ws';
+import dotenv from 'dotenv';
+dotenv.config();
 
-const TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID;
-const LIVE = (process.env.LIVE_TRADING || "false") === "true";
-const DRY_RUN =!LIVE;
-
-if (!TOKEN) { console.error("❌ No hay token"); process.exit(1); }
-
-const bot = new Telegraf(TOKEN);
 const { Pool } = pg;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
+const LIVE_TRADING = process.env.LIVE_TRADING === 'true';
 
-// Estructura nueva: wallets = [{alias, address, amount, chain}]
-let state = { holdings: {}, wallets: [], tradeAmount: 0.02 };
+if (!BOT_TOKEN) throw new Error('Falta TELEGRAM_BOT_TOKEN');
+if (!DATABASE_URL) throw new Error('Falta DATABASE_URL');
 
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const bot = new Telegraf(BOT_TOKEN);
+
+// --- DB STATE ---
+async function initDB() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS bot_state (id TEXT PRIMARY KEY, data JSONB)`);
+}
 async function loadState() {
   try {
-    const r = await pool.query("SELECT data FROM bot_state WHERE id='main'");
-    if (r.rows[0]?.data) {
-      state = {...state,...r.rows[0].data };
-      // migracion de formato viejo
-      if (!state.wallets) state.wallets = [];
-      if (state.customWallets && state.customWallets.length && state.wallets.length === 0) {
-        console.log("Migrando formato viejo...");
-      }
-    }
-  } catch {}
+    const res = await pool.query(`SELECT data FROM bot_state WHERE id='main'`);
+    if (res.rows.length === 0) return { wallets: [], notifyChats: [] };
+    return res.rows[0].data;
+  } catch (e) { return { wallets: [], notifyChats: [] }; }
 }
-async function saveState() {
-  try { await pool.query("INSERT INTO bot_state(id,data) VALUES('main',$1) ON CONFLICT(id) DO UPDATE SET data=$1", [state]); } catch(e){ console.error(e.message) }
+async function saveState(state) {
+  await pool.query(`INSERT INTO bot_state(id, data) VALUES('main', $1) ON CONFLICT(id) DO UPDATE SET data=$1`, [state]);
 }
 
-function findWalletsByAlias(alias) { return state.wallets.filter(w => w.alias.toLowerCase() === alias.toLowerCase()); }
+let state = await initDB().then(() => loadState());
+console.log('STATE loaded:', state.wallets.length, 'wallets');
 
-bot.command('help', (ctx) => {
-  ctx.reply(`MEMEBOT v4.3 - SOL / EVM
-/add alias wallet monto red
-  red = sol o evm (obligatorio)
-  Ej: /add sapphy 7xKX... 0.05 sol
-      /add sapphy 0x123... 0.05 evm
+function save() { saveState(state).catch(console.error); }
+function addNotifyChat(chatId) {
+  if (!state.notifyChats) state.notifyChats = [];
+  if (!state.notifyChats.includes(chatId)) {
+    state.notifyChats.push(chatId);
+    save();
+  }
+}
 
-/wallets - ver todo agrupado
-/remove alias - borra todo ese alias
-/remove alias red - borra solo esa red
-  Ej: /remove sapphy evm
+// --- HELPERS ---
+function parseAdd(text) {
+  // /add alias address amount chain
+  const parts = text.split(' ').filter(Boolean);
+  if (parts.length < 5) return null;
+  return { alias: parts[1].toLowerCase(), address: parts[2], amount: parseFloat(parts[3]), chain: parts[4].toLowerCase() };
+}
 
-/set alias monto - cambia monto en todas sus redes
-/set alias monto red - solo esa red
-  Ej: /set sapphy 0.08
-      /set sapphy 0.1 evm
-
-/estado - estado
-/reset - borra holdings`);
+// --- COMMANDS ---
+bot.start((ctx) => {
+  addNotifyChat(ctx.chat.id);
+  ctx.reply('Bot Online v4.4 🟢\nYa te voy a avisar aquí de las copias.\nUsa /help');
 });
 
-bot.command('estado', async (ctx) => {
-  await loadState();
-  ctx.reply(`v4.3 | ${DRY_RUN?'SIMULACION 🧪':'REAL 🔴'} | Wallets: ${state.wallets.length} | Holdings: ${Object.keys(state.holdings).length}\nModo: pumpportal multichain (sol+evm)`);
+bot.command('help', (ctx) => {
+  addNotifyChat(ctx.chat.id);
+  ctx.reply(`
+v4.4 - MEMEBOT PAPER
+/add alias address amount chain -> ej: /add sapphy So11... 0.05 sol
+/add alias address amount evm -> ej: /add sapphy 0x123... 0.05 evm
+/set alias amount chain
+/remove alias address chain
+/delete alias
+/wallets
+LIVE_TRADING=${LIVE_TRADING? 'REAL' : 'PAPER (simulación)'}
+  `);
 });
 
 bot.command('wallets', (ctx) => {
-  if (!state.wallets.length) return ctx.reply("Vacío. Agrega: /add alias wallet monto red");
-  const grouped = {};
+  addNotifyChat(ctx.chat.id);
+  if (!state.wallets.length) return ctx.reply('Sin wallets');
+  let msg = 'WALLETS:\n';
+  const byAlias = {};
   state.wallets.forEach(w => {
-    if (!grouped[w.alias]) grouped[w.alias] = [];
-    grouped[w.alias].push(w);
+    if (!byAlias[w.alias]) byAlias[w.alias] = [];
+    byAlias[w.alias].push(w);
   });
-  let msg = `Copiando ${state.wallets.length} lineas:\n\n`;
-  for (const alias in grouped) {
-    msg += `${alias}:\n`;
-    grouped[alias].forEach(w => {
-      msg += ` - ${w.chain}: ${w.address.slice(0,6)}...${w.address.slice(-4)} -> ${w.amount}\n`;
-    });
+  for (const alias in byAlias) {
+    msg += `\n${alias}:\n`;
+    byAlias[alias].forEach(w => msg += ` - ${w.chain} ${w.address.slice(0,6)}... ${w.amount}\n`);
   }
   ctx.reply(msg);
 });
 
-bot.command('add', async (ctx) => {
-  const parts = ctx.message.text.trim().split(/\s+/);
-  // /add alias wallet monto red
-  if (parts.length < 5) return ctx.reply("❌ Uso: /add alias wallet monto red\nEj: /add sapphy 0x123... 0.05 evm\nRed solo: sol o evm");
-  const alias = parts[1];
-  const wallet = parts[2];
-  const amount = parseFloat(parts[3]);
-  const chain = parts[4].toLowerCase();
-
-  if (!amount || amount <= 0) return ctx.reply("❌ Monto obligatorio y mayor a 0. Ejemplo: 0.05");
-  if (!['sol','evm'].includes(chain)) return ctx.reply("❌ Red solo puede ser 'sol' o 'evm'");
-  if (chain === 'evm' &&!wallet.startsWith('0x')) return ctx.reply("❌ Para evm la wallet debe empezar con 0x");
-  if (chain === 'sol' && wallet.startsWith('0x')) return ctx.reply("❌ Para sol no uses 0x, usa dirección solana");
-
-  // si ya existe mismo alias+chain, lo reemplaza
-  state.wallets = state.wallets.filter(w =>!(w.alias.toLowerCase() === alias.toLowerCase() && w.chain === chain));
-  state.wallets.push({ alias, address: wallet, amount, chain, addressLower: wallet.toLowerCase() });
-  await saveState();
-  ctx.reply(`✅ Agregado: ${alias} | ${chain} | ${wallet.slice(0,6)}... -> ${amount}`);
-  connectPump();
+bot.command('add', (ctx) => {
+  addNotifyChat(ctx.chat.id);
+  const p = parseAdd(ctx.message.text);
+  if (!p) return ctx.reply('Formato: /add alias address amount chain\nEj: /add sapphy 0x123 0.05 evm');
+  if (!['sol','evm'].includes(p.chain)) return ctx.reply('chain debe ser sol o evm');
+  // borrar si ya existe misma address+chain+alias
+  state.wallets = state.wallets.filter(w =>!(w.alias===p.alias && w.address===p.address && w.chain===p.chain));
+  state.wallets.push(p);
+  save();
+  ctx.reply(`Agregada: ${p.alias} [${p.chain}] ${p.amount}`);
 });
 
-bot.command('remove', async (ctx) => {
-  const parts = ctx.message.text.trim().split(/\s+/);
-  const alias = parts[1];
-  const chain = parts[2]?.toLowerCase();
-  if (!alias) return ctx.reply("Uso: /remove alias o /remove alias evm");
-  const before = state.wallets.length;
-  if (chain) {
-    if (!['sol','evm'].includes(chain)) return ctx.reply("Red solo sol o evm");
-    state.wallets = state.wallets.filter(w =>!(w.alias.toLowerCase() === alias.toLowerCase() && w.chain === chain));
-  } else {
-    state.wallets = state.wallets.filter(w => w.alias.toLowerCase()!== alias.toLowerCase());
-  }
-  await saveState();
-  ctx.reply(`🗑️ Borrado ${alias}${chain?' '+chain:''}. ${before - state.wallets.length} linea(s) eliminadas. Quedan ${state.wallets.length}`);
-  connectPump();
+bot.command('set', (ctx) => {
+  addNotifyChat(ctx.chat.id);
+  const parts = ctx.message.text.split(' ').filter(Boolean);
+  if (parts.length < 4) return ctx.reply('Uso: /set alias amount chain');
+  const alias = parts[1].toLowerCase(), amount = parseFloat(parts[2]), chain = parts[3].toLowerCase();
+  let c=0;
+  state.wallets.forEach(w=>{ if(w.alias===alias && w.chain===chain){ w.amount=amount; c++; } });
+  save();
+  ctx.reply(`Actualizadas ${c} wallets de ${alias} [${chain}] a ${amount}`);
 });
 
-bot.command('set', async (ctx) => {
-  const parts = ctx.message.text.trim().split(/\s+/);
-  // /set alias monto o /set alias monto red
-  if (parts.length < 3) return ctx.reply("Uso: /set alias monto o /set alias monto red");
-  const alias = parts[1];
-  const amount = parseFloat(parts[2]);
-  const chain = parts[3]?.toLowerCase();
-  if (!amount || amount <= 0) return ctx.reply("Monto obligatorio mayor a 0");
-  if (chain &&!['sol','evm'].includes(chain)) return ctx.reply("Red solo sol o evm");
+bot.command('remove', (ctx) => {
+  addNotifyChat(ctx.chat.id);
+  const parts = ctx.message.text.split(' ').filter(Boolean);
+  if (parts.length < 4) return ctx.reply('Uso: /remove alias address chain');
+  const alias=parts[1].toLowerCase(), address=parts[2], chain=parts[3].toLowerCase();
+  const before=state.wallets.length;
+  state.wallets = state.wallets.filter(w=>!(w.alias===alias && w.address===address && w.chain===chain));
+  save();
+  ctx.reply(`Borradas ${before-state.wallets.length}`);
+});
 
-  let count = 0;
-  state.wallets.forEach(w => {
-    if (w.alias.toLowerCase() === alias.toLowerCase()) {
-      if (!chain || w.chain === chain) { w.amount = amount; count++; }
-    }
+bot.command('delete', (ctx) => {
+  addNotifyChat(ctx.chat.id);
+  const alias = ctx.message.text.split(' ')[1]?.toLowerCase();
+  if(!alias) return ctx.reply('Uso: /delete alias');
+  const before=state.wallets.length;
+  state.wallets = state.wallets.filter(w=>w.alias!==alias);
+  save();
+  ctx.reply(`Borrado alias ${alias}: ${before-state.wallets.length} wallets`);
+});
+
+// --- PUMP.FUN WS (SOL) ---
+function connectPump() {
+  const ws = new WebSocket('wss://pumpportal.fun/api/data');
+  ws.on('open', () => {
+    console.log('PumpPortal WS conectado');
+    // Suscribirse a todas nuestras wallets SOL
+    const solWallets = state.wallets.filter(w=>w.chain==='sol').map(w=>w.address);
+    if(solWallets.length) ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: solWallets }));
   });
-  if (!count) return ctx.reply(`No encontré ${alias}${chain?' '+chain:''}`);
-  await saveState();
-  ctx.reply(`✅ ${alias}${chain?' '+chain:''} ahora con ${amount} (${count} linea(s) actualizada(s))`);
-});
+  ws.on('message', async (data) => {
+    try {
+      const trade = JSON.parse(data.toString());
+      if(!trade.traderPublicKey) return;
+      const found = state.wallets.filter(w=>w.chain==='sol' && w.address===trade.traderPublicKey);
+      if(!found.length) return;
 
-bot.command('reset', async (ctx) => { state.holdings={}; await saveState(); ctx.reply("Holdings borrados ✅"); });
-
-await loadState();
-bot.launch();
-console.log(`MEMEBOT v4.3 LISTO | ${state.wallets.length} wallets | DRY_RUN=${DRY_RUN}`);
-
-let ws;
-function connectPump(){
-  const allAddrs = [...new Set(state.wallets.map(w=>w.address))];
-  if(ws) try{ws.close()}catch{}
-  if(!allAddrs.length){ console.log("Sin wallets para escuchar"); return; }
-  ws = new WebSocket("wss://pumpportal.fun/api/data");
-  ws.on('open', ()=>{ console.log(`[PUMP] Escuchando ${allAddrs.length} addrs (${state.wallets.length} lineas)`); ws.send(JSON.stringify({method:"subscribeAccountTrade", keys: allAddrs})); });
-  ws.on('message', (d)=>{
-    try{
-      const tx = JSON.parse(d.toString());
-      if(!tx.mint) return;
-      const trader = tx.traderPublicKey;
-      const match = state.wallets.find(w=>w.addressLower === trader.toLowerCase() || w.address === trader);
-      if(!match) return;
-      const alias = match.alias;
-      if(state.holdings[tx.mint]) {
-        if(DRY_RUN && CHAT_ID) bot.telegram.sendMessage(CHAT_ID, `🧪 [R2] ${alias} (${match.chain}) promedio ${tx.mint.slice(0,6)} IGNORADO`).catch(()=>{});
-        return;
+      for(const w of found) {
+        const type = trade.txType || trade.type || 'trade';
+        const mint = trade.mint || 'unknown';
+        const solAmount = trade.solAmount || trade.sol_amount || 0;
+        const msg = `🧪 [${w.chain}] ${w.alias} ${type.toUpperCase()} ${mint.slice(0,6)}... por ${solAmount} SOL\n-> Hubiera copiado ${w.amount} SOL ${LIVE_TRADING? 'REAL' : '(PAPER)'}`;
+        console.log(msg);
+        for(const chatId of state.notifyChats) {
+          try { await bot.telegram.sendMessage(chatId, msg); } catch(e){}
+        }
       }
-      console.log(`[NUEVA] ${alias} ${match.chain} compro ${tx.mint.slice(0,6)}`);
-      if(DRY_RUN && CHAT_ID) bot.telegram.sendMessage(CHAT_ID, `🧪 ${alias} [${match.chain}] COMPRÓ ${tx.mint.slice(0,6)} -> hubiera copiado ${match.amount}`).catch(()=>{});
-    }catch{}
+    } catch(e){ console.error('WS parse', e.message); }
   });
-  ws.on('close', ()=>setTimeout(connectPump,5000));
+  ws.on('close', () => { console.log('WS cerrado, reconectando 5s'); setTimeout(connectPump, 5000); });
+  ws.on('error', (e)=>{ console.error('WS error', e.message); });
 }
 connectPump();
+
+bot.launch();
+console.log('Bot lanzado v4.4 LIVE_TRADING:', LIVE_TRADING);
