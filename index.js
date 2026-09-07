@@ -71,11 +71,23 @@ bot.onText(/\/list/, async (msg)=>{
   bot.sendMessage(msg.chat.id, rows.map(r=>`• ${r.alias} ${r.address.slice(0,6)} ${r.amount} ${getLabel(r.chain)}`).join('\n') || 'Vacío');
 });
 bot.onText(/\/status/, async (msg)=>{
-  bot.sendMessage(msg.chat.id, `Estado: ${process.env.LIVE_TRADING?'REAL':'PAPER'} | Saldo $${GLOBAL_BALANCE} / Init $${INITIAL_BALANCE} | RH Chain 4663 OK`);
+  const modo = process.env.LIVE_TRADING === 'true' ? 'REAL' : 'PAPER';
+  bot.sendMessage(msg.chat.id, `Estado: ${modo} | Saldo $${GLOBAL_BALANCE} / Init $${INITIAL_BALANCE} | RH Chain 4663 OK`);
 });
 bot.onText(/\/setbalance (.+)/, async (msg, m)=>{
   GLOBAL_BALANCE=parseFloat(m[1]); INITIAL_BALANCE=parseFloat(m[1]);
   bot.sendMessage(msg.chat.id, `💰 Saldo seteado $${m[1]}`);
+});
+bot.onText(/\/help/, async (msg)=>{
+  const texto = [
+    '📋 Comandos disponibles:',
+    '/add alias direccion monto cadena - Agrega o actualiza una wallet a seguir',
+    '/list - Muestra todas las wallets que sigues',
+    '/status - Muestra modo (REAL/PAPER) y saldo actual',
+    '/setbalance monto - Cambia tu saldo global',
+    '/help - Muestra este mensaje'
+  ].join('\n');
+  bot.sendMessage(msg.chat.id, texto);
 });
 
 function startListener(){
