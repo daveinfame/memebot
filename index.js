@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY DE PUMPPORTAL =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY + NOMBRE DE TOKEN + SNAPSHOT REAL =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -13,7 +13,6 @@ const pool = new Pool({
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const CHAT_ID = process.env.CHAT_ID;
 
-// La API key es obligatoria para subscribeAccountTrade (sin ella, PumpPortal ignora la suscripción sin avisar)
 if (!process.env.PUMPPORTAL_API_KEY) {
   console.error('⚠️ FALTA PUMPPORTAL_API_KEY - las wallets trackeadas NO se van a poder vigilar sin esto');
 }
@@ -23,7 +22,9 @@ const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
 const JUPITER_SWAP = 'https://quote-api.jup.ag/v6/swap';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const PUMPPORTAL_WALLET = 'Guao96aNr7GUj3CSspwLy3tEccL3RUh5xVT4W3KNfBUH'; // wallet ligada a tu API key, para saber cuánto SOL le queda
+const PUMPPORTAL_WALLET = 'Guao96aNr7GUj3CSspwLy3tEccL3RUh5xVT4W3KNfBUH';
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const DUST_MIN_SOL = 0.05;
@@ -35,6 +36,7 @@ let ws = null;
 let totalMensajesRecibidos = 0;
 let primerMensajeConfirmado = false;
 let mensajesDesdeUltimoResumen = 0;
+const cacheSimbolos = new Map();
 
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
@@ -81,6 +83,43 @@ async function getPumpPortalWalletBalance() {
   } catch (e) { console.error('Error consultando saldo de PumpPortal:', e.message); return null; }
 }
 
+async function getTokenSymbol(mint) {
+  if (cacheSimbolos.has(mint)) return cacheSimbolos.get(mint);
+  let symbol = mint.slice(0, 6) + '...';
+  try {
+    const res = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.symbol) symbol = data.symbol;
+      else if (data.name) symbol = data.name;
+    }
+  } catch (e) { console.log('No se pudo obtener símbolo de', mint, e.message); }
+  cacheSimbolos.set(mint, symbol);
+  return symbol;
+}
+
+// Snapshot REAL: consulta directo a la blockchain de Solana (vía Helius) qué tokens tiene la wallet AHORA MISMO.
+// Reemplaza al endpoint inventado de PumpPortal que nunca existió y siempre regresaba vacío.
+async function getHoldings(address) {
+  if (!connection) { console.error('No hay conexión RPC, no se puede hacer snapshot real'); return []; }
+  try {
+    const owner = new PublicKey(address);
+    const [legacy, token2022] = await Promise.all([
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }),
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }).catch(() => ({ value: [] }))
+    ]);
+    const todasLasCuentas = [...legacy.value, ...token2022.value];
+    const conSaldo = todasLasCuentas
+      .map(acc => acc.account.data.parsed.info)
+      .filter(info => info.tokenAmount && parseFloat(info.tokenAmount.uiAmount || 0) > 0)
+      .map(info => ({ mint: info.mint }));
+    return conSaldo;
+  } catch (e) {
+    console.error('Error haciendo snapshot real de holdings:', e.message);
+    return [];
+  }
+}
+
 async function initDB() {
   try {
     await pool.query(`
@@ -123,13 +162,6 @@ async function getPaperBalance() {
 async function adjustPaperBalance(deltaUsd) {
   const { rows } = await pool.query('UPDATE global_balance SET current_usdc = current_usdc + $1 WHERE id=1 RETURNING current_usdc', [deltaUsd]);
   return rows[0]?.current_usdc;
-}
-
-async function getHoldings(address) {
-  try {
-    const res = await fetch(`https://pumpportal.fun/api/data/holdings?address=${address}`);
-    const data = await res.json(); return Array.isArray(data) ? data : [];
-  } catch { return []; }
 }
 
 async function getSolPriceUSD() {
@@ -192,13 +224,16 @@ async function swapProfitToUsdc(amountSol) {
 
 async function handleTrackedBuy(tracked, trade) {
   const solPaid = trade.solAmount || 0;
-  if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} ${trade.symbol} (${solPaid} SOL)`); return; }
+  if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} (${solPaid} SOL)`); return; }
 
-  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} compró ${trade.symbol} · ${solPaid.toFixed(3)} SOL`);
+  const symbol = await getTokenSymbol(trade.mint);
+  const link = `https://pump.fun/coin/${trade.mint}`;
+
+  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} compró ${symbol} · ${solPaid.toFixed(3)} SOL\n🔗 ${link}`);
 
   const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
   if (seen.rows.length > 0) {
-    console.log(`R2: recompra/ya visto ignorado ${tracked.alias} ${trade.symbol}`);
+    console.log(`R2: recompra/ya visto ignorado ${tracked.alias} ${symbol}`);
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (recompra o ya visto)`);
     return;
   }
@@ -226,26 +261,27 @@ async function handleTrackedBuy(tracked, trade) {
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
-        [trade.mint, trade.symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${trade.symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · tx:${sig}`);
+        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · tx:${sig}`);
     } catch (e) {
       console.error('Error comprando real:', e.message);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al comprar ${trade.symbol}: ${e.message}`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al comprar ${symbol}: ${e.message}`);
     }
   } else {
     await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
-      [trade.mint, trade.symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
+      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
     const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: BOT copió a ${tracked.alias} - compró ${trade.symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: BOT copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
   }
 }
 
 async function handleTrackedSell(tracked, trade) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
+  const symbol = await getTokenSymbol(trade.mint);
   const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
   if (posRes.rows.length === 0) {
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${trade.symbol} (no tenías posición vía esta wallet, nada que copiar)`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
     return;
   }
   const position = posRes.rows[0];
@@ -258,7 +294,7 @@ async function handleTrackedSell(tracked, trade) {
       const proceedsSol = after - before;
       const profit = proceedsSol - position.cost_basis_sol;
       await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
-      let msg = `📤 VENTA REAL [${tracked.alias}] ${trade.symbol} 100% · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`;
+      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`;
       if (profit > 0) {
         const usdcSig = await swapProfitToUsdc(profit);
         msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
@@ -266,7 +302,7 @@ async function handleTrackedSell(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${trade.symbol}: ${e.message}`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${e.message}`);
     }
   } else {
     const priceAtSell = bondingCurvePriceSol(trade);
@@ -276,7 +312,7 @@ async function handleTrackedSell(tracked, trade) {
     const proceedsUsd = solPrice ? proceedsSol * solPrice : tracked.amount;
     await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    let msg = `🧪 PAPER: BOT vendió 100% ${trade.symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
+    let msg = `🧪 PAPER: BOT vendió 100% ${symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (profit > 0) msg += `\n💵 (simulado) ${profit.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
   }
@@ -294,11 +330,11 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
     const holdings = await getHoldings(address);
     for (const h of holdings) {
-      const mint = h.mint || h.address;
+      const mint = h.mint;
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra. Snapshot: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra. Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
