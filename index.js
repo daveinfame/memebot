@@ -1,9 +1,9 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + VERIFICACION DE CONEXION =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY DE PUMPPORTAL =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-const { Connection, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { Connection, Keypair, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const bs58 = require('bs58');
 
 const pool = new Pool({
@@ -13,12 +13,17 @@ const pool = new Pool({
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const CHAT_ID = process.env.CHAT_ID;
 
-const PUMP_PORTAL_WS = 'wss://pumpportal.fun/api/data';
+// La API key es obligatoria para subscribeAccountTrade (sin ella, PumpPortal ignora la suscripción sin avisar)
+if (!process.env.PUMPPORTAL_API_KEY) {
+  console.error('⚠️ FALTA PUMPPORTAL_API_KEY - las wallets trackeadas NO se van a poder vigilar sin esto');
+}
+const PUMP_PORTAL_WS = `wss://pumpportal.fun/api/data?api-key=${process.env.PUMPPORTAL_API_KEY || ''}`;
 const PUMP_PORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
 const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
 const JUPITER_SWAP = 'https://quote-api.jup.ag/v6/swap';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const PUMPPORTAL_WALLET = 'Guao96aNr7GUj3CSspwLy3tEccL3RUh5xVT4W3KNfBUH'; // wallet ligada a tu API key, para saber cuánto SOL le queda
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const DUST_MIN_SOL = 0.05;
@@ -66,6 +71,14 @@ async function logWatchList() {
     if (rows.length === 0) { console.log('Escuchando: ninguna wallet agregada todavía'); return; }
     console.log(`Escuchando: ${rows.map(r => r.alias).join(', ')} (${rows.length} wallets)`);
   } catch (e) { console.error('Error listando wallets vigiladas:', e.message); }
+}
+
+async function getPumpPortalWalletBalance() {
+  if (!connection) return null;
+  try {
+    const lamports = await connection.getBalance(new PublicKey(PUMPPORTAL_WALLET));
+    return lamports / LAMPORTS_PER_SOL;
+  } catch (e) { console.error('Error consultando saldo de PumpPortal:', e.message); return null; }
 }
 
 async function initDB() {
@@ -311,14 +324,18 @@ bot.onText(/\/positions/, async (msg) => {
 bot.onText(/\/status/, async (msg) => {
   const modo = LIVE ? 'REAL' : 'PAPER';
   const estadoConexion = primerMensajeConfirmado ? `✅ PumpPortal confirmado (${totalMensajesRecibidos} eventos recibidos)` : '⏳ Esperando primer dato de PumpPortal...';
+  const saldoApiKey = await getPumpPortalWalletBalance();
+  const lineaApiKey = saldoApiKey !== null
+    ? `${saldoApiKey < 0.005 ? '⚠️ BAJO' : '💳'} Saldo cuenta PumpPortal: ${saldoApiKey.toFixed(4)} SOL`
+    : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
   if (LIVE) {
     const solBalance = await getWalletSolBalance();
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}\n${estadoConexion}`);
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}\n${estadoConexion}\n${lineaApiKey}`);
   } else {
     const balance = await getPaperBalance();
     const pnl = balance.current_usdc - balance.initial_usdc;
     const signo = pnl >= 0 ? '📈' : '📉';
-    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}`);
+    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}`);
   }
 });
 
@@ -329,7 +346,7 @@ bot.onText(/\/help/, async (msg) => {
     '/remove alias - Elimina una wallet de la lista',
     '/list - Muestra todas las wallets que sigues',
     '/positions - Muestra las posiciones abiertas del bot',
-    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida y si la API de PumpPortal está viva',
+    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -338,12 +355,9 @@ bot.onText(/\/help/, async (msg) => {
 function startListener() {
   ws = new WebSocket(PUMP_PORTAL_WS);
   ws.on('open', async () => {
-    console.log('WS conectado');
+    console.log('WS conectado (con API key)');
     const { rows } = await pool.query('SELECT address FROM tracked_wallets');
     if (rows.length > 0) ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
-    // Nos suscribimos también a TODOS los tokens nuevos que se crean en pump.fun.
-    // Esto no afecta tus reglas (esos eventos no coinciden con tus wallets y se ignoran),
-    // pero sirve como "pulso" para comprobar que PumpPortal realmente está mandando datos en vivo.
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     await logWatchList();
   });
@@ -369,7 +383,6 @@ function startListener() {
   ws.on('error', (e) => console.error('WS err', e));
 }
 
-// Resumen de vida cada 5 minutos, para detectar de inmediato si la conexión se quedó "muda"
 setInterval(() => {
   if (mensajesDesdeUltimoResumen === 0) {
     console.warn('⚠️ ALERTA: no ha llegado NINGÚN dato de PumpPortal en los últimos 5 minutos. Revisa la conexión.');
