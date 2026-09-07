@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - REGLAS R0/R0.5/R1/R2/R3/R5 =========
+// ========= MEMEBOT REAL TRADING - REGLAS R0/R0.5/R1/R2/R3/R5 + SALDO PAPER =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -22,6 +22,7 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const DUST_MIN_SOL = 0.05;
+const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 
 let connection = null;
 let walletKeypair = null;
@@ -53,9 +54,23 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT PRIMARY KEY, symbol TEXT, chain TEXT, amount REAL);
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;
+      CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
+      INSERT INTO global_balance (id, initial_usdc, current_usdc)
+        VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
+        ON CONFLICT (id) DO NOTHING;
     `);
     console.log('DB OK');
   } catch (e) { console.error('DB Error', e); }
+}
+
+async function getPaperBalance() {
+  const { rows } = await pool.query('SELECT * FROM global_balance WHERE id=1');
+  return rows[0] || { initial_usdc: INITIAL_PAPER_BALANCE, current_usdc: INITIAL_PAPER_BALANCE };
+}
+
+async function adjustPaperBalance(deltaUsd) {
+  const { rows } = await pool.query('UPDATE global_balance SET current_usdc = current_usdc + $1 WHERE id=1 RETURNING current_usdc', [deltaUsd]);
+  return rows[0]?.current_usdc;
 }
 
 async function getHoldings(address) {
@@ -127,7 +142,6 @@ async function handleTrackedBuy(tracked, trade) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} ${trade.symbol} (${solPaid} SOL)`); return; }
 
-  // Aviso de que la wallet compró, SIEMPRE que no sea dust (aunque el bot no la copie)
   if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} compró ${trade.symbol} · ${solPaid.toFixed(3)} SOL`);
 
   const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
@@ -169,7 +183,8 @@ async function handleTrackedBuy(tracked, trade) {
   } else {
     await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
       [trade.mint, trade.symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: BOT copió a ${tracked.alias} - compró ${trade.symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount})`);
+    const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: BOT copió a ${tracked.alias} - compró ${trade.symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
   }
 }
 
@@ -205,8 +220,11 @@ async function handleTrackedSell(tracked, trade) {
     const priceAtSell = bondingCurvePriceSol(trade);
     const proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
     const profit = proceedsSol - position.cost_basis_sol;
+    const solPrice = await getSolPriceUSD();
+    const proceedsUsd = solPrice ? proceedsSol * solPrice : tracked.amount;
     await pool.query('DELETE FROM bot_positions WHERE token_mint=$1', [trade.mint]);
-    let msg = `🧪 PAPER: BOT vendió 100% ${trade.symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL · Ganancia simulada: ${profit.toFixed(4)} SOL`;
+    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+    let msg = `🧪 PAPER: BOT vendió 100% ${trade.symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (profit > 0) msg += `\n💵 (simulado) ${profit.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
   }
@@ -230,6 +248,15 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
+bot.onText(/\/remove (.+)/, async (msg, match) => {
+  try {
+    const alias = match[1].trim();
+    const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
+    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`);
+    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
+  } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
+});
+
 bot.onText(/\/list/, async (msg) => {
   const { rows } = await pool.query('SELECT * FROM tracked_wallets');
   bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.alias} ${r.address.slice(0, 6)} $${r.amount} ${getLabel(r.chain)}`).join('\n') || 'Vacío');
@@ -242,17 +269,25 @@ bot.onText(/\/positions/, async (msg) => {
 
 bot.onText(/\/status/, async (msg) => {
   const modo = LIVE ? 'REAL' : 'PAPER';
-  const solBalance = LIVE ? await getWalletSolBalance() : null;
-  bot.sendMessage(msg.chat.id, `Estado: ${modo}${solBalance !== null ? ` | Saldo SOL: ${solBalance.toFixed(4)}` : ''} | RH Chain solo alertas (no ejecuta)`);
+  if (LIVE) {
+    const solBalance = await getWalletSolBalance();
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}`);
+  } else {
+    const balance = await getPaperBalance();
+    const pnl = balance.current_usdc - balance.initial_usdc;
+    const signo = pnl >= 0 ? '📈' : '📉';
+    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`);
+  }
 });
 
 bot.onText(/\/help/, async (msg) => {
   const texto = [
     '📋 Comandos disponibles:',
     '/add alias direccion monto_usd cadena - Agrega/actualiza una wallet a seguir (monto en USD)',
+    '/remove alias - Elimina una wallet de la lista',
     '/list - Muestra todas las wallets que sigues',
     '/positions - Muestra las posiciones abiertas del bot',
-    '/status - Muestra modo (REAL/PAPER) y saldo',
+    '/status - Muestra modo (REAL/PAPER), saldo y ganancia/pérdida',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
