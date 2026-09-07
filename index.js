@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - REGLAS R0/R0.5/R1/R2/R3/R5 + SALDO PAPER =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -26,6 +26,8 @@ const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 
 let connection = null;
 let walletKeypair = null;
+let ws = null;
+
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
   if (process.env.WALLET_PRIVATE_KEY) walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
@@ -46,12 +48,21 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[c.toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
+function subscribeWallet(address) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: [address] }));
+    console.log('Suscrito en vivo a', address);
+  } else {
+    console.log('WS no está listo todavía, la wallet se suscribirá en la próxima reconexión');
+  }
+}
+
 async function initDB() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS tracked_wallets (alias TEXT PRIMARY KEY, address TEXT, amount REAL, chain TEXT);
       CREATE TABLE IF NOT EXISTS seen_tokens (wallet_address TEXT, token_mint TEXT, PRIMARY KEY (wallet_address, token_mint));
-      CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT PRIMARY KEY, symbol TEXT, chain TEXT, amount REAL);
+      CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT, symbol TEXT, chain TEXT, amount REAL);
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;
       CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
@@ -61,6 +72,24 @@ async function initDB() {
     `);
     console.log('DB OK');
   } catch (e) { console.error('DB Error', e); }
+
+  // Migración: cada posición ahora es única por (token_mint, wallet_alias), no solo por token_mint
+  try {
+    await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE table_name='bot_positions' AND constraint_name='bot_positions_pkey_v2'
+        ) THEN
+          ALTER TABLE bot_positions DROP CONSTRAINT IF EXISTS bot_positions_pkey;
+          ALTER TABLE bot_positions ADD CONSTRAINT bot_positions_pkey_v2 PRIMARY KEY (token_mint, wallet_alias);
+        END IF;
+      END $$;
+    `);
+    console.log('Migración de posiciones por wallet OK');
+  } catch (e) { console.error('Error migrando bot_positions:', e.message); }
 }
 
 async function getPaperBalance() {
@@ -152,10 +181,11 @@ async function handleTrackedBuy(tracked, trade) {
   }
   await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
 
-  const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1', [trade.mint]);
+  // La posición ahora se checa por token + wallet que la originó, no solo por token
+  const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
   if (existingPos.rows.length > 0) {
-    console.log('R2: posición ya abierta, ignorado');
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (ya tienes posición abierta en este token)`);
+    console.log('R2: posición ya abierta con esta wallet, ignorado');
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (ya tienes posición abierta en este token vía ${tracked.alias})`);
     return;
   }
 
@@ -191,9 +221,10 @@ async function handleTrackedBuy(tracked, trade) {
 async function handleTrackedSell(tracked, trade) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
-  const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1', [trade.mint]);
+  // Se busca la posición específica de ESTA wallet en ESTE token
+  const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
   if (posRes.rows.length === 0) {
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${trade.symbol} (no tenías posición, nada que copiar)`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${trade.symbol} (no tenías posición vía esta wallet, nada que copiar)`);
     return;
   }
   const position = posRes.rows[0];
@@ -205,7 +236,7 @@ async function handleTrackedSell(tracked, trade) {
       const after = await getWalletSolBalance();
       const proceedsSol = after - before;
       const profit = proceedsSol - position.cost_basis_sol;
-      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1', [trade.mint]);
+      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
       let msg = `📤 VENTA REAL [${tracked.alias}] ${trade.symbol} 100% · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`;
       if (profit > 0) {
         const usdcSig = await swapProfitToUsdc(profit);
@@ -222,7 +253,7 @@ async function handleTrackedSell(tracked, trade) {
     const profit = proceedsSol - position.cost_basis_sol;
     const solPrice = await getSolPriceUSD();
     const proceedsUsd = solPrice ? proceedsSol * solPrice : tracked.amount;
-    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1', [trade.mint]);
+    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
     let msg = `🧪 PAPER: BOT vendió 100% ${trade.symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (profit > 0) msg += `\n💵 (simulado) ${profit.toFixed(4)} SOL de ganancia se convertirían a USDC`;
@@ -237,6 +268,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     const amount = parseFloat(amountStr);
     const chain = normalizeChain(chainRaw);
     await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
+    subscribeWallet(address);
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
     const holdings = await getHoldings(address);
     for (const h of holdings) {
@@ -244,7 +276,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra. Snapshot: ${holdings.length} tokens vistos.`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra. Snapshot: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -294,9 +326,9 @@ bot.onText(/\/help/, async (msg) => {
 });
 
 function startListener() {
-  const ws = new WebSocket(PUMP_PORTAL_WS);
+  ws = new WebSocket(PUMP_PORTAL_WS);
   ws.on('open', async () => {
-    console.log('WS conectado multichain incl RH');
+    console.log('WS conectado');
     const { rows } = await pool.query('SELECT address FROM tracked_wallets');
     if (rows.length > 0) ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
   });
