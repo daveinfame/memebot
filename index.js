@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + VERIFICACION DE CONEXION =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -27,6 +27,9 @@ const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 let connection = null;
 let walletKeypair = null;
 let ws = null;
+let totalMensajesRecibidos = 0;
+let primerMensajeConfirmado = false;
+let mensajesDesdeUltimoResumen = 0;
 
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
@@ -57,6 +60,14 @@ function subscribeWallet(address) {
   }
 }
 
+async function logWatchList() {
+  try {
+    const { rows } = await pool.query('SELECT alias FROM tracked_wallets ORDER BY alias');
+    if (rows.length === 0) { console.log('Escuchando: ninguna wallet agregada todavía'); return; }
+    console.log(`Escuchando: ${rows.map(r => r.alias).join(', ')} (${rows.length} wallets)`);
+  } catch (e) { console.error('Error listando wallets vigiladas:', e.message); }
+}
+
 async function initDB() {
   try {
     await pool.query(`
@@ -73,7 +84,6 @@ async function initDB() {
     console.log('DB OK');
   } catch (e) { console.error('DB Error', e); }
 
-  // Migración: cada posición ahora es única por (token_mint, wallet_alias), no solo por token_mint
   try {
     await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
     await pool.query(`
@@ -181,7 +191,6 @@ async function handleTrackedBuy(tracked, trade) {
   }
   await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
 
-  // La posición ahora se checa por token + wallet que la originó, no solo por token
   const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
   if (existingPos.rows.length > 0) {
     console.log('R2: posición ya abierta con esta wallet, ignorado');
@@ -221,7 +230,6 @@ async function handleTrackedBuy(tracked, trade) {
 async function handleTrackedSell(tracked, trade) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
-  // Se busca la posición específica de ESTA wallet en ESTE token
   const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
   if (posRes.rows.length === 0) {
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${trade.symbol} (no tenías posición vía esta wallet, nada que copiar)`);
@@ -269,6 +277,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     const chain = normalizeChain(chainRaw);
     await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
     subscribeWallet(address);
+    await logWatchList();
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
     const holdings = await getHoldings(address);
     for (const h of holdings) {
@@ -284,7 +293,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
-    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`);
+    if (result.rows.length > 0) { bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`); await logWatchList(); }
     else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
@@ -301,14 +310,15 @@ bot.onText(/\/positions/, async (msg) => {
 
 bot.onText(/\/status/, async (msg) => {
   const modo = LIVE ? 'REAL' : 'PAPER';
+  const estadoConexion = primerMensajeConfirmado ? `✅ PumpPortal confirmado (${totalMensajesRecibidos} eventos recibidos)` : '⏳ Esperando primer dato de PumpPortal...';
   if (LIVE) {
     const solBalance = await getWalletSolBalance();
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}`);
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}\n${estadoConexion}`);
   } else {
     const balance = await getPaperBalance();
     const pnl = balance.current_usdc - balance.initial_usdc;
     const signo = pnl >= 0 ? '📈' : '📉';
-    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`);
+    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}`);
   }
 });
 
@@ -319,7 +329,7 @@ bot.onText(/\/help/, async (msg) => {
     '/remove alias - Elimina una wallet de la lista',
     '/list - Muestra todas las wallets que sigues',
     '/positions - Muestra las posiciones abiertas del bot',
-    '/status - Muestra modo (REAL/PAPER), saldo y ganancia/pérdida',
+    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida y si la API de PumpPortal está viva',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -331,9 +341,21 @@ function startListener() {
     console.log('WS conectado');
     const { rows } = await pool.query('SELECT address FROM tracked_wallets');
     if (rows.length > 0) ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
+    // Nos suscribimos también a TODOS los tokens nuevos que se crean en pump.fun.
+    // Esto no afecta tus reglas (esos eventos no coinciden con tus wallets y se ignoran),
+    // pero sirve como "pulso" para comprobar que PumpPortal realmente está mandando datos en vivo.
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    await logWatchList();
   });
   ws.on('message', async (raw) => {
     try {
+      totalMensajesRecibidos++;
+      mensajesDesdeUltimoResumen++;
+      if (!primerMensajeConfirmado) {
+        primerMensajeConfirmado = true;
+        console.log('✅ CONFIRMADO: PumpPortal está mandando datos en vivo (llegó el primer evento)');
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, '✅ Confirmado: la API de PumpPortal está funcionando y mandando datos en vivo.');
+      }
       const trade = JSON.parse(raw.toString());
       if (!trade.mint) return;
       const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [trade.traderPublicKey]);
@@ -343,9 +365,19 @@ function startListener() {
       else if (trade.txType === 'sell') await handleTrackedSell(tracked, trade);
     } catch (e) { console.error('ws msg', e); }
   });
-  ws.on('close', () => setTimeout(startListener, 5000));
+  ws.on('close', () => { console.log('WS cerrado, reintentando en 5s...'); setTimeout(startListener, 5000); });
   ws.on('error', (e) => console.error('WS err', e));
 }
+
+// Resumen de vida cada 5 minutos, para detectar de inmediato si la conexión se quedó "muda"
+setInterval(() => {
+  if (mensajesDesdeUltimoResumen === 0) {
+    console.warn('⚠️ ALERTA: no ha llegado NINGÚN dato de PumpPortal en los últimos 5 minutos. Revisa la conexión.');
+  } else {
+    console.log(`💓 Pulso OK: ${mensajesDesdeUltimoResumen} eventos recibidos en los últimos 5 min (total acumulado: ${totalMensajesRecibidos})`);
+  }
+  mensajesDesdeUltimoResumen = 0;
+}, 5 * 60 * 1000);
 
 initDB().then(() => startListener());
 console.log(`MEMEBOT REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
