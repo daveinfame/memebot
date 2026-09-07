@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY + NOMBRE DE TOKEN + SNAPSHOT REAL =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -83,23 +83,28 @@ async function getPumpPortalWalletBalance() {
   } catch (e) { console.error('Error consultando saldo de PumpPortal:', e.message); return null; }
 }
 
+// Busca el símbolo del token usando el servicio DAS de Helius (mismo proveedor que ya usas para el RPC)
 async function getTokenSymbol(mint) {
   if (cacheSimbolos.has(mint)) return cacheSimbolos.get(mint);
   let symbol = mint.slice(0, 6) + '...';
   try {
-    const res = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
-    if (res.ok) {
+    if (process.env.HELIUS_RPC_URL) {
+      const res = await fetch(process.env.HELIUS_RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'symbol-lookup', method: 'getAsset', params: { id: mint } })
+      });
       const data = await res.json();
-      if (data.symbol) symbol = data.symbol;
-      else if (data.name) symbol = data.name;
+      const meta = data?.result?.content?.metadata;
+      if (meta?.symbol) symbol = meta.symbol;
+      else if (meta?.name) symbol = meta.name;
     }
   } catch (e) { console.log('No se pudo obtener símbolo de', mint, e.message); }
   cacheSimbolos.set(mint, symbol);
   return symbol;
 }
 
-// Snapshot REAL: consulta directo a la blockchain de Solana (vía Helius) qué tokens tiene la wallet AHORA MISMO.
-// Reemplaza al endpoint inventado de PumpPortal que nunca existió y siempre regresaba vacío.
+// Snapshot REAL: consulta directo a la blockchain de Solana qué tokens tiene la wallet AHORA MISMO.
 async function getHoldings(address) {
   if (!connection) { console.error('No hay conexión RPC, no se puede hacer snapshot real'); return []; }
   try {
