@@ -127,12 +127,28 @@ async function handleTrackedBuy(tracked, trade) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} ${trade.symbol} (${solPaid} SOL)`); return; }
 
+  // Aviso de que la wallet compró, SIEMPRE que no sea dust (aunque el bot no la copie)
+  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} compró ${trade.symbol} · ${solPaid.toFixed(3)} SOL`);
+
   const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
-  if (seen.rows.length > 0) { console.log(`R2: recompra/ya visto ignorado ${tracked.alias} ${trade.symbol}`); return; }
+  if (seen.rows.length > 0) {
+    console.log(`R2: recompra/ya visto ignorado ${tracked.alias} ${trade.symbol}`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (recompra o ya visto)`);
+    return;
+  }
   await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
 
   const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1', [trade.mint]);
-  if (existingPos.rows.length > 0) { console.log('R2: posición ya abierta, ignorado'); return; }
+  if (existingPos.rows.length > 0) {
+    console.log('R2: posición ya abierta, ignorado');
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (ya tienes posición abierta en este token)`);
+    return;
+  }
+
+  if (tracked.chain !== 'solana') {
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (esta cadena solo genera alertas, no ejecución)`);
+    return;
+  }
 
   const solPrice = await getSolPriceUSD();
   if (!solPrice) { console.error('No se pudo obtener precio de SOL, se aborta compra'); return; }
@@ -140,7 +156,7 @@ async function handleTrackedBuy(tracked, trade) {
   const priceAtBuy = bondingCurvePriceSol(trade);
   const tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
 
-  if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
+  if (LIVE && walletKeypair && connection) {
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
@@ -161,7 +177,10 @@ async function handleTrackedSell(tracked, trade) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
   const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1', [trade.mint]);
-  if (posRes.rows.length === 0) return;
+  if (posRes.rows.length === 0) {
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${trade.symbol} (no tenías posición, nada que copiar)`);
+    return;
+  }
   const position = posRes.rows[0];
 
   if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
