@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + SUSCRIPCION EN VIVO + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL =========
+// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC COMPLETO DE SUSCRIPCIONES + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -58,21 +58,20 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[c.toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-function subscribeWallet(address) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: [address] }));
-    console.log('Suscrito en vivo a', address);
-  } else {
-    console.log('WS no está listo todavía, la wallet se suscribirá en la próxima reconexión');
+// Re-sincroniza SIEMPRE la lista COMPLETA de wallets con PumpPortal (no manda solo la nueva).
+// Esto evita depender de si PumpPortal suma o reemplaza suscripciones al recibir un subscribeAccountTrade.
+async function resyncSubscriptions() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log('WS no está listo todavía, se sincronizará completo en la próxima conexión');
+    return;
   }
-}
-
-async function logWatchList() {
   try {
-    const { rows } = await pool.query('SELECT alias FROM tracked_wallets ORDER BY alias');
-    if (rows.length === 0) { console.log('Escuchando: ninguna wallet agregada todavía'); return; }
-    console.log(`Escuchando: ${rows.map(r => r.alias).join(', ')} (${rows.length} wallets)`);
-  } catch (e) { console.error('Error listando wallets vigiladas:', e.message); }
+    const { rows } = await pool.query('SELECT alias, address FROM tracked_wallets');
+    if (rows.length > 0) {
+      ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
+    }
+    console.log(`🔁 Resincronizado: escuchando ${rows.length} wallets en total (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
+  } catch (e) { console.error('Error resincronizando suscripciones:', e.message); }
 }
 
 async function getPumpPortalWalletBalance() {
@@ -83,7 +82,6 @@ async function getPumpPortalWalletBalance() {
   } catch (e) { console.error('Error consultando saldo de PumpPortal:', e.message); return null; }
 }
 
-// Busca el símbolo del token usando el servicio DAS de Helius (mismo proveedor que ya usas para el RPC)
 async function getTokenSymbol(mint) {
   if (cacheSimbolos.has(mint)) return cacheSimbolos.get(mint);
   let symbol = mint.slice(0, 6) + '...';
@@ -104,7 +102,6 @@ async function getTokenSymbol(mint) {
   return symbol;
 }
 
-// Snapshot REAL: consulta directo a la blockchain de Solana qué tokens tiene la wallet AHORA MISMO.
 async function getHoldings(address) {
   if (!connection) { console.error('No hay conexión RPC, no se puede hacer snapshot real'); return []; }
   try {
@@ -330,8 +327,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     const amount = parseFloat(amountStr);
     const chain = normalizeChain(chainRaw);
     await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
-    subscribeWallet(address);
-    await logWatchList();
+    await resyncSubscriptions();
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
     const holdings = await getHoldings(address);
     for (const h of holdings) {
@@ -347,7 +343,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
-    if (result.rows.length > 0) { bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`); await logWatchList(); }
+    if (result.rows.length > 0) { bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`); await resyncSubscriptions(); }
     else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
@@ -355,6 +351,11 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
 bot.onText(/\/list/, async (msg) => {
   const { rows } = await pool.query('SELECT * FROM tracked_wallets');
   bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.alias} ${r.address.slice(0, 6)} $${r.amount} ${getLabel(r.chain)}`).join('\n') || 'Vacío');
+});
+
+bot.onText(/\/resync/, async (msg) => {
+  await resyncSubscriptions();
+  bot.sendMessage(msg.chat.id, '🔁 Suscripciones resincronizadas con PumpPortal.');
 });
 
 bot.onText(/\/positions/, async (msg) => {
@@ -386,6 +387,7 @@ bot.onText(/\/help/, async (msg) => {
     '/add alias direccion monto_usd cadena - Agrega/actualiza una wallet a seguir (monto en USD)',
     '/remove alias - Elimina una wallet de la lista',
     '/list - Muestra todas las wallets que sigues',
+    '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
     '/positions - Muestra las posiciones abiertas del bot',
     '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
@@ -397,10 +399,8 @@ function startListener() {
   ws = new WebSocket(PUMP_PORTAL_WS);
   ws.on('open', async () => {
     console.log('WS conectado (con API key)');
-    const { rows } = await pool.query('SELECT address FROM tracked_wallets');
-    if (rows.length > 0) ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
+    await resyncSubscriptions();
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    await logWatchList();
   });
   ws.on('message', async (raw) => {
     try {
@@ -432,6 +432,9 @@ setInterval(() => {
   }
   mensajesDesdeUltimoResumen = 0;
 }, 5 * 60 * 1000);
+
+// Resincronización preventiva cada 10 minutos, por si alguna suscripción se perdió sin que nos diéramos cuenta
+setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
 
 initDB().then(() => startListener());
 console.log(`MEMEBOT REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
