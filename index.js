@@ -1,4 +1,4 @@
-// ========= MEMEBOT REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC COMPLETO DE SUSCRIPCIONES + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC COMPLETO + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL + RANKING =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -12,6 +12,7 @@ const pool = new Pool({
 });
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const CHAT_ID = process.env.CHAT_ID;
+const NOMBRE_BOT = '⚡️M3M3B0T⚡️';
 
 if (!process.env.PUMPPORTAL_API_KEY) {
   console.error('⚠️ FALTA PUMPPORTAL_API_KEY - las wallets trackeadas NO se van a poder vigilar sin esto');
@@ -58,8 +59,6 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[c.toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Re-sincroniza SIEMPRE la lista COMPLETA de wallets con PumpPortal (no manda solo la nueva).
-// Esto evita depender de si PumpPortal suma o reemplaza suscripciones al recibir un subscribeAccountTrade.
 async function resyncSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.log('WS no está listo todavía, se sincronizará completo en la próxima conexión');
@@ -134,6 +133,13 @@ async function initDB() {
       INSERT INTO global_balance (id, initial_usdc, current_usdc)
         VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
         ON CONFLICT (id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS trade_history (
+        id SERIAL PRIMARY KEY,
+        wallet_alias TEXT,
+        symbol TEXT,
+        profit_sol REAL,
+        closed_at TIMESTAMP DEFAULT NOW()
+      );
     `);
     console.log('DB OK');
   } catch (e) { console.error('DB Error', e); }
@@ -154,6 +160,12 @@ async function initDB() {
     `);
     console.log('Migración de posiciones por wallet OK');
   } catch (e) { console.error('Error migrando bot_positions:', e.message); }
+}
+
+async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
+  try {
+    await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol) VALUES ($1,$2,$3)', [walletAlias, symbol, profitSol]);
+  } catch (e) { console.error('Error registrando historial de trade:', e.message); }
 }
 
 async function getPaperBalance() {
@@ -256,8 +268,18 @@ async function handleTrackedBuy(tracked, trade) {
   const solPrice = await getSolPriceUSD();
   if (!solPrice) { console.error('No se pudo obtener precio de SOL, se aborta compra'); return; }
   const amountSol = tracked.amount / solPrice;
-  const priceAtBuy = bondingCurvePriceSol(trade);
-  const tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
+
+  // Calcula cuántos tokens le tocan a NUESTRA compra (más chica), escalando proporcionalmente
+  // el tokenAmount real reportado por PumpPortal para la compra de la wallet original.
+  // Esto reemplaza el cálculo viejo (que dependía de la curva de bonding y fallaba en tokens ya graduados).
+  let tokensBought = 0;
+  if (trade.tokenAmount && trade.solAmount > 0) {
+    const factorEscala = amountSol / trade.solAmount;
+    tokensBought = trade.tokenAmount * factorEscala;
+  } else {
+    const priceAtBuy = bondingCurvePriceSol(trade);
+    tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
+  }
 
   if (LIVE && walletKeypair && connection) {
     try {
@@ -273,7 +295,7 @@ async function handleTrackedBuy(tracked, trade) {
     await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
       [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
     const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: BOT copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
   }
 }
 
@@ -296,6 +318,7 @@ async function handleTrackedSell(tracked, trade) {
       const proceedsSol = after - before;
       const profit = proceedsSol - position.cost_basis_sol;
       await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+      await registrarTradeCerrado(tracked.alias, symbol, profit);
       let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`;
       if (profit > 0) {
         const usdcSig = await swapProfitToUsdc(profit);
@@ -307,14 +330,23 @@ async function handleTrackedSell(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${e.message}`);
     }
   } else {
-    const priceAtSell = bondingCurvePriceSol(trade);
-    const proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
+    // Usa el precio real reportado en el trade (solAmount/tokenAmount) cuando está disponible;
+    // si no, cae de vuelta a la curva de bonding como respaldo.
+    let proceedsSol;
+    if (trade.tokenAmount && trade.solAmount > 0) {
+      const precioPorToken = trade.solAmount / trade.tokenAmount;
+      proceedsSol = position.amount * precioPorToken;
+    } else {
+      const priceAtSell = bondingCurvePriceSol(trade);
+      proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
+    }
     const profit = proceedsSol - position.cost_basis_sol;
     const solPrice = await getSolPriceUSD();
     const proceedsUsd = solPrice ? proceedsSol * solPrice : tracked.amount;
     await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+    await registrarTradeCerrado(tracked.alias, symbol, profit);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    let msg = `🧪 PAPER: BOT vendió 100% ${symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
+    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (profit > 0) msg += `\n💵 (simulado) ${profit.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
   }
@@ -363,6 +395,26 @@ bot.onText(/\/positions/, async (msg) => {
   bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}`).join('\n') || 'Sin posiciones abiertas');
 });
 
+bot.onText(/\/ranking/, async (msg) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT wallet_alias,
+             COUNT(*) AS trades,
+             SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END) AS ganadores,
+             SUM(CASE WHEN profit_sol <= 0 THEN 1 ELSE 0 END) AS perdedores,
+             SUM(profit_sol) AS ganancia_total
+      FROM trade_history
+      GROUP BY wallet_alias
+      ORDER BY ganancia_total DESC
+    `);
+    if (rows.length === 0) { bot.sendMessage(msg.chat.id, 'Todavía no hay trades cerrados para armar el ranking.'); return; }
+    const texto = ['🏆 Ranking por wallet:', ''].concat(rows.map((r, i) =>
+      `${i + 1}. ${r.wallet_alias} · ${r.trades} trades (${r.ganadores}✅/${r.perdedores}❌) · ${r.ganancia_total >= 0 ? '+' : ''}${parseFloat(r.ganancia_total).toFixed(4)} SOL`
+    )).join('\n');
+    bot.sendMessage(msg.chat.id, texto);
+  } catch (e) { bot.sendMessage(msg.chat.id, 'Error generando ranking: ' + e.message); console.error(e); }
+});
+
 bot.onText(/\/status/, async (msg) => {
   const modo = LIVE ? 'REAL' : 'PAPER';
   const estadoConexion = primerMensajeConfirmado ? `✅ PumpPortal confirmado (${totalMensajesRecibidos} eventos recibidos)` : '⏳ Esperando primer dato de PumpPortal...';
@@ -389,6 +441,7 @@ bot.onText(/\/help/, async (msg) => {
     '/list - Muestra todas las wallets que sigues',
     '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
     '/positions - Muestra las posiciones abiertas del bot',
+    '/ranking - Muestra desempeño por wallet: trades, ganadores/perdedores, ganancia total',
     '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
   ].join('\n');
@@ -433,10 +486,9 @@ setInterval(() => {
   mensajesDesdeUltimoResumen = 0;
 }, 5 * 60 * 1000);
 
-// Resincronización preventiva cada 10 minutos, por si alguna suscripción se perdió sin que nos diéramos cuenta
 setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
 
 initDB().then(() => startListener());
-console.log(`MEMEBOT REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
+console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
 process.on('uncaughtException', e => console.error('uncaught', e));
 process.on('unhandledRejection', e => console.error('unhandled', e));
