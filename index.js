@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL + RANKING + RECONCILIACION =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL + RANKING + RECONCILIACION + LIMPIEZA DE POSICIONES =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -87,7 +87,7 @@ async function getTokenInfoHelius(mint) {
     return { symbol: cacheSimbolos.get(mint), decimals: cacheDecimales.get(mint) };
   }
   let symbol = mint.slice(0, 6) + '...';
-  let decimals = 6; // valor típico de pump.fun si no se puede confirmar
+  let decimals = 6;
   try {
     if (process.env.HELIUS_RPC_URL) {
       const res = await fetch(process.env.HELIUS_RPC_URL, {
@@ -132,19 +132,14 @@ async function getHoldings(address) {
   }
 }
 
-// Consulta directo a Solana cuánto tiene AHORA una wallet de un token específico (para reconciliación)
 async function getBalanceDeTokenEnWallet(walletAddress, mint) {
   if (!connection) return null;
   try {
     const owner = new PublicKey(walletAddress);
     const mintKey = new PublicKey(mint);
-    const [legacy, token2022] = await Promise.all([
-      connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey }),
-      connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey }).catch(() => ({ value: [] }))
-    ]);
-    const cuentas = [...legacy.value, ...(token2022?.value || [])];
+    const cuentas = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey });
     let total = 0;
-    for (const c of cuentas) {
+    for (const c of cuentas.value) {
       total += parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
     }
     return total;
@@ -269,8 +264,6 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-// Pide una cotización a Jupiter (sin ejecutar nada) para estimar cuánto SOL valdría vender X tokens ahorita.
-// Se usa SOLO quando reconciliamos una posición cuya venta real nunca llegó por PumpPortal.
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
   try {
     const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
@@ -282,7 +275,6 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
   } catch (e) { console.log('No se pudo cotizar valor de reconciliación:', e.message); return null; }
 }
 
-// ===== RECONCILIACIÓN: revisa posiciones abiertas contra la blockchain real, por si se perdió el aviso de venta =====
 async function reconciliarPosiciones() {
   if (!connection) return;
   try {
@@ -293,7 +285,7 @@ async function reconciliarPosiciones() {
     `);
     for (const pos of posiciones) {
       const balanceActual = await getBalanceDeTokenEnWallet(pos.wallet_address, pos.token_mint);
-      if (balanceActual === null) continue; // error de RPC, no concluir nada, reintentar después
+      if (balanceActual === null) continue;
       if (balanceActual === 0) {
         console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} - se perdió el aviso de venta, cerrando posición ahora`);
         const { decimals } = await getTokenInfoHelius(pos.token_mint);
@@ -307,7 +299,7 @@ async function reconciliarPosiciones() {
             const profit = proceedsSol - pos.cost_basis_sol;
             await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
             await registrarTradeCerrado(pos.wallet_alias, pos.symbol, profit);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Se había perdido el aviso original (probable desconexión). Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`);
+            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`);
           } catch (e) {
             console.error('Error en venta real de reconciliación:', e.message);
             if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No se pudo ejecutar la venta atrasada de ${pos.symbol}: ${e.message}`);
@@ -321,7 +313,7 @@ async function reconciliarPosiciones() {
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, profit);
           const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada detectada [${pos.wallet_alias}] ${pos.symbol} · Se había perdido el aviso original (probable desconexión). Valor estimado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia estimada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}${valorEstimado === null ? '\n(no se pudo cotizar el precio exacto, se usó el costo original como referencia)' : ''}`);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada detectada [${pos.wallet_alias}] ${pos.symbol} · Valor estimado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia estimada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}${valorEstimado === null ? '\n(no se pudo cotizar el precio exacto, se usó el costo original como referencia)' : ''}`);
         }
       }
     }
@@ -462,8 +454,27 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
-    if (result.rows.length > 0) { bot.sendMessage(msg.chat.id, `🗑️ ${alias} eliminado de la lista de wallets seguidas.`); await resyncSubscriptions(); }
+    if (result.rows.length > 0) {
+      const posEliminadas = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 RETURNING symbol', [alias]);
+      let respuesta = `🗑️ ${alias} eliminado de la lista de wallets seguidas.`;
+      if (posEliminadas.rows.length > 0) {
+        respuesta += `\n🧹 También se cerraron ${posEliminadas.rows.length} posición(es) abierta(s) ligada(s) a esta wallet: ${posEliminadas.rows.map(r => r.symbol).join(', ')} (sin calcular ganancia, ya que dejó de seguirse).`;
+      }
+      bot.sendMessage(msg.chat.id, respuesta);
+      await resyncSubscriptions();
+    }
     else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
+  } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
+});
+
+// Cierra manualmente una posición huérfana específica (útil para limpiar las que quedaron de antes de este arreglo)
+bot.onText(/\/closepos (.+) (.+)/, async (msg, match) => {
+  try {
+    const alias = match[1].trim();
+    const symbol = match[2].trim();
+    const result = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 AND symbol=$2 RETURNING *', [alias, symbol]);
+    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `🧹 Posición cerrada manualmente: ${symbol} vía ${alias} (${result.rows.length} eliminada(s)).`);
+    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna posición con alias "${alias}" y símbolo "${symbol}". Revisa /positions para ver los nombres exactos.`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -530,7 +541,8 @@ bot.onText(/\/help/, async (msg) => {
   const texto = [
     '📋 Comandos disponibles:',
     '/add alias direccion monto_usd cadena - Agrega/actualiza una wallet a seguir (monto en USD)',
-    '/remove alias - Elimina una wallet de la lista',
+    '/remove alias - Elimina una wallet Y cierra sus posiciones abiertas',
+    '/closepos alias simbolo - Cierra manualmente una posición huérfana específica',
     '/list - Muestra todas las wallets que sigues',
     '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
     '/reconciliar - Revisa manualmente si alguna posición abierta ya se vendió sin que el bot se enterara',
@@ -580,7 +592,7 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
-setInterval(() => { reconciliarPosiciones(); }, 5 * 60 * 1000); // revisa cada 5 min si alguna posición ya se cerró sin que nos enteráramos
+setInterval(() => { reconciliarPosiciones(); }, 5 * 60 * 1000);
 
 initDB().then(() => startListener());
 console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
