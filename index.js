@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0/R0.5/R1/R2/R3/R5 + SALDO PAPER + RESYNC + POSICIONES POR WALLET + API KEY + SIMBOLO VIA HELIUS + SNAPSHOT REAL + RANKING + RECONCILIACION + LIMPIEZA DE POSICIONES =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + PAPER + RESYNC + POSICIONES POR WALLET + RANKING + RECONCILIACION CONSERVADORA + PERDIDAS Y FEES CLAROS =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -30,6 +30,8 @@ const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqC
 const LIVE = process.env.LIVE_TRADING === 'true';
 const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
+const PUMPFUN_FEE_PCT = 0.0125; // 1.25% - comisión vigente de pump.fun por operación en la curva de bonding
+const NETWORK_FEE_SOL = 0.0005; // coincide con el priorityFee usado en cada transacción
 
 let connection = null;
 let walletKeypair = null;
@@ -59,6 +61,19 @@ const CHAIN_CONFIG = {
 };
 function normalizeChain(c) { return (CHAIN_CONFIG[c.toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
+
+// Formatea el resultado de un trade cerrado: ganancia clara, o PÉRDIDA clara con el monto exacto en SOL
+function formatearResultado(profit) {
+  if (profit < 0) return `❌ PÉRDIDA: ${Math.abs(profit).toFixed(4)} SOL`;
+  return `✅ Ganancia: +${profit.toFixed(4)} SOL`;
+}
+
+// Estima el costo en fees de pump.fun (1.25% por lado) + fee de red que ya pagamos, solo informativo
+function estimarFees(costBasisSol, proceedsSol) {
+  const feePumpFun = (costBasisSol + proceedsSol) * PUMPFUN_FEE_PCT;
+  const feeRed = NETWORK_FEE_SOL * 2; // una vez en la compra, una vez en la venta
+  return feePumpFun + feeRed;
+}
 
 async function resyncSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -264,33 +279,36 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-async function estimarValorEnSol(mint, cantidadTokens, decimals) {
-  try {
-    const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
-    if (rawAmount <= 0) return null;
-    const res = await fetch(`${JUPITER_QUOTE}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=500`);
-    const quote = await res.json();
-    if (!quote.outAmount) return null;
-    return parseFloat(quote.outAmount) / LAMPORTS_PER_SOL;
-  } catch (e) { console.log('No se pudo cotizar valor de reconciliación:', e.message); return null; }
-}
-
+// ===== RECONCILIACIÓN =====
+// Si se perdió el aviso de venta real, ASUMIMOS PÉRDIDA TOTAL del capital (no intentamos "adivinar" un valor de
+// recuperación con una cotización, porque si el token ya no está en la wallet lo más probable es que haya perdido
+// toda su liquidez - cotizar ahí es engañoso y puede mostrar ganancia donde hubo pérdida real).
 async function reconciliarPosiciones() {
-  if (!connection) return;
+  const marca = new Date().toISOString();
+  if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
+
   try {
     const { rows: posiciones } = await pool.query(`
       SELECT bp.*, tw.address AS wallet_address
       FROM bot_positions bp
       JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
     `);
+
+    if (posiciones.length === 0) {
+      console.log(`🔍 [${marca}] Reconciliación: 0 posiciones abiertas, nada que revisar.`);
+      return;
+    }
+
+    let cerradas = 0;
     for (const pos of posiciones) {
       const balanceActual = await getBalanceDeTokenEnWallet(pos.wallet_address, pos.token_mint);
       if (balanceActual === null) continue;
       if (balanceActual === 0) {
-        console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} - se perdió el aviso de venta, cerrando posición ahora`);
-        const { decimals } = await getTokenInfoHelius(pos.token_mint);
+        cerradas++;
+        console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} - se perdió el aviso de venta, cerrando como pérdida total`);
 
         if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
+          // En modo REAL sí intentamos vender de verdad lo que quede (si sigue siendo vendible) para recuperar lo que se pueda
           try {
             const before = await getWalletSolBalance();
             const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
@@ -299,24 +317,25 @@ async function reconciliarPosiciones() {
             const profit = proceedsSol - pos.cost_basis_sol;
             await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
             await registrarTradeCerrado(pos.wallet_alias, pos.symbol, profit);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`);
+            const fees = estimarFees(pos.cost_basis_sol, proceedsSol);
+            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Recibido: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(profit)} · Fees estimados: ~${fees.toFixed(4)} SOL · tx:${sig}`);
           } catch (e) {
             console.error('Error en venta real de reconciliación:', e.message);
             if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No se pudo ejecutar la venta atrasada de ${pos.symbol}: ${e.message}`);
           }
         } else {
-          const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-          const proceedsSol = valorEstimado !== null ? valorEstimado : pos.cost_basis_sol;
-          const profit = proceedsSol - pos.cost_basis_sol;
-          const solPrice = await getSolPriceUSD();
-          const proceedsUsd = solPrice ? proceedsSol * solPrice : 0;
+          // En PAPER, si ya no tiene el token, asumimos pérdida total del capital invertido en esa posición.
+          const proceedsSol = 0;
+          const profit = proceedsSol - pos.cost_basis_sol; // = -cost_basis_sol, pérdida total
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, profit);
-          const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada detectada [${pos.wallet_alias}] ${pos.symbol} · Valor estimado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia estimada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}${valorEstimado === null ? '\n(no se pudo cotizar el precio exacto, se usó el costo original como referencia)' : ''}`);
+          const nuevoSaldo = await adjustPaperBalance(0); // no se suma nada al saldo, se perdió todo
+          const fees = estimarFees(pos.cost_basis_sol, proceedsSol);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total del capital invertido (0.0000 SOL recuperados) · ${formatearResultado(profit)} · Fees estimados: ~${fees.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(Esto es una estimación conservadora: el token ya no está en la wallet trackeada y no sabemos a qué precio se vendió realmente)`);
         }
       }
     }
+    console.log(`🔍 [${marca}] Reconciliación completa: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
@@ -400,7 +419,8 @@ async function handleTrackedSell(tracked, trade) {
       const profit = proceedsSol - position.cost_basis_sol;
       await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
       await registrarTradeCerrado(tracked.alias, symbol, profit);
-      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Recibido: ${proceedsSol.toFixed(4)} SOL · Ganancia: ${profit.toFixed(4)} SOL · tx:${sig}`;
+      const fees = estimarFees(position.cost_basis_sol, proceedsSol);
+      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(profit)} · Fees estimados: ~${fees.toFixed(4)} SOL · tx:${sig}`;
       if (profit > 0) {
         const usdcSig = await swapProfitToUsdc(profit);
         msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
@@ -425,7 +445,8 @@ async function handleTrackedSell(tracked, trade) {
     await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
     await registrarTradeCerrado(tracked.alias, symbol, profit);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Recibido simulado: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · Ganancia simulada: ${profit.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
+    const fees = estimarFees(position.cost_basis_sol, proceedsSol);
+    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con: ${proceedsSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(profit)} · Fees estimados: ~${fees.toFixed(4)} SOL · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (profit > 0) msg += `\n💵 (simulado) ${profit.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
   }
@@ -467,7 +488,6 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
-// Cierra manualmente una posición huérfana específica (útil para limpiar las que quedaron de antes de este arreglo)
 bot.onText(/\/closepos (.+) (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
