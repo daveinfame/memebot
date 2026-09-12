@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + FEES DESCONTADOS DE VERDAD + %/MULTIPLICADOR + SIN CONFUSION DE PRECIO SOL + CHAIN OPCIONAL =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + FEES + %/MULTIPLICADOR + RECONCILIACION CON DOBLE CONFIRMACION (anti falsos positivos) =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -32,6 +32,7 @@ const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
+const CONFIRMACIONES_NECESARIAS = 2; // hay que ver el balance en 0 esta cantidad de veces seguidas antes de creer que sí vendió
 
 let connection = null;
 let walletKeypair = null;
@@ -62,9 +63,6 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Calcula el resultado FINAL ya con fees descontados, en SOL, USD, % y multiplicador.
-// costBasisSol y proceedsSolBruto SIEMPRE en SOL. netoDeFees indica si hay que restar fees estimados
-// (solo aplica en PAPER; en REAL los fees ya están reflejados en el balance real observado).
 function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoDeFees) {
   const fees = netoDeFees ? estimarFees(costBasisSol, proceedsSolBruto) : 0;
   const proceedsNetoSol = proceedsSolBruto - fees;
@@ -187,6 +185,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT, symbol TEXT, chain TEXT, amount REAL);
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;
+      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ceros_seguidos INT DEFAULT 0;
       CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
       INSERT INTO global_balance (id, initial_usdc, current_usdc)
         VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
@@ -294,6 +293,10 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
+// ===== RECONCILIACIÓN CON DOBLE CONFIRMACIÓN =====
+// Ya no cierra una posición con solo ver el balance en 0 UNA vez (eso puede ser un falso positivo por
+// retraso del RPC o por una wallet recién agregada cuya suscripción aún no toma efecto del todo).
+// Ahora exige ver el balance en 0 dos veces seguidas (≈10 minutos) antes de darlo por vendido de verdad.
 async function reconciliarPosiciones() {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
@@ -314,34 +317,50 @@ async function reconciliarPosiciones() {
     for (const pos of posiciones) {
       const balanceActual = await getBalanceDeTokenEnWallet(pos.wallet_address, pos.token_mint);
       if (balanceActual === null) continue;
-      if (balanceActual === 0) {
-        cerradas++;
-        console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} - se perdió el aviso de venta, cerrando como pérdida total`);
 
-        if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
-          try {
-            const before = await getWalletSolBalance();
-            const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
-            const after = await getWalletSolBalance();
-            const proceedsSol = after - before;
-            const solPrice = await getSolPriceUSD();
-            const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-            await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
-            await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`);
-          } catch (e) {
-            console.error('Error en venta real de reconciliación:', e.message);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No se pudo ejecutar la venta atrasada de ${pos.symbol}: ${e.message}`);
-          }
-        } else {
-          const proceedsSol = 0; // pérdida total asumida: ya no tiene el token y no sabemos a qué precio se vendió
+      if (balanceActual > 0) {
+        // Tiene balance de nuevo (o siempre lo tuvo) - resetea el contador de confirmaciones
+        if (pos.ceros_seguidos > 0) {
+          await pool.query('UPDATE bot_positions SET ceros_seguidos=0 WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+        }
+        continue;
+      }
+
+      // balanceActual === 0
+      const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
+      if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
+        await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3', [nuevosCeros, pos.token_mint, pos.wallet_alias]);
+        console.log(`🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0 (confirmación ${nuevosCeros}/${CONFIRMACIONES_NECESARIAS}), esperando siguiente ciclo antes de cerrar`);
+        continue;
+      }
+
+      // Ya se confirmó 2 veces seguidas: sí se considera vendida de verdad
+      cerradas++;
+      console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} (confirmado 2 veces) - cerrando posición`);
+
+      if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
+        try {
+          const before = await getWalletSolBalance();
+          const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
+          const after = await getWalletSolBalance();
+          const proceedsSol = after - before;
           const solPrice = await getSolPriceUSD();
-          const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false); // no se aplican fees extra sobre 0
+          const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          const nuevoSaldo = await adjustPaperBalance(0);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total (0 SOL recuperados) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(estimación conservadora: no sabemos a qué precio real se vendió)`);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`);
+        } catch (e) {
+          console.error('Error en venta real de reconciliación:', e.message);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No se pudo ejecutar la venta atrasada de ${pos.symbol}: ${e.message}`);
         }
+      } else {
+        const proceedsSol = 0;
+        const solPrice = await getSolPriceUSD();
+        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+        await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+        const nuevoSaldo = await adjustPaperBalance(0);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total (0 SOL recuperados) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(confirmado 2 veces seguidas antes de cerrar, para evitar falsos positivos)`);
       }
     }
     console.log(`🔍 [${marca}] Reconciliación completa: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
@@ -426,7 +445,7 @@ async function handleTrackedSell(tracked, trade) {
       const after = await getWalletSolBalance();
       const proceedsSol = after - before;
       const solPrice = await getSolPriceUSD();
-      const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false); // en REAL, el balance ya refleja los fees reales
+      const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
       await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
       await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
       let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
@@ -449,11 +468,11 @@ async function handleTrackedSell(tracked, trade) {
       proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
     }
     const solPrice = await getSolPriceUSD();
-    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true); // en PAPER sí restamos fees estimados
+    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
     const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
     await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
     await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-    const nuevoSaldo = await adjustPaperBalance(proceedsUsd - tracked.amount + tracked.amount); // ajusta con el neto real (ver nota abajo)
+    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
     let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (r.profitSol > 0) msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
@@ -463,7 +482,7 @@ async function handleTrackedSell(tracked, trade) {
 bot.onText(/\/add (.+)/, async (msg, match) => {
   try {
     const args = match[1].trim().split(/\s+/);
-    const [alias, address, amountStr, chainRaw] = args; // chainRaw ahora es opcional, default 'sol'
+    const [alias, address, amountStr, chainRaw] = args;
     const amount = parseFloat(amountStr);
     const chain = normalizeChain(chainRaw);
     await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
@@ -524,7 +543,7 @@ bot.onText(/\/reconciliar/, async (msg) => {
 
 bot.onText(/\/positions/, async (msg) => {
   const { rows } = await pool.query('SELECT * FROM bot_positions');
-  bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}`).join('\n') || 'Sin posiciones abiertas');
+  bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}${r.ceros_seguidos > 0 ? ` ⚠️ (${r.ceros_seguidos}/${CONFIRMACIONES_NECESARIAS} confirmaciones de venta)` : ''}`).join('\n') || 'Sin posiciones abiertas');
 });
 
 bot.onText(/\/ranking/, async (msg) => {
