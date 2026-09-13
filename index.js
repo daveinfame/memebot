@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + FEES + %/MULTIPLICADOR + RECONCILIACION CON DOBLE CONFIRMACION (anti falsos positivos) =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + FEES + %/MULTIPLICADOR + RECONCILIACION DOBLE CONFIRMACION + CIERRE GARANTIZADO + DIAGNOSTICO SELL_EVENT =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -32,7 +32,7 @@ const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
-const CONFIRMACIONES_NECESARIAS = 2; // hay que ver el balance en 0 esta cantidad de veces seguidas antes de creer que sí vendió
+const CONFIRMACIONES_NECESARIAS = 2;
 
 let connection = null;
 let walletKeypair = null;
@@ -98,7 +98,7 @@ async function resyncSubscriptions() {
     if (rows.length > 0) {
       ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
     }
-    console.log(`🔁 Resincronizado: escuchando ${rows.length} wallets en total (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
+    console.log(`🔁 [${new Date().toISOString()}] Resincronizado: escuchando ${rows.length} wallets en total (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
   } catch (e) { console.error('Error resincronizando suscripciones:', e.message); }
 }
 
@@ -293,10 +293,6 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-// ===== RECONCILIACIÓN CON DOBLE CONFIRMACIÓN =====
-// Ya no cierra una posición con solo ver el balance en 0 UNA vez (eso puede ser un falso positivo por
-// retraso del RPC o por una wallet recién agregada cuya suscripción aún no toma efecto del todo).
-// Ahora exige ver el balance en 0 dos veces seguidas (≈10 minutos) antes de darlo por vendido de verdad.
 async function reconciliarPosiciones() {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
@@ -319,14 +315,12 @@ async function reconciliarPosiciones() {
       if (balanceActual === null) continue;
 
       if (balanceActual > 0) {
-        // Tiene balance de nuevo (o siempre lo tuvo) - resetea el contador de confirmaciones
         if (pos.ceros_seguidos > 0) {
           await pool.query('UPDATE bot_positions SET ceros_seguidos=0 WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
         }
         continue;
       }
 
-      // balanceActual === 0
       const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
       if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
         await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3', [nuevosCeros, pos.token_mint, pos.wallet_alias]);
@@ -334,7 +328,6 @@ async function reconciliarPosiciones() {
         continue;
       }
 
-      // Ya se confirmó 2 veces seguidas: sí se considera vendida de verdad
       cerradas++;
       console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} (confirmado 2 veces) - cerrando posición`);
 
@@ -350,8 +343,12 @@ async function reconciliarPosiciones() {
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
           if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`);
         } catch (e) {
-          console.error('Error en venta real de reconciliación:', e.message);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No se pudo ejecutar la venta atrasada de ${pos.symbol}: ${e.message}`);
+          console.error('Error en venta real de reconciliación (probable sin liquidez):', e.message);
+          const solPrice = await getSolPriceUSD();
+          const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
+          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+          await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: no se pudo ejecutar la venta real (probablemente ya no tiene liquidez). Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}\n(Nota: puede quedar "polvo" de este token en tu wallet real, sin valor)`);
         }
       } else {
         const proceedsSol = 0;
@@ -360,7 +357,7 @@ async function reconciliarPosiciones() {
         await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(0);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total (0 SOL recuperados) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(confirmado 2 veces seguidas antes de cerrar, para evitar falsos positivos)`);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total (el capital ya se había descontado al comprar) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(confirmado 2 veces seguidas antes de cerrar, para evitar falsos positivos)`);
       }
     }
     console.log(`🔍 [${marca}] Reconciliación completa: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
@@ -618,6 +615,14 @@ function startListener() {
       }
       const trade = JSON.parse(raw.toString());
       if (!trade.mint) return;
+
+      if (trade.txType === 'sell') {
+        const { rows: posiblesTracked } = await pool.query('SELECT alias FROM tracked_wallets WHERE address=$1', [trade.traderPublicKey]);
+        if (posiblesTracked[0]) {
+          console.log(`🔬 SELL_EVENT recibido: wallet=${posiblesTracked[0].alias} mint=${trade.mint} solAmount=${trade.solAmount} hora=${new Date().toISOString()}`);
+        }
+      }
+
       const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [trade.traderPublicKey]);
       if (!rows[0]) return;
       const tracked = rows[0];
