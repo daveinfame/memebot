@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - R0-R5 + FEES + %/MULTIPLICADOR + RECONCILIACION DOBLE CONFIRMACION + CIERRE GARANTIZADO + DIAGNOSTICO SELL_EVENT =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - LISTO PARA MODO REAL: USDC EN RECONCILIACION + ERRORES AMIGABLES + CHEQUEO DE SALDO PREVIO =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -33,6 +33,7 @@ const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
 const CONFIRMACIONES_NECESARIAS = 2;
+const COLCHON_RED_SOL = 0.01; // margen extra que dejamos libre para pagar comisiones de red
 
 let connection = null;
 let walletKeypair = null;
@@ -62,6 +63,18 @@ const CHAIN_CONFIG = {
 };
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
+
+// Traduce errores técnicos comunes a mensajes que sí se entienden
+function mensajeAmigableError(e) {
+  const msg = (e && e.message || '').toLowerCase();
+  if (msg.includes('insufficient') || msg.includes('lamports') || msg.includes('0x1')) {
+    return '⚠️ No había suficiente SOL en la wallet para completar esta operación.';
+  }
+  if (msg.includes('slippage') || msg.includes('0x1771')) {
+    return '⚠️ El precio se movió demasiado rápido (slippage) y la operación no se pudo completar.';
+  }
+  return e.message;
+}
 
 function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoDeFees) {
   const fees = netoDeFees ? estimarFees(costBasisSol, proceedsSolBruto) : 0;
@@ -341,14 +354,19 @@ async function reconciliarPosiciones() {
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`);
+          let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
+          if (r.profitSol > 0) {
+            const usdcSig = await swapProfitToUsdc(r.profitSol);
+            msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+          }
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
         } catch (e) {
           console.error('Error en venta real de reconciliación (probable sin liquidez):', e.message);
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: no se pudo ejecutar la venta real (probablemente ya no tiene liquidez). Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}\n(Nota: puede quedar "polvo" de este token en tu wallet real, sin valor)`);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}\n(Nota: puede quedar "polvo" de este token en tu wallet real, sin valor)`);
         }
       } else {
         const proceedsSol = 0;
@@ -407,6 +425,13 @@ async function handleTrackedBuy(tracked, trade) {
   }
 
   if (LIVE && walletKeypair && connection) {
+    // Chequeo previo: ¿alcanza el saldo? Evita intentos destinados a fallar y da un aviso claro de inmediato.
+    const saldoActual = await getWalletSolBalance();
+    if (saldoActual < amountSol + COLCHON_RED_SOL) {
+      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ~${(amountSol + COLCHON_RED_SOL).toFixed(4)} SOL`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ~${(amountSol + COLCHON_RED_SOL).toFixed(4)} SOL (incluye margen para fees).`);
+      return;
+    }
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
@@ -414,7 +439,7 @@ async function handleTrackedBuy(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · tx:${sig}`);
     } catch (e) {
       console.error('Error comprando real:', e.message);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al comprar ${symbol}: ${e.message}`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
     }
   } else {
     await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
@@ -453,7 +478,7 @@ async function handleTrackedSell(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${e.message}`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}`);
     }
   } else {
     let proceedsSol;
