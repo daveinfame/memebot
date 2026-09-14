@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - FEES INCLUIDOS EN $4 + POSICIONES POR MODO (PAPER/REAL) + LIMPIEZA AUTOMATICA AL CAMBIAR MODO =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - $4 INCLUYE TODOS LOS COSTOS REALES (fee pump.fun + red + rent de cuenta nueva) =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -33,6 +33,8 @@ const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
+const RENT_CUENTA_NUEVA_SOL = 0.00204; // costo de crear la cuenta del token si es la primera vez que lo compras
+const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL; // costo fijo real por transacción, aparte del fee de pump.fun
 const CONFIRMACIONES_NECESARIAS = 2;
 
 let connection = null;
@@ -100,11 +102,12 @@ function estimarFees(costBasisSol, proceedsSol) {
   return feePumpFun + feeRed;
 }
 
-// Convierte el monto en USD a SOL ya con el fee de pump.fun descontado adentro,
-// para que los $4 configurados sean el total gastado (compra + fee), no compra + fee encima.
+// $4 = fee de pump.fun + overhead de red (comisión + posible cuenta nueva) + lo que realmente compra el token.
+// Se resta el overhead de red del monto que se manda a comprar, para que el TOTAL gastado sea exactamente $4.
 function usdToSolNeto(usd, solPrice) {
   const solBruto = usd / solPrice;
-  return solBruto / (1 + PUMPFUN_FEE_PCT);
+  const solMenosFeePump = solBruto / (1 + PUMPFUN_FEE_PCT);
+  return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
 async function resyncSubscriptions() {
@@ -223,7 +226,6 @@ async function initDB() {
 
   try {
     await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
-    // Migra posiciones viejas sin columna modo: las marca como 'paper' para que no contaminen el modo REAL
     await pool.query(`UPDATE bot_positions SET modo='paper' WHERE modo IS NULL;`);
     await pool.query(`
       DO $$
@@ -237,11 +239,6 @@ async function initDB() {
         END IF;
       END $$;
     `);
-    const { rows: viejas } = await pool.query(`SELECT COUNT(*) FROM bot_positions WHERE modo != $1`, [MODO_ACTUAL]);
-    const nViejas = parseInt(viejas[0].count);
-    if (nViejas > 0) {
-      console.log(`🧹 Se encontraron ${nViejas} posición(es) de modo distinto (${MODO_ACTUAL === 'real' ? 'paper' : 'real'}) — no se borran, pero tampoco se muestran ni afectan al modo actual.`);
-    }
     console.log(`Migración de posiciones OK — modo actual: ${MODO_ACTUAL.toUpperCase()}`);
   } catch (e) { console.error('Error migrando bot_positions:', e.message); }
 }
@@ -381,7 +378,7 @@ async function reconciliarPosiciones() {
           const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}\n(Nota: puede quedar "polvo" de este token en tu wallet real, sin valor)`);
+          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}`);
         }
       } else {
         const proceedsSol = 0;
@@ -414,7 +411,6 @@ async function handleTrackedBuy(tracked, trade) {
   }
   await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
 
-  // R2 solo checa posiciones del modo actual — las de PAPER no bloquean compras REALES y viceversa
   const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
   if (existingPos.rows.length > 0) {
     console.log('R2: posición ya abierta con esta wallet en modo actual, ignorado');
@@ -430,8 +426,7 @@ async function handleTrackedBuy(tracked, trade) {
   const solPrice = await getSolPriceUSD();
   if (!solPrice) { console.error('No se pudo obtener precio de SOL, se aborta compra'); return; }
 
-  // Los $4 ya incluyen el fee de pump.fun — se compra con menos SOL, pero el total gastado es exactamente $4
-  const amountSol = usdToSolNeto(tracked.amount, solPrice);
+  const amountSol = usdToSolNeto(tracked.amount, solPrice); // ya con TODO descontado: fee pump.fun + overhead de red
 
   let tokensBought = 0;
   if (trade.tokenAmount && trade.solAmount > 0) {
@@ -444,9 +439,10 @@ async function handleTrackedBuy(tracked, trade) {
 
   if (LIVE && walletKeypair && connection) {
     const saldoActual = await getWalletSolBalance();
-    if (saldoActual < amountSol) {
-      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${amountSol.toFixed(4)} SOL (ya incluye fees)`);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${amountSol.toFixed(4)} SOL (fees incluidos en ese monto).`);
+    const totalNecesario = amountSol + OVERHEAD_RED_SOL; // lo que amountSol NO cubre (overhead) hay que tenerlo aparte en la wallet
+    if (saldoActual < totalNecesario) {
+      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (todo incluido)`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (fee + red incluidos).`);
       return;
     }
     try {
@@ -533,7 +529,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
