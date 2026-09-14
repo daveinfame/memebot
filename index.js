@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - LISTO PARA MODO REAL: USDC EN RECONCILIACION + ERRORES AMIGABLES + CHEQUEO DE SALDO PREVIO =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - FEES INCLUIDOS EN $4 + POSICIONES POR MODO (PAPER/REAL) + LIMPIEZA AUTOMATICA AL CAMBIAR MODO =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -28,12 +28,12 @@ const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
 const LIVE = process.env.LIVE_TRADING === 'true';
+const MODO_ACTUAL = LIVE ? 'real' : 'paper';
 const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
 const CONFIRMACIONES_NECESARIAS = 2;
-const COLCHON_RED_SOL = 0.01; // margen extra que dejamos libre para pagar comisiones de red
 
 let connection = null;
 let walletKeypair = null;
@@ -64,7 +64,6 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Traduce errores técnicos comunes a mensajes que sí se entienden
 function mensajeAmigableError(e) {
   const msg = (e && e.message || '').toLowerCase();
   if (msg.includes('insufficient') || msg.includes('lamports') || msg.includes('0x1')) {
@@ -99,6 +98,13 @@ function estimarFees(costBasisSol, proceedsSol) {
   const feePumpFun = (costBasisSol + proceedsSol) * PUMPFUN_FEE_PCT;
   const feeRed = NETWORK_FEE_SOL * 2;
   return feePumpFun + feeRed;
+}
+
+// Convierte el monto en USD a SOL ya con el fee de pump.fun descontado adentro,
+// para que los $4 configurados sean el total gastado (compra + fee), no compra + fee encima.
+function usdToSolNeto(usd, solPrice) {
+  const solBruto = usd / solPrice;
+  return solBruto / (1 + PUMPFUN_FEE_PCT);
 }
 
 async function resyncSubscriptions() {
@@ -199,6 +205,7 @@ async function initDB() {
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ceros_seguidos INT DEFAULT 0;
+      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
       CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
       INSERT INTO global_balance (id, initial_usdc, current_usdc)
         VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
@@ -216,6 +223,8 @@ async function initDB() {
 
   try {
     await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
+    // Migra posiciones viejas sin columna modo: las marca como 'paper' para que no contaminen el modo REAL
+    await pool.query(`UPDATE bot_positions SET modo='paper' WHERE modo IS NULL;`);
     await pool.query(`
       DO $$
       BEGIN
@@ -228,7 +237,12 @@ async function initDB() {
         END IF;
       END $$;
     `);
-    console.log('Migración de posiciones por wallet OK');
+    const { rows: viejas } = await pool.query(`SELECT COUNT(*) FROM bot_positions WHERE modo != $1`, [MODO_ACTUAL]);
+    const nViejas = parseInt(viejas[0].count);
+    if (nViejas > 0) {
+      console.log(`🧹 Se encontraron ${nViejas} posición(es) de modo distinto (${MODO_ACTUAL === 'real' ? 'paper' : 'real'}) — no se borran, pero tampoco se muestran ni afectan al modo actual.`);
+    }
+    console.log(`Migración de posiciones OK — modo actual: ${MODO_ACTUAL.toUpperCase()}`);
   } catch (e) { console.error('Error migrando bot_positions:', e.message); }
 }
 
@@ -315,10 +329,11 @@ async function reconciliarPosiciones() {
       SELECT bp.*, tw.address AS wallet_address
       FROM bot_positions bp
       JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
-    `);
+      WHERE bp.modo = $1
+    `, [MODO_ACTUAL]);
 
     if (posiciones.length === 0) {
-      console.log(`🔍 [${marca}] Reconciliación: 0 posiciones abiertas, nada que revisar.`);
+      console.log(`🔍 [${marca}] Reconciliación: 0 posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}, nada que revisar.`);
       return;
     }
 
@@ -329,20 +344,20 @@ async function reconciliarPosiciones() {
 
       if (balanceActual > 0) {
         if (pos.ceros_seguidos > 0) {
-          await pool.query('UPDATE bot_positions SET ceros_seguidos=0 WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+          await pool.query('UPDATE bot_positions SET ceros_seguidos=0 WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
         }
         continue;
       }
 
       const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
       if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
-        await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3', [nuevosCeros, pos.token_mint, pos.wallet_alias]);
+        await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4', [nuevosCeros, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
         console.log(`🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0 (confirmación ${nuevosCeros}/${CONFIRMACIONES_NECESARIAS}), esperando siguiente ciclo antes de cerrar`);
         continue;
       }
 
       cerradas++;
-      console.log(`🔄 Reconciliación: ${pos.wallet_alias} ya no tiene ${pos.symbol} (confirmado 2 veces) - cerrando posición`);
+      console.log(`🔄 Reconciliación [${MODO_ACTUAL.toUpperCase()}]: ${pos.wallet_alias} ya no tiene ${pos.symbol} (confirmado 2 veces) - cerrando posición`);
 
       if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
         try {
@@ -352,7 +367,7 @@ async function reconciliarPosiciones() {
           const proceedsSol = after - before;
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
           let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
           if (r.profitSol > 0) {
@@ -361,10 +376,10 @@ async function reconciliarPosiciones() {
           }
           if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
         } catch (e) {
-          console.error('Error en venta real de reconciliación (probable sin liquidez):', e.message);
+          console.error('Error en venta real de reconciliación:', e.message);
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
-          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
           if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}\n(Nota: puede quedar "polvo" de este token en tu wallet real, sin valor)`);
         }
@@ -372,13 +387,13 @@ async function reconciliarPosiciones() {
         const proceedsSol = 0;
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [pos.token_mint, pos.wallet_alias]);
+        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(0);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total (el capital ya se había descontado al comprar) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}\n(confirmado 2 veces seguidas antes de cerrar, para evitar falsos positivos)`);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
       }
     }
-    console.log(`🔍 [${marca}] Reconciliación completa: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
+    console.log(`🔍 [${marca}] Reconciliación completa [${MODO_ACTUAL.toUpperCase()}]: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
@@ -399,9 +414,10 @@ async function handleTrackedBuy(tracked, trade) {
   }
   await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
 
-  const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+  // R2 solo checa posiciones del modo actual — las de PAPER no bloquean compras REALES y viceversa
+  const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
   if (existingPos.rows.length > 0) {
-    console.log('R2: posición ya abierta con esta wallet, ignorado');
+    console.log('R2: posición ya abierta con esta wallet en modo actual, ignorado');
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (ya tienes posición abierta en este token vía ${tracked.alias})`);
     return;
   }
@@ -413,7 +429,9 @@ async function handleTrackedBuy(tracked, trade) {
 
   const solPrice = await getSolPriceUSD();
   if (!solPrice) { console.error('No se pudo obtener precio de SOL, se aborta compra'); return; }
-  const amountSol = tracked.amount / solPrice;
+
+  // Los $4 ya incluyen el fee de pump.fun — se compra con menos SOL, pero el total gastado es exactamente $4
+  const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
   let tokensBought = 0;
   if (trade.tokenAmount && trade.solAmount > 0) {
@@ -425,27 +443,26 @@ async function handleTrackedBuy(tracked, trade) {
   }
 
   if (LIVE && walletKeypair && connection) {
-    // Chequeo previo: ¿alcanza el saldo? Evita intentos destinados a fallar y da un aviso claro de inmediato.
     const saldoActual = await getWalletSolBalance();
-    if (saldoActual < amountSol + COLCHON_RED_SOL) {
-      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ~${(amountSol + COLCHON_RED_SOL).toFixed(4)} SOL`);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ~${(amountSol + COLCHON_RED_SOL).toFixed(4)} SOL (incluye margen para fees).`);
+    if (saldoActual < amountSol) {
+      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${amountSol.toFixed(4)} SOL (ya incluye fees)`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${amountSol.toFixed(4)} SOL (fees incluidos en ese monto).`);
       return;
     }
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
-      await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
-        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · tx:${sig}`);
+      await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx:${sig}`);
     } catch (e) {
       console.error('Error comprando real:', e.message);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
     }
   } else {
-    await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias) VALUES ($1,$2,$3,$4,$5,$6)',
-      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias]);
+    await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
     const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount}) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
   }
 }
 
@@ -453,7 +470,7 @@ async function handleTrackedSell(tracked, trade) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
   const symbol = await getTokenSymbol(trade.mint);
-  const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+  const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
   if (posRes.rows.length === 0) {
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
     return;
@@ -468,7 +485,7 @@ async function handleTrackedSell(tracked, trade) {
       const proceedsSol = after - before;
       const solPrice = await getSolPriceUSD();
       const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
-      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
       await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
       let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
       if (r.profitSol > 0) {
@@ -492,7 +509,7 @@ async function handleTrackedSell(tracked, trade) {
     const solPrice = await getSolPriceUSD();
     const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
     const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
-    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2', [trade.mint, tracked.alias]);
+    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
     await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
     let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
@@ -516,7 +533,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra. Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -525,10 +542,10 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
     const alias = match[1].trim();
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
     if (result.rows.length > 0) {
-      const posEliminadas = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 RETURNING symbol', [alias]);
+      const posEliminadas = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 AND modo=$2 RETURNING symbol', [alias, MODO_ACTUAL]);
       let respuesta = `🗑️ ${alias} eliminado de la lista de wallets seguidas.`;
       if (posEliminadas.rows.length > 0) {
-        respuesta += `\n🧹 También se cerraron ${posEliminadas.rows.length} posición(es) abierta(s) ligada(s) a esta wallet: ${posEliminadas.rows.map(r => r.symbol).join(', ')} (sin calcular ganancia, ya que dejó de seguirse).`;
+        respuesta += `\n🧹 También se cerraron ${posEliminadas.rows.length} posición(es) del modo actual: ${posEliminadas.rows.map(r => r.symbol).join(', ')}.`;
       }
       bot.sendMessage(msg.chat.id, respuesta);
       await resyncSubscriptions();
@@ -541,9 +558,9 @@ bot.onText(/\/closepos (.+) (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
     const symbol = match[2].trim();
-    const result = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 AND symbol=$2 RETURNING *', [alias, symbol]);
-    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `🧹 Posición cerrada manualmente: ${symbol} vía ${alias} (${result.rows.length} eliminada(s)).`);
-    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna posición con alias "${alias}" y símbolo "${symbol}". Revisa /positions para ver los nombres exactos.`);
+    const result = await pool.query('DELETE FROM bot_positions WHERE wallet_alias=$1 AND symbol=$2 AND modo=$3 RETURNING *', [alias, symbol, MODO_ACTUAL]);
+    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `🧹 Posición cerrada manualmente: ${symbol} vía ${alias}.`);
+    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna posición con alias "${alias}" y símbolo "${symbol}" en modo ${MODO_ACTUAL.toUpperCase()}. Revisa /positions.`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -564,8 +581,10 @@ bot.onText(/\/reconciliar/, async (msg) => {
 });
 
 bot.onText(/\/positions/, async (msg) => {
-  const { rows } = await pool.query('SELECT * FROM bot_positions');
-  bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}${r.ceros_seguidos > 0 ? ` ⚠️ (${r.ceros_seguidos}/${CONFIRMACIONES_NECESARIAS} confirmaciones de venta)` : ''}`).join('\n') || 'Sin posiciones abiertas');
+  const { rows } = await pool.query('SELECT * FROM bot_positions WHERE modo=$1', [MODO_ACTUAL]);
+  const header = `📋 Posiciones abiertas [${MODO_ACTUAL.toUpperCase()}]:`;
+  const lista = rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}${r.ceros_seguidos > 0 ? ` ⚠️ (${r.ceros_seguidos}/${CONFIRMACIONES_NECESARIAS} confirmaciones de venta)` : ''}`).join('\n');
+  bot.sendMessage(msg.chat.id, lista ? `${header}\n${lista}` : `${header}\nSin posiciones abiertas.`);
 });
 
 bot.onText(/\/ranking/, async (msg) => {
@@ -610,12 +629,12 @@ bot.onText(/\/help/, async (msg) => {
   const texto = [
     '📋 Comandos disponibles:',
     '/add alias direccion monto_usd [cadena] - Agrega/actualiza una wallet (cadena es opcional, default SOL)',
-    '/remove alias - Elimina una wallet Y cierra sus posiciones abiertas',
-    '/closepos alias simbolo - Cierra manualmente una posición huérfana específica',
+    '/remove alias - Elimina una wallet Y cierra sus posiciones del modo actual',
+    '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
     '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
     '/reconciliar - Revisa manualmente si alguna posición abierta ya se vendió sin que el bot se enterara',
-    '/positions - Muestra las posiciones abiertas del bot',
+    '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
     '/ranking - Muestra desempeño por wallet: trades, ganadores/perdedores, ganancia total',
     '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
@@ -626,7 +645,7 @@ bot.onText(/\/help/, async (msg) => {
 function startListener() {
   ws = new WebSocket(PUMP_PORTAL_WS);
   ws.on('open', async () => {
-    console.log('WS conectado (con API key)');
+    console.log(`WS conectado (con API key) — modo ${MODO_ACTUAL.toUpperCase()}`);
     await resyncSubscriptions();
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
