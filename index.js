@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - RECUPERA RENT AL CERRAR CUENTA DEL TOKEN DESPUES DE VENDER =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - POOL AUTO + ERRORES PRECISOS + HASH CLICKEABLE + TIMING DE SALDO + BASELINE REAL + RECONCILIAR MANUAL INMEDIATO =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -36,6 +36,7 @@ const NETWORK_FEE_SOL = 0.0005;
 const RENT_CUENTA_NUEVA_SOL = 0.00204;
 const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
+const ESPERA_LECTURA_SALDO_MS = 1500; // margen para que el RPC refleje el balance real después de confirmar una tx
 
 let connection = null;
 let walletKeypair = null;
@@ -45,6 +46,8 @@ let primerMensajeConfirmado = false;
 let mensajesDesdeUltimoResumen = 0;
 const cacheSimbolos = new Map();
 const cacheDecimales = new Map();
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
@@ -66,16 +69,27 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
+// Traduce errores técnicos a mensajes claros — SIN adivinar por coincidencias de texto imprecisas.
+// Antes, buscar "0x1" atrapaba por accidente el código 0x1775 (BondingCurveComplete) y decía "sin fondos" quando no era eso.
 function mensajeAmigableError(e) {
-  const msg = (e && e.message || '').toLowerCase();
-  if (msg.includes('insufficient') || msg.includes('lamports') || msg.includes('0x1')) {
+  const msgOriginal = (e && e.message) || '';
+  const msg = msgOriginal.toLowerCase();
+
+  // Código específico y exacto de pump.fun: el token ya se graduó de la curva de bonding.
+  if (/0x1775\b/.test(msgOriginal) || msg.includes('bondingcurvecomplete')) {
+    return '⚠️ Este token ya no está en la curva de pump.fun (se movió a otro exchange) y no se pudo enrutar automáticamente.';
+  }
+  // Palabras reales de falta de fondos, no códigos hex que puedan contener "0x1" por coincidencia.
+  if (msg.includes('insufficient') || msg.includes('insufficient lamports') || msg.includes('debit an account')) {
     return '⚠️ No había suficiente SOL en la wallet para completar esta operación.';
   }
-  if (msg.includes('slippage') || msg.includes('0x1771')) {
+  if (msg.includes('slippage')) {
     return '⚠️ El precio se movió demasiado rápido (slippage) y la operación no se pudo completar.';
   }
-  return e.message;
+  return msgOriginal;
 }
+
+function linkTx(sig) { return `https://solscan.io/tx/${sig}`; }
 
 function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoDeFees) {
   const fees = netoDeFees ? estimarFees(costBasisSol, proceedsSolBruto) : 0;
@@ -108,8 +122,6 @@ function usdToSolNeto(usd, solPrice) {
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
-// Cierra la(s) cuenta(s) del token en NUESTRA wallet una vez vendido el 100%, para recuperar el rent (SOL de depósito).
-// Solo cierra cuentas que ya están en 0 (recién vendidas) — nunca toca cuentas con saldo.
 async function cerrarCuentaDelToken(mint) {
   if (!connection || !walletKeypair) return null;
   try {
@@ -118,7 +130,7 @@ async function cerrarCuentaDelToken(mint) {
     let recuperadoSol = 0;
     for (const c of cuentas.value) {
       const balance = parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
-      if (balance > 0) continue; // no tocar cuentas que todavía tienen tokens
+      if (balance > 0) continue;
       const antesSol = await getWalletSolBalance();
       const closeIx = new TransactionInstruction({
         programId: c.account.owner,
@@ -127,7 +139,7 @@ async function cerrarCuentaDelToken(mint) {
           { pubkey: walletKeypair.publicKey, isSigner: false, isWritable: true },
           { pubkey: walletKeypair.publicKey, isSigner: true, isWritable: false }
         ],
-        data: Buffer.from([9]) // CloseAccount
+        data: Buffer.from([9])
       });
       const tx = new Transaction().add(closeIx);
       tx.feePayer = walletKeypair.publicKey;
@@ -136,6 +148,7 @@ async function cerrarCuentaDelToken(mint) {
       tx.sign(walletKeypair);
       const sig = await connection.sendRawTransaction(tx.serialize());
       await connection.confirmTransaction(sig, 'confirmed');
+      await sleep(ESPERA_LECTURA_SALDO_MS);
       const despuesSol = await getWalletSolBalance();
       recuperadoSol += Math.max(despuesSol - antesSol, 0);
       console.log(`♻️ Cuenta de token cerrada (${mint.slice(0, 6)}...), recuperado: ${(despuesSol - antesSol).toFixed(5)} SOL`);
@@ -247,6 +260,7 @@ async function initDB() {
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ceros_seguidos INT DEFAULT 0;
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
       CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
+      ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS real_initial_sol REAL;
       INSERT INTO global_balance (id, initial_usdc, current_usdc)
         VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
         ON CONFLICT (id) DO NOTHING;
@@ -278,6 +292,20 @@ async function initDB() {
     `);
     console.log(`Migración de posiciones OK — modo actual: ${MODO_ACTUAL.toUpperCase()}`);
   } catch (e) { console.error('Error migrando bot_positions:', e.message); }
+}
+
+// Establece el "punto de partida" de SOL en modo REAL, una sola vez, para poder mostrar ganancia/pérdida
+// total desde que empezaste — igual que ya hacíamos en PAPER con el saldo ficticio inicial.
+async function initBaselineReal() {
+  if (!LIVE || !connection || !walletKeypair) return;
+  try {
+    const { rows } = await pool.query('SELECT real_initial_sol FROM global_balance WHERE id=1');
+    if (!rows[0] || rows[0].real_initial_sol === null) {
+      const saldoInicial = await getWalletSolBalance();
+      await pool.query('UPDATE global_balance SET real_initial_sol=$1 WHERE id=1', [saldoInicial]);
+      console.log(`📌 Baseline REAL establecido: ${saldoInicial.toFixed(4)} SOL`);
+    }
+  } catch (e) { console.error('Error estableciendo baseline real:', e.message); }
 }
 
 async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
@@ -315,7 +343,9 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'pump' }) {
+// pool: 'auto' deja que PumpPortal decida solo dónde está el token (curva de bonding, PumpSwap, o Raydium),
+// en vez de forzar 'pump' y fallar cuando el token ya se graduó.
+async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -354,7 +384,9 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-async function reconciliarPosiciones() {
+// forzado=true (usado por /reconciliar manual) cierra de inmediato con un solo balance en 0, sin esperar
+// la doble confirmación — la doble confirmación se queda solo para el ciclo automático cada 5 minutos.
+async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
 
@@ -367,7 +399,7 @@ async function reconciliarPosiciones() {
     `, [MODO_ACTUAL]);
 
     if (posiciones.length === 0) {
-      console.log(`🔍 [${marca}] Reconciliación: 0 posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}, nada que revisar.`);
+      console.log(`🔍 [${marca}] Reconciliación${forzado ? ' (manual)' : ''}: 0 posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}, nada que revisar.`);
       return;
     }
 
@@ -383,30 +415,35 @@ async function reconciliarPosiciones() {
         continue;
       }
 
-      const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
-      if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
-        await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4', [nuevosCeros, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-        console.log(`🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0 (confirmación ${nuevosCeros}/${CONFIRMACIONES_NECESARIAS}), esperando siguiente ciclo antes de cerrar`);
-        continue;
+      if (!forzado) {
+        const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
+        if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
+          await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4', [nuevosCeros, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+          console.log(`🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0 (confirmación ${nuevosCeros}/${CONFIRMACIONES_NECESARIAS}), esperando siguiente ciclo antes de cerrar`);
+          continue;
+        }
+      } else {
+        console.log(`🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0, cerrando de inmediato (reconciliación manual forzada)`);
       }
 
       cerradas++;
-      console.log(`🔄 Reconciliación [${MODO_ACTUAL.toUpperCase()}]: ${pos.wallet_alias} ya no tiene ${pos.symbol} (confirmado 2 veces) - cerrando posición`);
+      console.log(`🔄 Reconciliación [${MODO_ACTUAL.toUpperCase()}]: ${pos.wallet_alias} ya no tiene ${pos.symbol} - cerrando posición`);
 
       if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
         try {
           const before = await getWalletSolBalance();
           const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
+          await sleep(ESPERA_LECTURA_SALDO_MS);
           const after = await getWalletSolBalance();
           const proceedsSol = after - before;
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
+          let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
           if (r.profitSol > 0) {
             const usdcSig = await swapProfitToUsdc(r.profitSol);
-            msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+            msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
           }
           const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
           if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
@@ -429,7 +466,7 @@ async function reconciliarPosiciones() {
         if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
       }
     }
-    console.log(`🔍 [${marca}] Reconciliación completa [${MODO_ACTUAL.toUpperCase()}]: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
+    console.log(`🔍 [${marca}] Reconciliación completa [${MODO_ACTUAL.toUpperCase()}]${forzado ? ' (manual)' : ''}: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
@@ -488,7 +525,7 @@ async function handleTrackedBuy(tracked, trade) {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
         [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx:${sig}`);
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx: ${linkTx(sig)}`);
     } catch (e) {
       console.error('Error comprando real:', e.message);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
@@ -516,16 +553,17 @@ async function handleTrackedSell(tracked, trade) {
     try {
       const before = await getWalletSolBalance();
       const sig = await pumpPortalTrade({ action: 'sell', mint: trade.mint, amount: '100%', denominatedInSol: false });
+      await sleep(ESPERA_LECTURA_SALDO_MS);
       const after = await getWalletSolBalance();
       const proceedsSol = after - before;
       const solPrice = await getSolPriceUSD();
       const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
       await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
       await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx:${sig}`;
+      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
       if (r.profitSol > 0) {
         const usdcSig = await swapProfitToUsdc(r.profitSol);
-        msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+        msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
       }
       const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
       if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
@@ -612,8 +650,8 @@ bot.onText(/\/resync/, async (msg) => {
 });
 
 bot.onText(/\/reconciliar/, async (msg) => {
-  bot.sendMessage(msg.chat.id, '🔄 Revisando posiciones abiertas contra la blockchain...');
-  await reconciliarPosiciones();
+  bot.sendMessage(msg.chat.id, '🔄 Revisando posiciones abiertas contra la blockchain (modo manual, sin esperar doble confirmación)...');
+  await reconciliarPosiciones(true);
   bot.sendMessage(msg.chat.id, '✅ Reconciliación manual completada.');
 });
 
@@ -653,7 +691,17 @@ bot.onText(/\/status/, async (msg) => {
     : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
   if (LIVE) {
     const solBalance = await getWalletSolBalance();
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}\n${estadoConexion}\n${lineaApiKey}`);
+    let lineaBaseline = '';
+    try {
+      const { rows } = await pool.query('SELECT real_initial_sol FROM global_balance WHERE id=1');
+      const inicialSol = rows[0]?.real_initial_sol;
+      if (inicialSol !== null && inicialSol !== undefined) {
+        const delta = solBalance - inicialSol;
+        const pct = inicialSol > 0 ? (delta / inicialSol) * 100 : 0;
+        lineaBaseline = `\n${delta >= 0 ? '📈' : '📉'} Desde que empezaste: ${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) · inicial: ${inicialSol.toFixed(4)} SOL`;
+      }
+    } catch (e) { console.error('Error leyendo baseline real:', e.message); }
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}`);
   } else {
     const balance = await getPaperBalance();
     const pnl = balance.current_usdc - balance.initial_usdc;
@@ -670,10 +718,10 @@ bot.onText(/\/help/, async (msg) => {
     '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
     '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
-    '/reconciliar - Revisa manualmente si alguna posición abierta ya se vendió sin que el bot se enterara',
+    '/reconciliar - Revisa AHORA MISMO (sin esperar doble confirmación) si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
     '/ranking - Muestra desempeño por wallet: trades, ganadores/perdedores, ganancia total',
-    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida, conexión y saldo de la API key',
+    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida desde el inicio, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -725,9 +773,9 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
-setInterval(() => { reconciliarPosiciones(); }, 5 * 60 * 1000);
+setInterval(() => { reconciliarPosiciones(false); }, 5 * 60 * 1000);
 
-initDB().then(() => startListener());
+initDB().then(() => initBaselineReal()).then(() => startListener());
 console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
 process.on('uncaughtException', e => console.error('uncaught', e));
 process.on('unhandledRejection', e => console.error('unhandled', e));
