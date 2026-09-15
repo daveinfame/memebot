@@ -1,9 +1,9 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - $4 INCLUYE TODOS LOS COSTOS REALES (fee pump.fun + red + rent de cuenta nueva) =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - RECUPERA RENT AL CERRAR CUENTA DEL TOKEN DESPUES DE VENDER =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-const { Connection, Keypair, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { Connection, Keypair, PublicKey, VersionedTransaction, Transaction, TransactionInstruction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const bs58 = require('bs58');
 
 const pool = new Pool({
@@ -33,8 +33,8 @@ const DUST_MIN_SOL = 0.05;
 const INITIAL_PAPER_BALANCE = parseFloat(process.env.INITIAL_USDC || '1000');
 const PUMPFUN_FEE_PCT = 0.0125;
 const NETWORK_FEE_SOL = 0.0005;
-const RENT_CUENTA_NUEVA_SOL = 0.00204; // costo de crear la cuenta del token si es la primera vez que lo compras
-const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL; // costo fijo real por transacción, aparte del fee de pump.fun
+const RENT_CUENTA_NUEVA_SOL = 0.00204;
+const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
 
 let connection = null;
@@ -102,12 +102,49 @@ function estimarFees(costBasisSol, proceedsSol) {
   return feePumpFun + feeRed;
 }
 
-// $4 = fee de pump.fun + overhead de red (comisión + posible cuenta nueva) + lo que realmente compra el token.
-// Se resta el overhead de red del monto que se manda a comprar, para que el TOTAL gastado sea exactamente $4.
 function usdToSolNeto(usd, solPrice) {
   const solBruto = usd / solPrice;
   const solMenosFeePump = solBruto / (1 + PUMPFUN_FEE_PCT);
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
+}
+
+// Cierra la(s) cuenta(s) del token en NUESTRA wallet una vez vendido el 100%, para recuperar el rent (SOL de depósito).
+// Solo cierra cuentas que ya están en 0 (recién vendidas) — nunca toca cuentas con saldo.
+async function cerrarCuentaDelToken(mint) {
+  if (!connection || !walletKeypair) return null;
+  try {
+    const mintKey = new PublicKey(mint);
+    const cuentas = await connection.getParsedTokenAccountsByOwner(walletKeypair.publicKey, { mint: mintKey });
+    let recuperadoSol = 0;
+    for (const c of cuentas.value) {
+      const balance = parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
+      if (balance > 0) continue; // no tocar cuentas que todavía tienen tokens
+      const antesSol = await getWalletSolBalance();
+      const closeIx = new TransactionInstruction({
+        programId: c.account.owner,
+        keys: [
+          { pubkey: c.pubkey, isSigner: false, isWritable: true },
+          { pubkey: walletKeypair.publicKey, isSigner: false, isWritable: true },
+          { pubkey: walletKeypair.publicKey, isSigner: true, isWritable: false }
+        ],
+        data: Buffer.from([9]) // CloseAccount
+      });
+      const tx = new Transaction().add(closeIx);
+      tx.feePayer = walletKeypair.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
+      tx.sign(walletKeypair);
+      const sig = await connection.sendRawTransaction(tx.serialize());
+      await connection.confirmTransaction(sig, 'confirmed');
+      const despuesSol = await getWalletSolBalance();
+      recuperadoSol += Math.max(despuesSol - antesSol, 0);
+      console.log(`♻️ Cuenta de token cerrada (${mint.slice(0, 6)}...), recuperado: ${(despuesSol - antesSol).toFixed(5)} SOL`);
+    }
+    return recuperadoSol > 0 ? recuperadoSol : null;
+  } catch (e) {
+    console.log('No se pudo cerrar la cuenta del token (no crítico):', e.message);
+    return null;
+  }
 }
 
 async function resyncSubscriptions() {
@@ -371,6 +408,8 @@ async function reconciliarPosiciones() {
             const usdcSig = await swapProfitToUsdc(r.profitSol);
             msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
           }
+          const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
+          if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
           if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
         } catch (e) {
           console.error('Error en venta real de reconciliación:', e.message);
@@ -426,7 +465,7 @@ async function handleTrackedBuy(tracked, trade) {
   const solPrice = await getSolPriceUSD();
   if (!solPrice) { console.error('No se pudo obtener precio de SOL, se aborta compra'); return; }
 
-  const amountSol = usdToSolNeto(tracked.amount, solPrice); // ya con TODO descontado: fee pump.fun + overhead de red
+  const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
   let tokensBought = 0;
   if (trade.tokenAmount && trade.solAmount > 0) {
@@ -439,9 +478,9 @@ async function handleTrackedBuy(tracked, trade) {
 
   if (LIVE && walletKeypair && connection) {
     const saldoActual = await getWalletSolBalance();
-    const totalNecesario = amountSol + OVERHEAD_RED_SOL; // lo que amountSol NO cubre (overhead) hay que tenerlo aparte en la wallet
+    const totalNecesario = amountSol + OVERHEAD_RED_SOL;
     if (saldoActual < totalNecesario) {
-      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (todo incluido)`);
+      console.log(`Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL`);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (fee + red incluidos).`);
       return;
     }
@@ -488,6 +527,8 @@ async function handleTrackedSell(tracked, trade) {
         const usdcSig = await swapProfitToUsdc(r.profitSol);
         msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx:${usdcSig}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
       }
+      const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
+      if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
