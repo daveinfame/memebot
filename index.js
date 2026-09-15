@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - POOL AUTO + ERRORES PRECISOS + HASH CLICKEABLE + TIMING DE SALDO + BASELINE REAL + RECONCILIAR MANUAL INMEDIATO =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - /setamount + SALDO EN CADA OPERACION + ERRORES SIEMPRE LIMPIOS + RANKING POR MODO =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -36,7 +36,7 @@ const NETWORK_FEE_SOL = 0.0005;
 const RENT_CUENTA_NUEVA_SOL = 0.00204;
 const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
-const ESPERA_LECTURA_SALDO_MS = 1500; // margen para que el RPC refleje el balance real después de confirmar una tx
+const ESPERA_LECTURA_SALDO_MS = 1500;
 
 let connection = null;
 let walletKeypair = null;
@@ -69,24 +69,34 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Traduce errores técnicos a mensajes claros — SIN adivinar por coincidencias de texto imprecisas.
-// Antes, buscar "0x1" atrapaba por accidente el código 0x1775 (BondingCurveComplete) y decía "sin fondos" quando no era eso.
+// Extrae un código hex tipo 0x1234 de un mensaje de error, para al menos mostrar el código si no lo reconocemos.
+function extraerCodigoError(msgOriginal) {
+  const match = msgOriginal.match(/0x[0-9a-f]{2,6}\b/i);
+  return match ? match[0] : null;
+}
+
+// NUNCA regresa el log crudo de Solana/PumpPortal — siempre un mensaje corto y limpio.
+// El detalle técnico completo se sigue mandando a console.error() en Railway por separado.
 function mensajeAmigableError(e) {
   const msgOriginal = (e && e.message) || '';
   const msg = msgOriginal.toLowerCase();
 
-  // Código específico y exacto de pump.fun: el token ya se graduó de la curva de bonding.
   if (/0x1775\b/.test(msgOriginal) || msg.includes('bondingcurvecomplete')) {
     return '⚠️ Este token ya no está en la curva de pump.fun (se movió a otro exchange) y no se pudo enrutar automáticamente.';
   }
-  // Palabras reales de falta de fondos, no códigos hex que puedan contener "0x1" por coincidencia.
-  if (msg.includes('insufficient') || msg.includes('insufficient lamports') || msg.includes('debit an account')) {
+  if (/0x17af\b/.test(msgOriginal) || msg.includes('unsupportedquotemint')) {
+    return '⚠️ Este token usa un pool con una moneda base distinta a SOL — no se pudo operar automáticamente.';
+  }
+  if (msg.includes('insufficient') || msg.includes('debit an account')) {
     return '⚠️ No había suficiente SOL en la wallet para completar esta operación.';
   }
   if (msg.includes('slippage')) {
     return '⚠️ El precio se movió demasiado rápido (slippage) y la operación no se pudo completar.';
   }
-  return msgOriginal;
+  const codigo = extraerCodigoError(msgOriginal);
+  return codigo
+    ? `⚠️ No se pudo completar la operación (código: ${codigo}). Detalle completo en los logs de Railway.`
+    : '⚠️ No se pudo completar la operación. Detalle completo en los logs de Railway.';
 }
 
 function linkTx(sig) { return `https://solscan.io/tx/${sig}`; }
@@ -271,6 +281,7 @@ async function initDB() {
         profit_sol REAL,
         closed_at TIMESTAMP DEFAULT NOW()
       );
+      ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
     `);
     console.log('DB OK');
   } catch (e) { console.error('DB Error', e); }
@@ -294,8 +305,6 @@ async function initDB() {
   } catch (e) { console.error('Error migrando bot_positions:', e.message); }
 }
 
-// Establece el "punto de partida" de SOL en modo REAL, una sola vez, para poder mostrar ganancia/pérdida
-// total desde que empezaste — igual que ya hacíamos en PAPER con el saldo ficticio inicial.
 async function initBaselineReal() {
   if (!LIVE || !connection || !walletKeypair) return;
   try {
@@ -308,9 +317,10 @@ async function initBaselineReal() {
   } catch (e) { console.error('Error estableciendo baseline real:', e.message); }
 }
 
+// Registra el trade en el historial, MARCANDO en qué modo se hizo (para que /ranking no mezcle PAPER con REAL)
 async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
   try {
-    await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol) VALUES ($1,$2,$3)', [walletAlias, symbol, profitSol]);
+    await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol, modo) VALUES ($1,$2,$3,$4)', [walletAlias, symbol, profitSol, MODO_ACTUAL]);
   } catch (e) { console.error('Error registrando historial de trade:', e.message); }
 }
 
@@ -343,8 +353,6 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// pool: 'auto' deja que PumpPortal decida solo dónde está el token (curva de bonding, PumpSwap, o Raydium),
-// en vez de forzar 'pump' y fallar cuando el token ya se graduó.
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
@@ -384,8 +392,6 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-// forzado=true (usado por /reconciliar manual) cierra de inmediato con un solo balance en 0, sin esperar
-// la doble confirmación — la doble confirmación se queda solo para el ciclo automático cada 5 minutos.
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
@@ -447,6 +453,8 @@ async function reconciliarPosiciones(forzado = false) {
           }
           const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
           if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+          const saldoFinal = await getWalletSolBalance();
+          msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
           if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
         } catch (e) {
           console.error('Error en venta real de reconciliación:', e.message);
@@ -525,7 +533,8 @@ async function handleTrackedBuy(tracked, trade) {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
         [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx: ${linkTx(sig)}`);
+      const saldoFinal = await getWalletSolBalance();
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx: ${linkTx(sig)}\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`);
     } catch (e) {
       console.error('Error comprando real:', e.message);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
@@ -567,6 +576,8 @@ async function handleTrackedSell(tracked, trade) {
       }
       const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
       if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+      const saldoFinal = await getWalletSolBalance();
+      msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
@@ -612,6 +623,21 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
+// Cambia solo el monto ($) que se usa al copiar a una wallet ya agregada, sin tocar snapshot ni suscripción.
+bot.onText(/\/setamount (\S+) (\S+)/, async (msg, match) => {
+  try {
+    const alias = match[1];
+    const nuevoMonto = parseFloat(match[2]);
+    if (isNaN(nuevoMonto) || nuevoMonto <= 0) {
+      bot.sendMessage(msg.chat.id, '⚠️ Monto inválido. Usa: /setamount alias nuevo_monto (ej. /setamount CAP 6)');
+      return;
+    }
+    const result = await pool.query('UPDATE tracked_wallets SET amount=$1 WHERE alias=$2 RETURNING alias, amount', [nuevoMonto, alias]);
+    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `✅ ${alias} ahora usa $${nuevoMonto} USD por compra (efectivo desde la próxima señal).`);
+    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
+  } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
+});
+
 bot.onText(/\/remove (.+)/, async (msg, match) => {
   try {
     const alias = match[1].trim();
@@ -650,7 +676,7 @@ bot.onText(/\/resync/, async (msg) => {
 });
 
 bot.onText(/\/reconciliar/, async (msg) => {
-  bot.sendMessage(msg.chat.id, '🔄 Revisando posiciones abiertas contra la blockchain (modo manual, sin esperar doble confirmación)...');
+  bot.sendMessage(msg.chat.id, '🔄 Revisando posiciones abiertas contra la blockchain (modo manual)...');
   await reconciliarPosiciones(true);
   bot.sendMessage(msg.chat.id, '✅ Reconciliación manual completada.');
 });
@@ -662,6 +688,7 @@ bot.onText(/\/positions/, async (msg) => {
   bot.sendMessage(msg.chat.id, lista ? `${header}\n${lista}` : `${header}\nSin posiciones abiertas.`);
 });
 
+// El ranking SOLO cuenta trades cerrados en el modo actual (PAPER o REAL) — ya no se mezclan.
 bot.onText(/\/ranking/, async (msg) => {
   try {
     const { rows } = await pool.query(`
@@ -671,11 +698,13 @@ bot.onText(/\/ranking/, async (msg) => {
              SUM(CASE WHEN profit_sol <= 0 THEN 1 ELSE 0 END) AS perdedores,
              SUM(profit_sol) AS ganancia_total
       FROM trade_history
+      WHERE modo = $1
       GROUP BY wallet_alias
       ORDER BY ganancia_total DESC
-    `);
-    if (rows.length === 0) { bot.sendMessage(msg.chat.id, 'Todavía no hay trades cerrados para armar el ranking.'); return; }
-    const texto = ['🏆 Ranking por wallet:', ''].concat(rows.map((r, i) =>
+    `, [MODO_ACTUAL]);
+    const header = `🏆 Ranking por wallet [${MODO_ACTUAL.toUpperCase()}]:`;
+    if (rows.length === 0) { bot.sendMessage(msg.chat.id, `${header}\nTodavía no hay trades cerrados en este modo.`); return; }
+    const texto = [header, ''].concat(rows.map((r, i) =>
       `${i + 1}. ${r.wallet_alias} · ${r.trades} trades (${r.ganadores}✅/${r.perdedores}❌) · ${r.ganancia_total >= 0 ? '+' : ''}${parseFloat(r.ganancia_total).toFixed(4)} SOL`
     )).join('\n');
     bot.sendMessage(msg.chat.id, texto);
@@ -714,14 +743,15 @@ bot.onText(/\/help/, async (msg) => {
   const texto = [
     '📋 Comandos disponibles:',
     '/add alias direccion monto_usd [cadena] - Agrega/actualiza una wallet (cadena es opcional, default SOL)',
+    '/setamount alias nuevo_monto - Cambia solo el monto ($) de una wallet ya agregada',
     '/remove alias - Elimina una wallet Y cierra sus posiciones del modo actual',
     '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
     '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
-    '/reconciliar - Revisa AHORA MISMO (sin esperar doble confirmación) si alguna posición ya se vendió sin avisar',
+    '/reconciliar - Revisa AHORA MISMO si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
-    '/ranking - Muestra desempeño por wallet: trades, ganadores/perdedores, ganancia total',
-    '/status - Muestra modo (REAL/PAPER), saldo, ganancia/pérdida desde el inicio, conexión y saldo de la API key',
+    '/ranking - Muestra desempeño por wallet del modo actual (REAL o PAPER, separados)',
+    '/status - Muestra modo, saldo, ganancia/pérdida desde el inicio, conexión y saldo de la API key',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
