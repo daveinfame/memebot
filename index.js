@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - /setamount + SALDO EN CADA OPERACION + ERRORES SIEMPRE LIMPIOS + RANKING POR MODO =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - VERIFICA ERRORES ON-CHAIN (confirmada != exitosa) + SIN FALSAS COMPRAS/PERDIDAS =========
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -69,23 +69,53 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Extrae un código hex tipo 0x1234 de un mensaje de error, para al menos mostrar el código si no lo reconocemos.
-function extraerCodigoError(msgOriginal) {
-  const match = msgOriginal.match(/0x[0-9a-f]{2,6}\b/i);
-  return match ? match[0] : null;
+// Convierte el objeto de error on-chain de Solana (confirmation.value.err) en texto legible + código hex,
+// para poder identificar el error real y no solo "se confirmó" cuando en realidad falló por dentro.
+function describirErrorOnChain(errValue) {
+  try {
+    if (errValue && errValue.InstructionError) {
+      const [idx, detalle] = errValue.InstructionError;
+      if (detalle && typeof detalle === 'object' && 'Custom' in detalle) {
+        const codigoDecimal = detalle.Custom;
+        const codigoHex = '0x' + codigoDecimal.toString(16);
+        return { texto: `Instrucción #${idx} falló con código ${codigoHex} (${codigoDecimal})`, codigoHex };
+      }
+      return { texto: `Instrucción #${idx} falló: ${JSON.stringify(detalle)}`, codigoHex: null };
+    }
+    return { texto: JSON.stringify(errValue), codigoHex: null };
+  } catch (e) {
+    return { texto: String(errValue), codigoHex: null };
+  }
 }
 
-// NUNCA regresa el log crudo de Solana/PumpPortal — siempre un mensaje corto y limpio.
-// El detalle técnico completo se sigue mandando a console.error() en Railway por separado.
+// Confirma la transacción Y verifica que no haya fallado por dentro. "Confirmada" no es lo mismo que "exitosa" —
+// Solana puede incluir una transacción en un bloque aunque la instrucción real haya fallado (ej. slippage excedido
+// justo antes de ejecutarse). Si no revisamos esto, el bot festeja compras/ventas que nunca pasaron de verdad.
+async function confirmarYVerificarTx(sig) {
+  const confirmacion = await connection.confirmTransaction(sig, 'confirmed');
+  if (confirmacion.value.err) {
+    const info = describirErrorOnChain(confirmacion.value.err);
+    throw new Error(`ON_CHAIN_FAIL ${info.codigoHex || ''}: ${info.texto} (tx: ${sig})`);
+  }
+}
+
+// Traduce errores técnicos a mensajes claros — SIN adivinar por coincidencias de texto imprecisas,
+// y SIN mandar nunca el volcado crudo de logs a Telegram (eso se queda en Railway vía console.error).
 function mensajeAmigableError(e) {
   const msgOriginal = (e && e.message) || '';
   const msg = msgOriginal.toLowerCase();
 
+  if (/0x1786\b/.test(msgOriginal) || msg.includes('sellzeroamount')) {
+    return '⚠️ Tu wallet no tiene nada de este token para vender (probablemente una compra anterior nunca se llegó a ejecutar de verdad).';
+  }
   if (/0x1775\b/.test(msgOriginal) || msg.includes('bondingcurvecomplete')) {
     return '⚠️ Este token ya no está en la curva de pump.fun (se movió a otro exchange) y no se pudo enrutar automáticamente.';
   }
   if (/0x17af\b/.test(msgOriginal) || msg.includes('unsupportedquotemint')) {
     return '⚠️ Este token usa un pool con una moneda base distinta a SOL — no se pudo operar automáticamente.';
+  }
+  if (/0x1774\b/.test(msgOriginal) || msg.includes('exceededslippage')) {
+    return '⚠️ El precio se movió más de lo permitido (slippage) y la operación no se completó.';
   }
   if (msg.includes('insufficient') || msg.includes('debit an account')) {
     return '⚠️ No había suficiente SOL en la wallet para completar esta operación.';
@@ -93,10 +123,16 @@ function mensajeAmigableError(e) {
   if (msg.includes('slippage')) {
     return '⚠️ El precio se movió demasiado rápido (slippage) y la operación no se pudo completar.';
   }
-  const codigo = extraerCodigoError(msgOriginal);
+  const codigoMatch = msgOriginal.match(/0x[0-9a-f]{2,6}\b/i);
+  const codigo = codigoMatch ? codigoMatch[0] : null;
   return codigo
     ? `⚠️ No se pudo completar la operación (código: ${codigo}). Detalle completo en los logs de Railway.`
     : '⚠️ No se pudo completar la operación. Detalle completo en los logs de Railway.';
+}
+
+function esSellZeroAmount(e) {
+  const msgOriginal = (e && e.message) || '';
+  return /0x1786\b/.test(msgOriginal) || msgOriginal.toLowerCase().includes('sellzeroamount');
 }
 
 function linkTx(sig) { return `https://solscan.io/tx/${sig}`; }
@@ -157,7 +193,7 @@ async function cerrarCuentaDelToken(mint) {
       tx.recentBlockhash = blockhash;
       tx.sign(walletKeypair);
       const sig = await connection.sendRawTransaction(tx.serialize());
-      await connection.confirmTransaction(sig, 'confirmed');
+      await confirmarYVerificarTx(sig);
       await sleep(ESPERA_LECTURA_SALDO_MS);
       const despuesSol = await getWalletSolBalance();
       recuperadoSol += Math.max(despuesSol - antesSol, 0);
@@ -317,7 +353,6 @@ async function initBaselineReal() {
   } catch (e) { console.error('Error estableciendo baseline real:', e.message); }
 }
 
-// Registra el trade en el historial, MARCANDO en qué modo se hizo (para que /ranking no mezcle PAPER con REAL)
 async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
   try {
     await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol, modo) VALUES ($1,$2,$3,$4)', [walletAlias, symbol, profitSol, MODO_ACTUAL]);
@@ -353,6 +388,7 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
+// AHORA verifica que la transacción no solo se "confirme" sino que también haya sido EXITOSA on-chain.
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
@@ -369,7 +405,7 @@ async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippag
   const tx = VersionedTransaction.deserialize(new Uint8Array(data));
   tx.sign([walletKeypair]);
   const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await connection.confirmTransaction(sig, 'confirmed');
+  await confirmarYVerificarTx(sig); // <- aquí está el arreglo: lanza error si falló por dentro, aunque "confirmó"
   return sig;
 }
 
@@ -387,11 +423,14 @@ async function swapProfitToUsdc(amountSol) {
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
     tx.sign([walletKeypair]);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-    await connection.confirmTransaction(sig, 'confirmed');
+    await confirmarYVerificarTx(sig);
     return sig;
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
+// forzado=true (usado por /reconciliar manual) cierra de inmediato con un solo balance en 0.
+// Diferencia entre "SellZeroAmount" (posición fantasma, nunca se compró de verdad → NO fue pérdida real)
+// y cualquier otro error (se deja la posición abierta para reintentar en el siguiente ciclo, no se asume pérdida).
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
@@ -458,11 +497,17 @@ async function reconciliarPosiciones(forzado = false) {
           if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
         } catch (e) {
           console.error('Error en venta real de reconciliación:', e.message);
-          const solPrice = await getSolPriceUSD();
-          const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
-          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-          await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se cierra la posición en los registros como pérdida total. ${formatearResultado(r)}`);
+          if (esSellZeroAmount(e)) {
+            // Posición fantasma confirmada: nuestra wallet nunca tuvo el token de verdad (la compra original falló
+            // sin que lo detectáramos). No se registra pérdida real porque el capital nunca se gastó de verdad
+            // (salvo la comisión de red, ya perdida antes, no aquí).
+            await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad (tu wallet ya tenía 0 de este token). No se cuenta como pérdida.`);
+          } else {
+            // Cualquier otro error (ej. slippage momentáneo): NO se asume pérdida ni se cierra —
+            // se deja la posición abierta para reintentar en el próximo ciclo de reconciliación.
+            if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se reintentará en el próximo ciclo, la posición sigue abierta.`);
+          }
         }
       } else {
         const proceedsSol = 0;
@@ -529,6 +574,9 @@ async function handleTrackedBuy(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (fee + red incluidos).`);
       return;
     }
+    // IMPORTANTE: la posición SOLO se guarda si pumpPortalTrade no lanzó error — es decir, solo si la compra
+    // fue realmente exitosa on-chain (gracias a confirmarYVerificarTx). Si falla, el catch de abajo se activa
+    // y NUNCA se llega a insertar la posición ni a avisar "compra exitosa" falsamente.
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
@@ -581,7 +629,14 @@ async function handleTrackedSell(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}`);
+      // Si el error es SellZeroAmount, esta posición era fantasma (compra que nunca se ejecutó de verdad).
+      // La eliminamos de los registros SIN contarla como pérdida, ya que el capital nunca salió de la wallet.
+      if (esSellZeroAmount(e)) {
+        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${tracked.alias}] ${symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
+      } else {
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}\n(la posición sigue abierta, se reintentará con la próxima reconciliación)`);
+      }
     }
   } else {
     let proceedsSol;
@@ -623,7 +678,6 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
-// Cambia solo el monto ($) que se usa al copiar a una wallet ya agregada, sin tocar snapshot ni suscripción.
 bot.onText(/\/setamount (\S+) (\S+)/, async (msg, match) => {
   try {
     const alias = match[1];
@@ -688,7 +742,6 @@ bot.onText(/\/positions/, async (msg) => {
   bot.sendMessage(msg.chat.id, lista ? `${header}\n${lista}` : `${header}\nSin posiciones abiertas.`);
 });
 
-// El ranking SOLO cuenta trades cerrados en el modo actual (PAPER o REAL) — ya no se mezclan.
 bot.onText(/\/ranking/, async (msg) => {
   try {
     const { rows } = await pool.query(`
