@@ -1,5 +1,6 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - VERIFICA ERRORES ON-CHAIN (confirmada != exitosa) + SIN FALSAS COMPRAS/PERDIDAS =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - AHORA TAMBIÉN COPIA COMPRAS/VENTAS EN RAYDIUM (via Helius Webhooks) =========
 require('dotenv').config();
+const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
@@ -26,6 +27,8 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const PUMPPORTAL_WALLET = 'Guao96aNr7GUj3CSspwLy3tEccL3RUh5xVT4W3KNfBUH';
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+const HELIUS_WEBHOOK_URL = process.env.HELIUS_WEBHOOK_URL || 'https://memebot-production-054e.up.railway.app/helius-hook';
+const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET || 'memebot-raydium-secret';
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const MODO_ACTUAL = LIVE ? 'real' : 'paper';
@@ -57,6 +60,13 @@ try {
   console.error('Error cargando wallet/RPC de Solana:', e.message);
 }
 
+function getHeliusApiKey() {
+  try {
+    const url = new URL(process.env.HELIUS_RPC_URL);
+    return url.searchParams.get('api-key');
+  } catch { return null; }
+}
+
 const CHAIN_CONFIG = {
   sol: { id: 'solana', name: 'SOLANA' },
   eth: { id: 'eth', name: 'ETH' },
@@ -69,8 +79,6 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// Convierte el objeto de error on-chain de Solana (confirmation.value.err) en texto legible + código hex,
-// para poder identificar el error real y no solo "se confirmó" cuando en realidad falló por dentro.
 function describirErrorOnChain(errValue) {
   try {
     if (errValue && errValue.InstructionError) {
@@ -88,9 +96,6 @@ function describirErrorOnChain(errValue) {
   }
 }
 
-// Confirma la transacción Y verifica que no haya fallado por dentro. "Confirmada" no es lo mismo que "exitosa" —
-// Solana puede incluir una transacción en un bloque aunque la instrucción real haya fallado (ej. slippage excedido
-// justo antes de ejecutarse). Si no revisamos esto, el bot festeja compras/ventas que nunca pasaron de verdad.
 async function confirmarYVerificarTx(sig) {
   const confirmacion = await connection.confirmTransaction(sig, 'confirmed');
   if (confirmacion.value.err) {
@@ -99,8 +104,6 @@ async function confirmarYVerificarTx(sig) {
   }
 }
 
-// Traduce errores técnicos a mensajes claros — SIN adivinar por coincidencias de texto imprecisas,
-// y SIN mandar nunca el volcado crudo de logs a Telegram (eso se queda en Railway vía console.error).
 function mensajeAmigableError(e) {
   const msgOriginal = (e && e.message) || '';
   const msg = msgOriginal.toLowerCase();
@@ -216,8 +219,48 @@ async function resyncSubscriptions() {
     if (rows.length > 0) {
       ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
     }
-    console.log(`🔁 [${new Date().toISOString()}] Resincronizado: escuchando ${rows.length} wallets en total (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
+    console.log(`🔁 [${new Date().toISOString()}] Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
   } catch (e) { console.error('Error resincronizando suscripciones:', e.message); }
+}
+
+// ===== NUEVO: registra/actualiza el webhook de Helius para detectar swaps en RAYDIUM =====
+async function crearOActualizarWebhookHelius() {
+  const apiKey = getHeliusApiKey();
+  if (!apiKey) { console.error('⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook de Raydium no se puede configurar'); return; }
+  try {
+    const { rows: walletRows } = await pool.query('SELECT address FROM tracked_wallets');
+    const direcciones = walletRows.map(r => r.address);
+    const { rows } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+    const webhookIdExistente = rows[0]?.helius_webhook_id;
+
+    const payload = {
+      webhookURL: HELIUS_WEBHOOK_URL,
+      transactionTypes: ['SWAP'],
+      accountAddresses: direcciones,
+      webhookType: 'enhanced',
+      authHeader: HELIUS_WEBHOOK_SECRET
+    };
+
+    if (webhookIdExistente) {
+      const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) { console.error('Error actualizando webhook de Helius:', await res.text()); return; }
+      console.log(`🌊 Webhook de Raydium (Helius) actualizado: ${direcciones.length} wallets`);
+    } else {
+      const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) { console.error('Error creando webhook de Helius:', await res.text()); return; }
+      const data = await res.json();
+      await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]);
+      console.log(`🌊 Webhook de Raydium (Helius) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
+    }
+  } catch (e) { console.error('Error configurando webhook de Helius:', e.message); }
 }
 
 async function getPumpPortalWalletBalance() {
@@ -307,6 +350,7 @@ async function initDB() {
       ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
       CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
       ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS real_initial_sol REAL;
+      ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS helius_webhook_id TEXT;
       INSERT INTO global_balance (id, initial_usdc, current_usdc)
         VALUES (1, ${INITIAL_PAPER_BALANCE}, ${INITIAL_PAPER_BALANCE})
         ON CONFLICT (id) DO NOTHING;
@@ -388,7 +432,6 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// AHORA verifica que la transacción no solo se "confirme" sino que también haya sido EXITOSA on-chain.
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
@@ -405,7 +448,7 @@ async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippag
   const tx = VersionedTransaction.deserialize(new Uint8Array(data));
   tx.sign([walletKeypair]);
   const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await confirmarYVerificarTx(sig); // <- aquí está el arreglo: lanza error si falló por dentro, aunque "confirmó"
+  await confirmarYVerificarTx(sig);
   return sig;
 }
 
@@ -428,9 +471,6 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) { console.error('Error swap a USDC:', e.message); return null; }
 }
 
-// forzado=true (usado por /reconciliar manual) cierra de inmediato con un solo balance en 0.
-// Diferencia entre "SellZeroAmount" (posición fantasma, nunca se compró de verdad → NO fue pérdida real)
-// y cualquier otro error (se deja la posición abierta para reintentar en el siguiente ciclo, no se asume pérdida).
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) { console.log(`🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`); return; }
@@ -498,14 +538,9 @@ async function reconciliarPosiciones(forzado = false) {
         } catch (e) {
           console.error('Error en venta real de reconciliación:', e.message);
           if (esSellZeroAmount(e)) {
-            // Posición fantasma confirmada: nuestra wallet nunca tuvo el token de verdad (la compra original falló
-            // sin que lo detectáramos). No se registra pérdida real porque el capital nunca se gastó de verdad
-            // (salvo la comisión de red, ya perdida antes, no aquí).
             await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad (tu wallet ya tenía 0 de este token). No se cuenta como pérdida.`);
+            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
           } else {
-            // Cualquier otro error (ej. slippage momentáneo): NO se asume pérdida ni se cierra —
-            // se deja la posición abierta para reintentar en el próximo ciclo de reconciliación.
             if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se reintentará en el próximo ciclo, la posición sigue abierta.`);
           }
         }
@@ -523,14 +558,16 @@ async function reconciliarPosiciones(forzado = false) {
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
-async function handleTrackedBuy(tracked, trade) {
+// origen: 'PumpPortal' o 'Raydium' — solo para que el mensaje de Telegram diga de dónde vino la señal
+async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal') {
   const solPaid = trade.solAmount || 0;
-  if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} (${solPaid} SOL)`); return; }
+  if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`); return; }
 
   const symbol = await getTokenSymbol(trade.mint);
   const link = `https://pump.fun/coin/${trade.mint}`;
+  const etiquetaOrigen = origen === 'Raydium' ? ' 🌊' : '';
 
-  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} compró ${symbol} · ${solPaid.toFixed(3)} SOL\n🔗 ${link}`);
+  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solPaid.toFixed(3)} SOL\n🔗 ${link}`);
 
   const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
   if (seen.rows.length > 0) {
@@ -574,9 +611,6 @@ async function handleTrackedBuy(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (fee + red incluidos).`);
       return;
     }
-    // IMPORTANTE: la posición SOLO se guarda si pumpPortalTrade no lanzó error — es decir, solo si la compra
-    // fue realmente exitosa on-chain (gracias a confirmarYVerificarTx). Si falla, el catch de abajo se activa
-    // y NUNCA se llega a insertar la posición ni a avisar "compra exitosa" falsamente.
     try {
       const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
@@ -595,13 +629,14 @@ async function handleTrackedBuy(tracked, trade) {
   }
 }
 
-async function handleTrackedSell(tracked, trade) {
+async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
   const symbol = await getTokenSymbol(trade.mint);
+  const etiquetaOrigen = origen === 'Raydium' ? ' 🌊' : '';
   const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
   if (posRes.rows.length === 0) {
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
     return;
   }
   const position = posRes.rows[0];
@@ -629,8 +664,6 @@ async function handleTrackedSell(tracked, trade) {
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
-      // Si el error es SellZeroAmount, esta posición era fantasma (compra que nunca se ejecutó de verdad).
-      // La eliminamos de los registros SIN contarla como pérdida, ya que el capital nunca salió de la wallet.
       if (esSellZeroAmount(e)) {
         await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
         if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${tracked.alias}] ${symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
@@ -659,6 +692,73 @@ async function handleTrackedSell(tracked, trade) {
   }
 }
 
+// ===== NUEVO: extrae los datos de un swap de Raydium desde el evento "enhanced" de Helius =====
+function extraerSwapDeHelius(tx, walletAddress) {
+  try {
+    let tokenMint = null, tokenAmount = 0, direction = null;
+    for (const t of (tx.tokenTransfers || [])) {
+      if (t.mint === SOL_MINT) continue;
+      if (t.toUserAccount === walletAddress) { tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'buy'; }
+      else if (t.fromUserAccount === walletAddress) { tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'sell'; }
+    }
+    if (!tokenMint) return null;
+
+    let solAmount = 0;
+    for (const n of (tx.nativeTransfers || [])) {
+      if (n.fromUserAccount === walletAddress || n.toUserAccount === walletAddress) solAmount += n.amount / LAMPORTS_PER_SOL;
+    }
+    if (solAmount === 0) {
+      for (const t of (tx.tokenTransfers || [])) {
+        if (t.mint === SOL_MINT && (t.fromUserAccount === walletAddress || t.toUserAccount === walletAddress)) {
+          solAmount += t.tokenAmount;
+        }
+      }
+    }
+    solAmount = Math.abs(solAmount);
+    if (solAmount <= 0) return null;
+    return { mint: tokenMint, tokenAmount, solAmount, direction };
+  } catch (e) { console.error('Error extrayendo swap de Helius:', e.message); return null; }
+}
+
+// ===== NUEVO: servidor web que recibe los avisos de Helius sobre swaps en Raydium =====
+function iniciarServidorWebhook() {
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok'); // respondemos rápido, procesamos después
+      procesarWebhookHelius(body).catch(e => console.error('Error procesando webhook de Helius:', e.message));
+    });
+  });
+  const port = process.env.PORT || 3000;
+  server.listen(port, () => console.log(`🌐 Servidor de webhooks (Raydium/Helius) escuchando en el puerto ${port}`));
+}
+
+async function procesarWebhookHelius(rawBody) {
+  const eventos = JSON.parse(rawBody);
+  for (const tx of eventos) {
+    if (tx.type !== 'SWAP' || (tx.source || '').toUpperCase() !== 'RAYDIUM') continue;
+    const walletAddress = tx.feePayer;
+    const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [walletAddress]);
+    if (!rows[0]) continue;
+    const tracked = rows[0];
+    const swap = extraerSwapDeHelius(tx, walletAddress);
+    if (!swap) { console.log('🌊 Swap de Raydium detectado pero no se pudo interpretar (revisar formato)'); continue; }
+    console.log(`🌊 RAYDIUM detectado: ${tracked.alias} ${swap.direction} ${swap.mint.slice(0, 6)}... · ${swap.solAmount.toFixed(4)} SOL`);
+    const tradeCompatible = {
+      mint: swap.mint,
+      solAmount: swap.solAmount,
+      tokenAmount: swap.tokenAmount,
+      traderPublicKey: walletAddress,
+      txType: swap.direction
+    };
+    if (swap.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, 'Raydium');
+    else await handleTrackedSell(tracked, tradeCompatible, 'Raydium');
+  }
+}
+
 bot.onText(/\/add (.+)/, async (msg, match) => {
   try {
     const args = match[1].trim().split(/\s+/);
@@ -667,6 +767,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     const chain = normalizeChain(chainRaw);
     await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
     await resyncSubscriptions();
+    await crearOActualizarWebhookHelius();
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
     const holdings = await getHoldings(address);
     for (const h of holdings) {
@@ -674,7 +775,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando en vivo ✅`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y Raydium ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -704,6 +805,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
       }
       bot.sendMessage(msg.chat.id, respuesta);
       await resyncSubscriptions();
+      await crearOActualizarWebhookHelius();
     }
     else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}".`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
@@ -726,7 +828,8 @@ bot.onText(/\/list/, async (msg) => {
 
 bot.onText(/\/resync/, async (msg) => {
   await resyncSubscriptions();
-  bot.sendMessage(msg.chat.id, '🔁 Suscripciones resincronizadas con PumpPortal.');
+  await crearOActualizarWebhookHelius();
+  bot.sendMessage(msg.chat.id, '🔁 Suscripciones resincronizadas (PumpPortal + Raydium/Helius).');
 });
 
 bot.onText(/\/reconciliar/, async (msg) => {
@@ -771,6 +874,11 @@ bot.onText(/\/status/, async (msg) => {
   const lineaApiKey = saldoApiKey !== null
     ? `${saldoApiKey < 0.005 ? '⚠️ BAJO' : '💳'} Saldo cuenta PumpPortal: ${saldoApiKey.toFixed(4)} SOL`
     : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
+  let lineaRaydium = '⏳ Webhook de Raydium aún no configurado';
+  try {
+    const { rows } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+    if (rows[0]?.helius_webhook_id) lineaRaydium = `🌊 Raydium activo (webhook id: ${rows[0].helius_webhook_id.slice(0, 8)}...)`;
+  } catch (e) { /* no crítico */ }
   if (LIVE) {
     const solBalance = await getWalletSolBalance();
     let lineaBaseline = '';
@@ -783,12 +891,12 @@ bot.onText(/\/status/, async (msg) => {
         lineaBaseline = `\n${delta >= 0 ? '📈' : '📉'} Desde que empezaste: ${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) · inicial: ${inicialSol.toFixed(4)} SOL`;
       }
     } catch (e) { console.error('Error leyendo baseline real:', e.message); }
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}`);
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}\n${lineaRaydium}`);
   } else {
     const balance = await getPaperBalance();
     const pnl = balance.current_usdc - balance.initial_usdc;
     const signo = pnl >= 0 ? '📈' : '📉';
-    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}`);
+    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}\n${lineaRaydium}`);
   }
 });
 
@@ -800,11 +908,11 @@ bot.onText(/\/help/, async (msg) => {
     '/remove alias - Elimina una wallet Y cierra sus posiciones del modo actual',
     '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
-    '/resync - Fuerza una resincronización de todas las wallets con PumpPortal',
+    '/resync - Fuerza una resincronización de todas las wallets (PumpPortal + Raydium)',
     '/reconciliar - Revisa AHORA MISMO si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
     '/ranking - Muestra desempeño por wallet del modo actual (REAL o PAPER, separados)',
-    '/status - Muestra modo, saldo, ganancia/pérdida desde el inicio, conexión y saldo de la API key',
+    '/status - Muestra modo, saldo, ganancia/pérdida desde el inicio, y estado de PumpPortal + Raydium',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -838,8 +946,8 @@ function startListener() {
       const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [trade.traderPublicKey]);
       if (!rows[0]) return;
       const tracked = rows[0];
-      if (trade.txType === 'buy') await handleTrackedBuy(tracked, trade);
-      else if (trade.txType === 'sell') await handleTrackedSell(tracked, trade);
+      if (trade.txType === 'buy') await handleTrackedBuy(tracked, trade, 'PumpPortal');
+      else if (trade.txType === 'sell') await handleTrackedSell(tracked, trade, 'PumpPortal');
     } catch (e) { console.error('ws msg', e); }
   });
   ws.on('close', () => { console.log('WS cerrado, reintentando en 5s...'); setTimeout(startListener, 5000); });
@@ -858,7 +966,13 @@ setInterval(() => {
 setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
 setInterval(() => { reconciliarPosiciones(false); }, 5 * 60 * 1000);
 
-initDB().then(() => initBaselineReal()).then(() => startListener());
-console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'}`);
+initDB()
+  .then(() => initBaselineReal())
+  .then(() => crearOActualizarWebhookHelius())
+  .then(() => {
+    startListener();
+    iniciarServidorWebhook();
+  });
+console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'} · pump.fun + Raydium`);
 process.on('uncaughtException', e => console.error('uncaught', e));
 process.on('unhandledRejection', e => console.error('unhandled', e));
