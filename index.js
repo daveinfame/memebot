@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - AHORA TAMBIÉN COPIA COMPRAS/VENTAS EN RAYDIUM (via Helius Webhooks) =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - WEBHOOK "ANY" + DETECCION POR BALANCE (cualquier DEX) + STOP-LOSS 50% CADA 2 MIN =========
 require('dotenv').config();
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -29,6 +29,7 @@ const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const HELIUS_WEBHOOK_URL = process.env.HELIUS_WEBHOOK_URL || 'https://memebot-production-054e.up.railway.app/helius-hook';
 const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET || 'memebot-raydium-secret';
+const MINTS_A_IGNORAR = new Set([SOL_MINT, USDC_MINT]); // no tiene sentido "copiar" que la wallet terminó con SOL o USDC
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const MODO_ACTUAL = LIVE ? 'real' : 'paper';
@@ -40,6 +41,7 @@ const RENT_CUENTA_NUEVA_SOL = 0.00204;
 const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
 const ESPERA_LECTURA_SALDO_MS = 1500;
+const STOP_LOSS_PCT = 0.50; // si el valor cae a este % o menos del costo, se vende
 
 let connection = null;
 let walletKeypair = null;
@@ -171,6 +173,18 @@ function usdToSolNeto(usd, solPrice) {
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
+// Cotiza (sin ejecutar) cuánto SOL valdría vender X tokens ahorita — se usa para el Stop-Loss.
+async function estimarValorEnSol(mint, cantidadTokens, decimals) {
+  try {
+    const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
+    if (rawAmount <= 0) return null;
+    const res = await fetch(`${JUPITER_QUOTE}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=500`);
+    const quote = await res.json();
+    if (!quote.outAmount) return null;
+    return parseFloat(quote.outAmount) / LAMPORTS_PER_SOL;
+  } catch (e) { console.log('No se pudo cotizar valor para stop-loss:', e.message); return null; }
+}
+
 async function cerrarCuentaDelToken(mint) {
   if (!connection || !walletKeypair) return null;
   try {
@@ -223,10 +237,12 @@ async function resyncSubscriptions() {
   } catch (e) { console.error('Error resincronizando suscripciones:', e.message); }
 }
 
-// ===== NUEVO: registra/actualiza el webhook de Helius para detectar swaps en RAYDIUM =====
+// Ahora registramos el webhook con transactionTypes: ['ANY'] — Helius manda TODO lo que hagan
+// las wallets trackeadas, sin decidir de antemano si es "swap" o no. Esto es lo que corrige el
+// hueco de PumpSwap/Raydium CPMM/CLMM/Meteora/Jupiter que se estaba perdiendo antes.
 async function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
-  if (!apiKey) { console.error('⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook de Raydium no se puede configurar'); return; }
+  if (!apiKey) { console.error('⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
   try {
     const { rows: walletRows } = await pool.query('SELECT address FROM tracked_wallets');
     const direcciones = walletRows.map(r => r.address);
@@ -235,7 +251,7 @@ async function crearOActualizarWebhookHelius() {
 
     const payload = {
       webhookURL: HELIUS_WEBHOOK_URL,
-      transactionTypes: ['SWAP'],
+      transactionTypes: ['ANY'],
       accountAddresses: direcciones,
       webhookType: 'enhanced',
       authHeader: HELIUS_WEBHOOK_SECRET
@@ -248,7 +264,7 @@ async function crearOActualizarWebhookHelius() {
         body: JSON.stringify(payload)
       });
       if (!res.ok) { console.error('Error actualizando webhook de Helius:', await res.text()); return; }
-      console.log(`🌊 Webhook de Raydium (Helius) actualizado: ${direcciones.length} wallets`);
+      console.log(`🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets`);
     } else {
       const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
         method: 'POST',
@@ -258,7 +274,7 @@ async function crearOActualizarWebhookHelius() {
       if (!res.ok) { console.error('Error creando webhook de Helius:', await res.text()); return; }
       const data = await res.json();
       await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]);
-      console.log(`🌊 Webhook de Raydium (Helius) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
+      console.log(`🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
     }
   } catch (e) { console.error('Error configurando webhook de Helius:', e.message); }
 }
@@ -524,6 +540,7 @@ async function reconciliarPosiciones(forzado = false) {
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
           await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+          await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
           let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
           if (r.profitSol > 0) {
@@ -539,6 +556,7 @@ async function reconciliarPosiciones(forzado = false) {
           console.error('Error en venta real de reconciliación:', e.message);
           if (esSellZeroAmount(e)) {
             await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+            await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
             if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
           } else {
             if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se reintentará en el próximo ciclo, la posición sigue abierta.`);
@@ -549,6 +567,7 @@ async function reconciliarPosiciones(forzado = false) {
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
         await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+        await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(0);
         if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
@@ -558,14 +577,77 @@ async function reconciliarPosiciones(forzado = false) {
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
-// origen: 'PumpPortal' o 'Raydium' — solo para que el mensaje de Telegram diga de dónde vino la señal
+// ===== NUEVO: STOP-LOSS — revisa cada posición cada 2 minutos, corta si cae al 50% o menos =====
+async function revisarStopLoss() {
+  try {
+    const { rows: posiciones } = await pool.query(`
+      SELECT bp.*, tw.address AS wallet_address
+      FROM bot_positions bp
+      JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
+      WHERE bp.modo = $1
+    `, [MODO_ACTUAL]);
+
+    for (const pos of posiciones) {
+      if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) continue;
+      const { decimals } = await getTokenInfoHelius(pos.token_mint);
+      const valorActualSol = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+      if (valorActualSol === null) continue; // no se pudo cotizar ahorita (ej. sin liquidez momentánea) - se deja para el próximo ciclo
+      const ratio = valorActualSol / pos.cost_basis_sol;
+      if (ratio > STOP_LOSS_PCT) continue; // sigue arriba del umbral, no se toca
+      console.log(`🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${valorActualSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`);
+      await ejecutarStopLoss(pos, valorActualSol);
+    }
+  } catch (e) { console.error('Error revisando stop-loss:', e.message); }
+}
+
+async function ejecutarStopLoss(pos, valorEstimadoSol) {
+  if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
+    try {
+      const before = await getWalletSolBalance();
+      const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
+      await sleep(ESPERA_LECTURA_SALDO_MS);
+      const after = await getWalletSolBalance();
+      const proceedsSol = after - before;
+      const solPrice = await getSolPriceUSD();
+      const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+      await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
+      await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+      let msg = `🛑 STOP-LOSS ejecutado [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
+      const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
+      if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+      const saldoFinal = await getWalletSolBalance();
+      msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+    } catch (e) {
+      console.error('Error ejecutando stop-loss real:', e.message);
+      if (esSellZeroAmount(e)) {
+        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+        await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada al intentar el stop-loss. No se cuenta como pérdida.`);
+      } else {
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🛑 [${pos.wallet_alias}] ${pos.symbol}: intento de stop-loss falló (${mensajeAmigableError(e)}). Se reintentará en el próximo ciclo; si sigue fallando, la reconciliación se hará cargo.`);
+      }
+    }
+  } else {
+    const solPrice = await getSolPriceUSD();
+    const r = calcularResultado(pos.cost_basis_sol, valorEstimadoSol, solPrice, true);
+    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
+    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
+    await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
+    await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🛑 PAPER STOP-LOSS: ${pos.symbol} vía ${pos.wallet_alias} · Salí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
+  }
+}
+
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal') {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`); return; }
 
   const symbol = await getTokenSymbol(trade.mint);
   const link = `https://pump.fun/coin/${trade.mint}`;
-  const etiquetaOrigen = origen === 'Raydium' ? ' 🌊' : '';
+  const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
 
   if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solPaid.toFixed(3)} SOL\n🔗 ${link}`);
 
@@ -633,7 +715,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
   const symbol = await getTokenSymbol(trade.mint);
-  const etiquetaOrigen = origen === 'Raydium' ? ' 🌊' : '';
+  const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
   const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
   if (posRes.rows.length === 0) {
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
@@ -692,35 +774,37 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
   }
 }
 
-// ===== NUEVO: extrae los datos de un swap de Raydium desde el evento "enhanced" de Helius =====
-function extraerSwapDeHelius(tx, walletAddress) {
-  try {
-    let tokenMint = null, tokenAmount = 0, direction = null;
-    for (const t of (tx.tokenTransfers || [])) {
-      if (t.mint === SOL_MINT) continue;
-      if (t.toUserAccount === walletAddress) { tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'buy'; }
-      else if (t.fromUserAccount === walletAddress) { tokenMint = t.mint; tokenAmount = t.tokenAmount; direction = 'sell'; }
-    }
-    if (!tokenMint) return null;
+// ===== NUEVO: detección de compra/venta por CAMBIO DE BALANCE, sin importar el DEX =====
+// Toma un "accountData" del evento de Helius (que ya viene interpretado por ellos) y devuelve,
+// por cada token cuyo balance cambió, si fue un aumento (compra) o una caída (venta), y cuánto SOL
+// se movió en esa misma transacción (para el filtro anti-dust y el cálculo de tamaño).
+function extraerCambiosDeBalance(acc) {
+  const resultados = [];
+  const nativeSol = Math.abs((acc.nativeBalanceChange || 0) / LAMPORTS_PER_SOL);
+  for (const tbc of (acc.tokenBalanceChanges || [])) {
+    if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
+    const decimals = tbc.rawTokenAmount?.decimals ?? 6;
+    if (decimals === 0) continue; // filtro de seguridad: probablemente un NFT/coleccionable, no un memecoin
+    const rawAmount = parseFloat(tbc.rawTokenAmount?.tokenAmount ?? '0');
+    const delta = rawAmount / Math.pow(10, decimals);
+    if (delta === 0) continue;
 
-    let solAmount = 0;
-    for (const n of (tx.nativeTransfers || [])) {
-      if (n.fromUserAccount === walletAddress || n.toUserAccount === walletAddress) solAmount += n.amount / LAMPORTS_PER_SOL;
-    }
+    let solAmount = nativeSol;
     if (solAmount === 0) {
-      for (const t of (tx.tokenTransfers || [])) {
-        if (t.mint === SOL_MINT && (t.fromUserAccount === walletAddress || t.toUserAccount === walletAddress)) {
-          solAmount += t.tokenAmount;
-        }
-      }
+      const wsol = (acc.tokenBalanceChanges || []).find(t => t.mint === SOL_MINT);
+      if (wsol) solAmount = Math.abs(parseFloat(wsol.rawTokenAmount?.tokenAmount ?? '0') / Math.pow(10, wsol.rawTokenAmount?.decimals ?? 9));
     }
-    solAmount = Math.abs(solAmount);
-    if (solAmount <= 0) return null;
-    return { mint: tokenMint, tokenAmount, solAmount, direction };
-  } catch (e) { console.error('Error extrayendo swap de Helius:', e.message); return null; }
+
+    resultados.push({
+      mint: tbc.mint,
+      tokenAmount: Math.abs(delta),
+      solAmount,
+      direction: delta > 0 ? 'buy' : 'sell'
+    });
+  }
+  return resultados;
 }
 
-// ===== NUEVO: servidor web que recibe los avisos de Helius sobre swaps en Raydium =====
 function iniciarServidorWebhook() {
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
@@ -728,34 +812,40 @@ function iniciarServidorWebhook() {
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('ok'); // respondemos rápido, procesamos después
+      res.end('ok');
       procesarWebhookHelius(body).catch(e => console.error('Error procesando webhook de Helius:', e.message));
     });
   });
   const port = process.env.PORT || 3000;
-  server.listen(port, () => console.log(`🌐 Servidor de webhooks (Raydium/Helius) escuchando en el puerto ${port}`));
+  server.listen(port, () => console.log(`🌐 Servidor de webhooks escuchando en el puerto ${port} (tipo ANY, cualquier DEX)`));
 }
 
 async function procesarWebhookHelius(rawBody) {
-  const eventos = JSON.parse(rawBody);
+  let eventos;
+  try { eventos = JSON.parse(rawBody); } catch (e) { console.error('Webhook Helius: JSON inválido'); return; }
+  const { rows: trackedRows } = await pool.query('SELECT * FROM tracked_wallets');
+  if (trackedRows.length === 0) return;
+  const trackedMap = new Map(trackedRows.map(r => [r.address, r]));
+
   for (const tx of eventos) {
-    if (tx.type !== 'SWAP' || (tx.source || '').toUpperCase() !== 'RAYDIUM') continue;
-    const walletAddress = tx.feePayer;
-    const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [walletAddress]);
-    if (!rows[0]) continue;
-    const tracked = rows[0];
-    const swap = extraerSwapDeHelius(tx, walletAddress);
-    if (!swap) { console.log('🌊 Swap de Raydium detectado pero no se pudo interpretar (revisar formato)'); continue; }
-    console.log(`🌊 RAYDIUM detectado: ${tracked.alias} ${swap.direction} ${swap.mint.slice(0, 6)}... · ${swap.solAmount.toFixed(4)} SOL`);
-    const tradeCompatible = {
-      mint: swap.mint,
-      solAmount: swap.solAmount,
-      tokenAmount: swap.tokenAmount,
-      traderPublicKey: walletAddress,
-      txType: swap.direction
-    };
-    if (swap.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, 'Raydium');
-    else await handleTrackedSell(tracked, tradeCompatible, 'Raydium');
+    for (const acc of (tx.accountData || [])) {
+      const tracked = trackedMap.get(acc.account);
+      if (!tracked) continue;
+      const cambios = extraerCambiosDeBalance(acc);
+      for (const cambio of cambios) {
+        console.log(`🌐 Actividad detectada: ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
+        const tradeCompatible = {
+          mint: cambio.mint,
+          solAmount: cambio.solAmount,
+          tokenAmount: cambio.tokenAmount,
+          traderPublicKey: tracked.address,
+          txType: cambio.direction
+        };
+        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
+        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen);
+        else await handleTrackedSell(tracked, tradeCompatible, origen);
+      }
+    }
   }
 }
 
@@ -775,7 +865,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       if (!mint) continue;
       await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
     }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y Raydium ✅`);
+    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y cualquier DEX ✅`);
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
@@ -829,7 +919,7 @@ bot.onText(/\/list/, async (msg) => {
 bot.onText(/\/resync/, async (msg) => {
   await resyncSubscriptions();
   await crearOActualizarWebhookHelius();
-  bot.sendMessage(msg.chat.id, '🔁 Suscripciones resincronizadas (PumpPortal + Raydium/Helius).');
+  bot.sendMessage(msg.chat.id, '🔁 Suscripciones resincronizadas (PumpPortal + webhook ANY).');
 });
 
 bot.onText(/\/reconciliar/, async (msg) => {
@@ -874,11 +964,12 @@ bot.onText(/\/status/, async (msg) => {
   const lineaApiKey = saldoApiKey !== null
     ? `${saldoApiKey < 0.005 ? '⚠️ BAJO' : '💳'} Saldo cuenta PumpPortal: ${saldoApiKey.toFixed(4)} SOL`
     : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
-  let lineaRaydium = '⏳ Webhook de Raydium aún no configurado';
+  let lineaWebhook = '⏳ Webhook (cualquier DEX) aún no configurado';
   try {
     const { rows } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
-    if (rows[0]?.helius_webhook_id) lineaRaydium = `🌊 Raydium activo (webhook id: ${rows[0].helius_webhook_id.slice(0, 8)}...)`;
+    if (rows[0]?.helius_webhook_id) lineaWebhook = `🌐 Webhook activo (cualquier DEX) · id: ${rows[0].helius_webhook_id.slice(0, 8)}...`;
   } catch (e) { /* no crítico */ }
+  const lineaSL = `🛑 Stop-loss: ${(STOP_LOSS_PCT * 100).toFixed(0)}% (revisión cada 2 min)`;
   if (LIVE) {
     const solBalance = await getWalletSolBalance();
     let lineaBaseline = '';
@@ -891,12 +982,12 @@ bot.onText(/\/status/, async (msg) => {
         lineaBaseline = `\n${delta >= 0 ? '📈' : '📉'} Desde que empezaste: ${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) · inicial: ${inicialSol.toFixed(4)} SOL`;
       }
     } catch (e) { console.error('Error leyendo baseline real:', e.message); }
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}\n${lineaRaydium}`);
+    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaSL}`);
   } else {
     const balance = await getPaperBalance();
     const pnl = balance.current_usdc - balance.initial_usdc;
     const signo = pnl >= 0 ? '📈' : '📉';
-    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}\n${lineaRaydium}`);
+    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaSL}`);
   }
 });
 
@@ -908,11 +999,11 @@ bot.onText(/\/help/, async (msg) => {
     '/remove alias - Elimina una wallet Y cierra sus posiciones del modo actual',
     '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
-    '/resync - Fuerza una resincronización de todas las wallets (PumpPortal + Raydium)',
+    '/resync - Fuerza una resincronización (PumpPortal + webhook de cualquier DEX)',
     '/reconciliar - Revisa AHORA MISMO si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
     '/ranking - Muestra desempeño por wallet del modo actual (REAL o PAPER, separados)',
-    '/status - Muestra modo, saldo, ganancia/pérdida desde el inicio, y estado de PumpPortal + Raydium',
+    '/status - Muestra modo, saldo, ganancia/pérdida, conexión, webhook y stop-loss',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -965,6 +1056,7 @@ setInterval(() => {
 
 setInterval(() => { resyncSubscriptions(); }, 10 * 60 * 1000);
 setInterval(() => { reconciliarPosiciones(false); }, 5 * 60 * 1000);
+setInterval(() => { revisarStopLoss(); }, 2 * 60 * 1000);
 
 initDB()
   .then(() => initBaselineReal())
@@ -973,6 +1065,6 @@ initDB()
     startListener();
     iniciarServidorWebhook();
   });
-console.log(`${NOMBRE_BOT} REGLAS R0-R5 LISTO · modo ${LIVE ? 'REAL' : 'PAPER'} · pump.fun + Raydium`);
+console.log(`${NOMBRE_BOT} REGLAS R0-R5 + STOP-LOSS ${(STOP_LOSS_PCT * 100).toFixed(0)}% LISTO · modo ${LIVE ? 'REAL' : 'PAPER'} · pump.fun + cualquier DEX`);
 process.on('uncaughtException', e => console.error('uncaught', e));
 process.on('unhandledRejection', e => console.error('unhandled', e));
