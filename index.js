@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - WEBHOOK "ANY" + DETECCION POR BALANCE (cualquier DEX) + STOP-LOSS 50% CADA 2 MIN =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - JUPITER V2 (con API key) + TIMEOUTS + BACKOFF + DELAY WARNING + FIX /list =========
 require('dotenv').config();
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -18,10 +18,12 @@ const NOMBRE_BOT = '⚡️M3M3B0T⚡️';
 if (!process.env.PUMPPORTAL_API_KEY) {
   console.error('⚠️ FALTA PUMPPORTAL_API_KEY - las wallets trackeadas NO se van a poder vigilar sin esto');
 }
+if (!process.env.JUPITER_API_KEY) {
+  console.error('⚠️ FALTA JUPITER_API_KEY - el stop-loss y la conversión a USDC no van a poder cotizar/ejecutar');
+}
 const PUMP_PORTAL_WS = `wss://pumpportal.fun/api/data?api-key=${process.env.PUMPPORTAL_API_KEY || ''}`;
 const PUMP_PORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
-const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_BASE = 'https://api.jup.ag/swap/v2';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const PUMPPORTAL_WALLET = 'Guao96aNr7GUj3CSspwLy3tEccL3RUh5xVT4W3KNfBUH';
@@ -29,7 +31,7 @@ const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const HELIUS_WEBHOOK_URL = process.env.HELIUS_WEBHOOK_URL || 'https://memebot-production-054e.up.railway.app/helius-hook';
 const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET || 'memebot-raydium-secret';
-const MINTS_A_IGNORAR = new Set([SOL_MINT, USDC_MINT]); // no tiene sentido "copiar" que la wallet terminó con SOL o USDC
+const MINTS_A_IGNORAR = new Set([SOL_MINT, USDC_MINT]);
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const MODO_ACTUAL = LIVE ? 'real' : 'paper';
@@ -41,7 +43,10 @@ const RENT_CUENTA_NUEVA_SOL = 0.00204;
 const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
 const ESPERA_LECTURA_SALDO_MS = 1500;
-const STOP_LOSS_PCT = 0.50; // si el valor cae a este % o menos del costo, se vende
+const STOP_LOSS_PCT = 0.50;
+const RETRASO_AVISO_MS = 10000; // avisa si pasan más de 10s entre detectar y copiar
+const JUPITER_TIMEOUT_MS = 8000; // cada intento a Jupiter falla rápido en vez de colgarse
+const JUPITER_MAX_INTENTOS = 3;
 
 let connection = null;
 let walletKeypair = null;
@@ -53,6 +58,42 @@ const cacheSimbolos = new Map();
 const cacheDecimales = new Map();
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function horaLocal(ms) {
+  return new Date(ms).toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour12: false });
+}
+
+function chequearRetraso(horaDeteccionMs, alias, symbol) {
+  if (!horaDeteccionMs) return;
+  const ahora = Date.now();
+  const retrasoMs = ahora - horaDeteccionMs;
+  if (retrasoMs > RETRASO_AVISO_MS) {
+    console.warn(`⚠️ DELAY DETECTADO: ${alias} (${symbol}) detectado a las ${horaLocal(horaDeteccionMs)} pero la copia se envió a las ${horaLocal(ahora)} (${Math.round(retrasoMs / 1000)}s de retraso) - posible saturación/rate limit`);
+  }
+}
+
+// Llama a Jupiter con timeout por intento y reintento con backoff exponencial si hay 429 o fallo de red.
+async function fetchJupiterConReintento(url, opts = {}) {
+  let ultimoError = null;
+  for (let intento = 1; intento <= JUPITER_MAX_INTENTOS; intento++) {
+    try {
+      const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(JUPITER_TIMEOUT_MS) });
+      if (res.status === 429) {
+        const espera = 1000 * Math.pow(2, intento);
+        console.warn(`Jupiter rate limited, esperando... (intento ${intento}/${JUPITER_MAX_INTENTOS}, espera ${espera}ms)`);
+        await sleep(espera);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      ultimoError = e;
+      const espera = 1000 * Math.pow(2, intento);
+      console.warn(`Jupiter rate limited, esperando... (fetch failed intento ${intento}/${JUPITER_MAX_INTENTOS}: ${e.message}, espera ${espera}ms)`);
+      if (intento < JUPITER_MAX_INTENTOS) await sleep(espera);
+    }
+  }
+  throw ultimoError || new Error('Jupiter: se agotaron los reintentos');
+}
 
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
@@ -173,15 +214,18 @@ function usdToSolNeto(usd, solPrice) {
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
-// Cotiza (sin ejecutar) cuánto SOL valdría vender X tokens ahorita — se usa para el Stop-Loss.
+// Cotiza (sin ejecutar) usando el nuevo Jupiter /order — sin "taker" solo trae el precio, no arma transacción.
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
+  if (!process.env.JUPITER_API_KEY) return null;
   try {
     const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
     if (rawAmount <= 0) return null;
-    const res = await fetch(`${JUPITER_QUOTE}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=500`);
-    const quote = await res.json();
-    if (!quote.outAmount) return null;
-    return parseFloat(quote.outAmount) / LAMPORTS_PER_SOL;
+    const url = `${JUPITER_BASE}/order?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}`;
+    const res = await fetchJupiterConReintento(url, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
+    if (!res.ok) { console.log('Jupiter /order (stop-loss) respondió mal:', res.status, await res.text()); return null; }
+    const data = await res.json();
+    if (!data.outAmount) return null;
+    return parseFloat(data.outAmount) / LAMPORTS_PER_SOL;
   } catch (e) { console.log('No se pudo cotizar valor para stop-loss:', e.message); return null; }
 }
 
@@ -237,9 +281,6 @@ async function resyncSubscriptions() {
   } catch (e) { console.error('Error resincronizando suscripciones:', e.message); }
 }
 
-// Ahora registramos el webhook con transactionTypes: ['ANY'] — Helius manda TODO lo que hagan
-// las wallets trackeadas, sin decidir de antemano si es "swap" o no. Esto es lo que corrige el
-// hueco de PumpSwap/Raydium CPMM/CLMM/Meteora/Jupiter que se estaba perdiendo antes.
 async function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
   if (!apiKey) { console.error('⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
@@ -468,18 +509,18 @@ async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippag
   return sig;
 }
 
+// Migrado al nuevo Jupiter /order (con "taker" para que arme la transacción real) + firmamos y mandamos nosotros mismos.
 async function swapProfitToUsdc(amountSol) {
+  if (!process.env.JUPITER_API_KEY) { console.error('Falta JUPITER_API_KEY, no se puede convertir a USDC'); return null; }
   try {
     const lamports = Math.floor(amountSol * LAMPORTS_PER_SOL);
     if (lamports <= 0) return null;
-    const quoteRes = await fetch(`${JUPITER_QUOTE}?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&slippageBps=100`);
-    const quote = await quoteRes.json();
-    const swapRes = await fetch(JUPITER_SWAP, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quoteResponse: quote, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true })
-    });
-    const { swapTransaction } = await swapRes.json();
-    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
+    const url = `${JUPITER_BASE}/order?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&taker=${walletKeypair.publicKey.toBase58()}`;
+    const res = await fetchJupiterConReintento(url, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
+    if (!res.ok) { console.error('Jupiter /order (swap a USDC) respondió mal:', res.status, await res.text()); return null; }
+    const order = await res.json();
+    if (!order.transaction) { console.error('Jupiter /order no regresó transacción:', JSON.stringify(order)); return null; }
+    const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
     tx.sign([walletKeypair]);
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
     await confirmarYVerificarTx(sig);
@@ -577,7 +618,7 @@ async function reconciliarPosiciones(forzado = false) {
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
-// ===== NUEVO: STOP-LOSS — revisa cada posición cada 2 minutos, corta si cae al 50% o menos =====
+// Ahora revisa TODAS las posiciones EN PARALELO (no una por una) para que un Jupiter lento no acumule retraso.
 async function revisarStopLoss() {
   try {
     const { rows: posiciones } = await pool.query(`
@@ -587,16 +628,16 @@ async function revisarStopLoss() {
       WHERE bp.modo = $1
     `, [MODO_ACTUAL]);
 
-    for (const pos of posiciones) {
-      if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) continue;
+    await Promise.allSettled(posiciones.map(async (pos) => {
+      if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) return;
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
       const valorActualSol = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-      if (valorActualSol === null) continue; // no se pudo cotizar ahorita (ej. sin liquidez momentánea) - se deja para el próximo ciclo
+      if (valorActualSol === null) return;
       const ratio = valorActualSol / pos.cost_basis_sol;
-      if (ratio > STOP_LOSS_PCT) continue; // sigue arriba del umbral, no se toca
+      if (ratio > STOP_LOSS_PCT) return;
       console.log(`🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${valorActualSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`);
       await ejecutarStopLoss(pos, valorActualSol);
-    }
+    }));
   } catch (e) { console.error('Error revisando stop-loss:', e.message); }
 }
 
@@ -641,7 +682,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
   }
 }
 
-async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal') {
+async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) { console.log(`Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`); return; }
 
@@ -699,6 +740,7 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal') {
         [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
       const saldoFinal = await getWalletSolBalance();
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx: ${linkTx(sig)}\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`);
+      chequearRetraso(horaDeteccion, tracked.alias, symbol);
     } catch (e) {
       console.error('Error comprando real:', e.message);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
@@ -708,10 +750,11 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal') {
       [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
     const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
     if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
+    chequearRetraso(horaDeteccion, tracked.alias, symbol);
   }
 }
 
-async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
+async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
 
   const symbol = await getTokenSymbol(trade.mint);
@@ -744,6 +787,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
       const saldoFinal = await getWalletSolBalance();
       msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+      chequearRetraso(horaDeteccion, tracked.alias, symbol);
     } catch (e) {
       console.error('Error vendiendo real:', e.message);
       if (esSellZeroAmount(e)) {
@@ -771,20 +815,17 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal') {
     let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
     if (r.profitSol > 0) msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+    chequearRetraso(horaDeteccion, tracked.alias, symbol);
   }
 }
 
-// ===== NUEVO: detección de compra/venta por CAMBIO DE BALANCE, sin importar el DEX =====
-// Toma un "accountData" del evento de Helius (que ya viene interpretado por ellos) y devuelve,
-// por cada token cuyo balance cambió, si fue un aumento (compra) o una caída (venta), y cuánto SOL
-// se movió en esa misma transacción (para el filtro anti-dust y el cálculo de tamaño).
 function extraerCambiosDeBalance(acc) {
   const resultados = [];
   const nativeSol = Math.abs((acc.nativeBalanceChange || 0) / LAMPORTS_PER_SOL);
   for (const tbc of (acc.tokenBalanceChanges || [])) {
     if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
     const decimals = tbc.rawTokenAmount?.decimals ?? 6;
-    if (decimals === 0) continue; // filtro de seguridad: probablemente un NFT/coleccionable, no un memecoin
+    if (decimals === 0) continue;
     const rawAmount = parseFloat(tbc.rawTokenAmount?.tokenAmount ?? '0');
     const delta = rawAmount / Math.pow(10, decimals);
     if (delta === 0) continue;
@@ -828,6 +869,7 @@ async function procesarWebhookHelius(rawBody) {
   const trackedMap = new Map(trackedRows.map(r => [r.address, r]));
 
   for (const tx of eventos) {
+    const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
     for (const acc of (tx.accountData || [])) {
       const tracked = trackedMap.get(acc.account);
       if (!tracked) continue;
@@ -842,8 +884,8 @@ async function procesarWebhookHelius(rawBody) {
           txType: cambio.direction
         };
         const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
-        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen);
-        else await handleTrackedSell(tracked, tradeCompatible, origen);
+        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
+        else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
       }
     }
   }
@@ -911,9 +953,21 @@ bot.onText(/\/closepos (.+) (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
+// Ahora con try/catch y protegido contra filas con dirección vacía/rara — esto es lo que probablemente
+// se estaba quedando mudo en tu bot sin avisar nada.
 bot.onText(/\/list/, async (msg) => {
-  const { rows } = await pool.query('SELECT * FROM tracked_wallets');
-  bot.sendMessage(msg.chat.id, rows.map(r => `• ${r.alias} ${r.address.slice(0, 6)} $${r.amount} ${getLabel(r.chain)}`).join('\n') || 'Vacío');
+  try {
+    const { rows } = await pool.query('SELECT * FROM tracked_wallets');
+    if (rows.length === 0) { bot.sendMessage(msg.chat.id, 'Vacío'); return; }
+    const texto = rows.map(r => {
+      const direccionCorta = r.address ? r.address.slice(0, 6) : '⚠️SIN-DIRECCION';
+      return `• ${r.alias || '⚠️sin-alias'} ${direccionCorta} $${r.amount ?? '?'} ${getLabel(r.chain)}`;
+    }).join('\n');
+    bot.sendMessage(msg.chat.id, texto);
+  } catch (e) {
+    console.error('Error en /list:', e.message);
+    bot.sendMessage(msg.chat.id, '❌ Error mostrando la lista: ' + e.message);
+  }
 });
 
 bot.onText(/\/resync/, async (msg) => {
@@ -929,10 +983,12 @@ bot.onText(/\/reconciliar/, async (msg) => {
 });
 
 bot.onText(/\/positions/, async (msg) => {
-  const { rows } = await pool.query('SELECT * FROM bot_positions WHERE modo=$1', [MODO_ACTUAL]);
-  const header = `📋 Posiciones abiertas [${MODO_ACTUAL.toUpperCase()}]:`;
-  const lista = rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}${r.ceros_seguidos > 0 ? ` ⚠️ (${r.ceros_seguidos}/${CONFIRMACIONES_NECESARIAS} confirmaciones de venta)` : ''}`).join('\n');
-  bot.sendMessage(msg.chat.id, lista ? `${header}\n${lista}` : `${header}\nSin posiciones abiertas.`);
+  try {
+    const { rows } = await pool.query('SELECT * FROM bot_positions WHERE modo=$1', [MODO_ACTUAL]);
+    const header = `📋 Posiciones abiertas [${MODO_ACTUAL.toUpperCase()}]:`;
+    const lista = rows.map(r => `• ${r.symbol} · ${r.amount?.toFixed(2)} tokens · costo ${r.cost_basis_sol?.toFixed(4)} SOL · via ${r.wallet_alias}${r.ceros_seguidos > 0 ? ` ⚠️ (${r.ceros_seguidos}/${CONFIRMACIONES_NECESARIAS} confirmaciones de venta)` : ''}`).join('\n');
+    bot.sendMessage(msg.chat.id, lista ? `${header}\n${lista}` : `${header}\nSin posiciones abiertas.`);
+  } catch (e) { console.error('Error en /positions:', e.message); bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message); }
 });
 
 bot.onText(/\/ranking/, async (msg) => {
@@ -958,37 +1014,40 @@ bot.onText(/\/ranking/, async (msg) => {
 });
 
 bot.onText(/\/status/, async (msg) => {
-  const modo = LIVE ? 'REAL' : 'PAPER';
-  const estadoConexion = primerMensajeConfirmado ? `✅ PumpPortal confirmado (${totalMensajesRecibidos} eventos recibidos)` : '⏳ Esperando primer dato de PumpPortal...';
-  const saldoApiKey = await getPumpPortalWalletBalance();
-  const lineaApiKey = saldoApiKey !== null
-    ? `${saldoApiKey < 0.005 ? '⚠️ BAJO' : '💳'} Saldo cuenta PumpPortal: ${saldoApiKey.toFixed(4)} SOL`
-    : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
-  let lineaWebhook = '⏳ Webhook (cualquier DEX) aún no configurado';
   try {
-    const { rows } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
-    if (rows[0]?.helius_webhook_id) lineaWebhook = `🌐 Webhook activo (cualquier DEX) · id: ${rows[0].helius_webhook_id.slice(0, 8)}...`;
-  } catch (e) { /* no crítico */ }
-  const lineaSL = `🛑 Stop-loss: ${(STOP_LOSS_PCT * 100).toFixed(0)}% (revisión cada 2 min)`;
-  if (LIVE) {
-    const solBalance = await getWalletSolBalance();
-    let lineaBaseline = '';
+    const modo = LIVE ? 'REAL' : 'PAPER';
+    const estadoConexion = primerMensajeConfirmado ? `✅ PumpPortal confirmado (${totalMensajesRecibidos} eventos recibidos)` : '⏳ Esperando primer dato de PumpPortal...';
+    const saldoApiKey = await getPumpPortalWalletBalance();
+    const lineaApiKey = saldoApiKey !== null
+      ? `${saldoApiKey < 0.005 ? '⚠️ BAJO' : '💳'} Saldo cuenta PumpPortal: ${saldoApiKey.toFixed(4)} SOL`
+      : '⚠️ No se pudo consultar el saldo de la cuenta de PumpPortal';
+    let lineaWebhook = '⏳ Webhook (cualquier DEX) aún no configurado';
     try {
-      const { rows } = await pool.query('SELECT real_initial_sol FROM global_balance WHERE id=1');
-      const inicialSol = rows[0]?.real_initial_sol;
-      if (inicialSol !== null && inicialSol !== undefined) {
-        const delta = solBalance - inicialSol;
-        const pct = inicialSol > 0 ? (delta / inicialSol) * 100 : 0;
-        lineaBaseline = `\n${delta >= 0 ? '📈' : '📉'} Desde que empezaste: ${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) · inicial: ${inicialSol.toFixed(4)} SOL`;
-      }
-    } catch (e) { console.error('Error leyendo baseline real:', e.message); }
-    bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaSL}`);
-  } else {
-    const balance = await getPaperBalance();
-    const pnl = balance.current_usdc - balance.initial_usdc;
-    const signo = pnl >= 0 ? '📈' : '📉';
-    bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaSL}`);
-  }
+      const { rows } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+      if (rows[0]?.helius_webhook_id) lineaWebhook = `🌐 Webhook activo (cualquier DEX) · id: ${rows[0].helius_webhook_id.slice(0, 8)}...`;
+    } catch (e) { /* no crítico */ }
+    const lineaJupiter = process.env.JUPITER_API_KEY ? '🪐 Jupiter: API key configurada' : '⚠️ Jupiter: FALTA JUPITER_API_KEY';
+    const lineaSL = `🛑 Stop-loss: ${(STOP_LOSS_PCT * 100).toFixed(0)}% (revisión cada 2 min)`;
+    if (LIVE) {
+      const solBalance = await getWalletSolBalance();
+      let lineaBaseline = '';
+      try {
+        const { rows } = await pool.query('SELECT real_initial_sol FROM global_balance WHERE id=1');
+        const inicialSol = rows[0]?.real_initial_sol;
+        if (inicialSol !== null && inicialSol !== undefined) {
+          const delta = solBalance - inicialSol;
+          const pct = inicialSol > 0 ? (delta / inicialSol) * 100 : 0;
+          lineaBaseline = `\n${delta >= 0 ? '📈' : '📉'} Desde que empezaste: ${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) · inicial: ${inicialSol.toFixed(4)} SOL`;
+        }
+      } catch (e) { console.error('Error leyendo baseline real:', e.message); }
+      bot.sendMessage(msg.chat.id, `Estado: REAL | Saldo SOL: ${solBalance.toFixed(4)}${lineaBaseline}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaJupiter}\n${lineaSL}`);
+    } else {
+      const balance = await getPaperBalance();
+      const pnl = balance.current_usdc - balance.initial_usdc;
+      const signo = pnl >= 0 ? '📈' : '📉';
+      bot.sendMessage(msg.chat.id, `Estado: PAPER | Saldo ficticio: $${balance.current_usdc.toFixed(2)} (inicial $${balance.initial_usdc.toFixed(2)}) ${signo} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\n${estadoConexion}\n${lineaApiKey}\n${lineaWebhook}\n${lineaJupiter}\n${lineaSL}`);
+    }
+  } catch (e) { console.error('Error en /status:', e.message); bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message); }
 });
 
 bot.onText(/\/help/, async (msg) => {
@@ -1003,7 +1062,7 @@ bot.onText(/\/help/, async (msg) => {
     '/reconciliar - Revisa AHORA MISMO si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
     '/ranking - Muestra desempeño por wallet del modo actual (REAL o PAPER, separados)',
-    '/status - Muestra modo, saldo, ganancia/pérdida, conexión, webhook y stop-loss',
+    '/status - Muestra modo, saldo, ganancia/pérdida, conexión, webhook, Jupiter y stop-loss',
     '/help - Muestra este mensaje'
   ].join('\n');
   bot.sendMessage(msg.chat.id, texto);
@@ -1020,6 +1079,7 @@ function startListener() {
     try {
       totalMensajesRecibidos++;
       mensajesDesdeUltimoResumen++;
+      const horaDeteccion = Date.now();
       if (!primerMensajeConfirmado) {
         primerMensajeConfirmado = true;
         console.log('✅ CONFIRMADO: PumpPortal está mandando datos en vivo (llegó el primer evento)');
@@ -1037,8 +1097,8 @@ function startListener() {
       const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [trade.traderPublicKey]);
       if (!rows[0]) return;
       const tracked = rows[0];
-      if (trade.txType === 'buy') await handleTrackedBuy(tracked, trade, 'PumpPortal');
-      else if (trade.txType === 'sell') await handleTrackedSell(tracked, trade, 'PumpPortal');
+      if (trade.txType === 'buy') await handleTrackedBuy(tracked, trade, 'PumpPortal', horaDeteccion);
+      else if (trade.txType === 'sell') await handleTrackedSell(tracked, trade, 'PumpPortal', horaDeteccion);
     } catch (e) { console.error('ws msg', e); }
   });
   ws.on('close', () => { console.log('WS cerrado, reintentando en 5s...'); setTimeout(startListener, 5000); });
