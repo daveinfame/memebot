@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - JUPITER V2 (con API key) + TIMEOUTS + BACKOFF + DELAY WARNING + FIX /list =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - DIAGNOSTICO COMPLETO DE WEBHOOK (para encontrar el hueco de Raydium/Moonshot) =========
 require('dotenv').config();
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -44,8 +44,8 @@ const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = 2;
 const ESPERA_LECTURA_SALDO_MS = 1500;
 const STOP_LOSS_PCT = 0.50;
-const RETRASO_AVISO_MS = 10000; // avisa si pasan más de 10s entre detectar y copiar
-const JUPITER_TIMEOUT_MS = 8000; // cada intento a Jupiter falla rápido en vez de colgarse
+const RETRASO_AVISO_MS = 10000;
+const JUPITER_TIMEOUT_MS = 8000;
 const JUPITER_MAX_INTENTOS = 3;
 
 let connection = null;
@@ -72,7 +72,6 @@ function chequearRetraso(horaDeteccionMs, alias, symbol) {
   }
 }
 
-// Llama a Jupiter con timeout por intento y reintento con backoff exponencial si hay 429 o fallo de red.
 async function fetchJupiterConReintento(url, opts = {}) {
   let ultimoError = null;
   for (let intento = 1; intento <= JUPITER_MAX_INTENTOS; intento++) {
@@ -214,7 +213,6 @@ function usdToSolNeto(usd, solPrice) {
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
-// Cotiza (sin ejecutar) usando el nuevo Jupiter /order — sin "taker" solo trae el precio, no arma transacción.
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
   if (!process.env.JUPITER_API_KEY) return null;
   try {
@@ -305,7 +303,7 @@ async function crearOActualizarWebhookHelius() {
         body: JSON.stringify(payload)
       });
       if (!res.ok) { console.error('Error actualizando webhook de Helius:', await res.text()); return; }
-      console.log(`🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets`);
+      console.log(`🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${direcciones.join(', ')})`);
     } else {
       const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
         method: 'POST',
@@ -509,7 +507,6 @@ async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippag
   return sig;
 }
 
-// Migrado al nuevo Jupiter /order (con "taker" para que arme la transacción real) + firmamos y mandamos nosotros mismos.
 async function swapProfitToUsdc(amountSol) {
   if (!process.env.JUPITER_API_KEY) { console.error('Falta JUPITER_API_KEY, no se puede convertir a USDC'); return null; }
   try {
@@ -618,7 +615,6 @@ async function reconciliarPosiciones(forzado = false) {
   } catch (e) { console.error('Error en reconciliación de posiciones:', e.message); }
 }
 
-// Ahora revisa TODAS las posiciones EN PARALELO (no una por una) para que un Jupiter lento no acumule retraso.
 async function revisarStopLoss() {
   try {
     const { rows: posiciones } = await pool.query(`
@@ -854,26 +850,50 @@ function iniciarServidorWebhook() {
     req.on('end', () => {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('ok');
-      procesarWebhookHelius(body).catch(e => console.error('Error procesando webhook de Helius:', e.message));
+      procesarWebhookHelius(body).catch(e => console.error('Error procesando webhook de Helius:', e.message, e.stack));
     });
   });
   const port = process.env.PORT || 3000;
   server.listen(port, () => console.log(`🌐 Servidor de webhooks escuchando en el puerto ${port} (tipo ANY, cualquier DEX)`));
 }
 
+// ===== DIAGNÓSTICO: ahora loguea SIEMPRE, sin condiciones, para saber con certeza si Helius nos toca la puerta =====
 async function procesarWebhookHelius(rawBody) {
+  console.log(`📨 Webhook Helius recibido: ${rawBody.length} bytes`);
+
   let eventos;
-  try { eventos = JSON.parse(rawBody); } catch (e) { console.error('Webhook Helius: JSON inválido'); return; }
+  try {
+    eventos = JSON.parse(rawBody);
+  } catch (e) {
+    console.error('📨 Webhook Helius: el body NO es JSON válido:', e.message, '— primeros 300 chars:', rawBody.slice(0, 300));
+    return;
+  }
+  if (!Array.isArray(eventos)) {
+    console.log('📨 Webhook Helius: el body no es un arreglo, tipo real:', typeof eventos, '— contenido:', JSON.stringify(eventos).slice(0, 300));
+    eventos = [eventos];
+  }
+  console.log(`📨 Webhook Helius: ${eventos.length} transacción(es) en este lote`);
+
   const { rows: trackedRows } = await pool.query('SELECT * FROM tracked_wallets');
-  if (trackedRows.length === 0) return;
   const trackedMap = new Map(trackedRows.map(r => [r.address, r]));
 
   for (const tx of eventos) {
+    const cuentasEnTx = (tx.accountData || []).map(a => a.account);
+    const walletsInvolucradas = cuentasEnTx.filter(a => trackedMap.has(a)).map(a => trackedMap.get(a).alias);
+    console.log(`📨 TX recibida: type=${tx.type || '(sin type)'} source=${tx.source || '(sin source)'} accountData.length=${cuentasEnTx.length} wallets-trackeadas=[${walletsInvolucradas.join(', ')}]`);
+
+    if (trackedRows.length === 0) continue;
+
     const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
     for (const acc of (tx.accountData || [])) {
       const tracked = trackedMap.get(acc.account);
       if (!tracked) continue;
+
       const cambios = extraerCambiosDeBalance(acc);
+      if (cambios.length === 0) {
+        console.log(`📨 ${tracked.alias} apareció en esta TX pero SIN cambio de balance de token relevante — nativeBalanceChange=${acc.nativeBalanceChange ?? '(vacío)'} tokenBalanceChanges=${JSON.stringify(acc.tokenBalanceChanges || []).slice(0, 400)}`);
+      }
+
       for (const cambio of cambios) {
         console.log(`🌐 Actividad detectada: ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
         const tradeCompatible = {
@@ -953,8 +973,6 @@ bot.onText(/\/closepos (.+) (.+)/, async (msg, match) => {
   } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
 });
 
-// Ahora con try/catch y protegido contra filas con dirección vacía/rara — esto es lo que probablemente
-// se estaba quedando mudo en tu bot sin avisar nada.
 bot.onText(/\/list/, async (msg) => {
   try {
     const { rows } = await pool.query('SELECT * FROM tracked_wallets');
