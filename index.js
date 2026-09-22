@@ -1,16 +1,6 @@
 // ========= ⚡️M3M3B0T⚡️ REAL TRADING - + COMANDO /diag PARA VERIFICAR CONFIGURACION DE HELIUS SIN ESPERAR =========
 require('dotenv').config();
 
-// ---------- Polyfills for Node <18 ----------
-if (typeof fetch !== 'function') {
-  const fetchPolyfill = (await import('node-fetch')).default;
-  globalThis.fetch = fetchPolyfill;
-}
-if (typeof AbortSignal !== 'object' || typeof AbortSignal.timeout !== 'function') {
-  const { AbortController } = require('abort-controller');
-  globalThis.AbortSignal = AbortController.prototype.signal.constructor;
-}
-
 // ---------- Dependencies ----------
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -481,7 +471,7 @@ async function getTokenInfoHelius(mint) {
   }
   cacheSet(cacheSimbolos, mint, symbol);
   cacheSet(cacheDecimales, mint, decimals);
-  return { symbol, decimales: decimals };
+  return { symbol, decimals };
 }
 async function getTokenSymbol(mint) {
   const info = await getTokenInfoHelius(mint);
