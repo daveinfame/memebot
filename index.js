@@ -79,7 +79,7 @@ let primerMensajeConfirmado = false;
 let mensajesDesdeUltimoResumen = 0;
 const cacheSimbolos = new Map();
 const cacheDecimales = new Map();
-const MAX_CACHE_SIZE = 500; // límite simple LRU (eliminamos la más antigua al superar)
+const MAX_CACHE_SIZE = 500;
 
 // ---------- Utilidades ----------
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -103,17 +103,16 @@ function getHeliusApiKey() {
   }
 }
 
-// ---------- Cache LRU sencillo ----------
+// ---------- Cache LRU ----------
 function cacheSet(map, key, value) {
   if (map.size >= MAX_CACHE_SIZE) {
-    // eliminar la primera entrada (orden de inserción)
     const firstKey = map.keys().next().value;
     map.delete(firstKey);
   }
   map.set(key, value);
 }
 
-// ---------- Funciones de Jupiter con reintento ----------
+// ---------- Jupiter con reintento ----------
 async function fetchJupiterConReintento(url, opts = {}) {
   let ultimoError = null;
   for (let intento = 1; intento <= JUPITER_MAX_INTENTOS; intento++) {
@@ -136,7 +135,7 @@ async function fetchJupiterConReintento(url, opts = {}) {
   throw ultimoError || new Error('Jupiter: se agotaron los reintentos');
 }
 
-// ---------- Inicialización de Solana ----------
+// ---------- Solana init ----------
 try {
   if (process.env.HELIUS_RPC_URL) connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
   if (process.env.WALLET_PRIVATE_KEY) walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
@@ -145,7 +144,7 @@ try {
   log('error', `Error cargando wallet/RPC de Solana: ${e.message}`);
 }
 
-// ---------- Constantes de cadena ----------
+// ---------- Cadena ----------
 const CHAIN_CONFIG = {
   sol: { id: 'solana', name: 'SOLANA' },
   eth: { id: 'eth', name: 'ETH' },
@@ -158,7 +157,7 @@ const CHAIN_CONFIG = {
 function normalizeChain(c) { return (CHAIN_CONFIG[(c || 'sol').toLowerCase()] || { id: 'solana' }).id; }
 function getLabel(c) { const f = Object.values(CHAIN_CONFIG).find(v => v.id === c); return f ? f.name : c.toUpperCase(); }
 
-// ---------- Manejo de errores on-chain ----------
+// ---------- Error on‑chain ----------
 function describirErrorOnChain(errValue) {
   try {
     if (errValue && errValue.InstructionError) {
@@ -216,7 +215,7 @@ function esSellZeroAmount(e) {
 }
 function linkTx(sig) { return `https://solscan.io/tx/${sig}`; }
 
-// ---------- Cálculo de resultados ----------
+// ---------- Cálculo ----------
 function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoDeFees) {
   const fees = netoDeFees ? estimarFees(costBasisSol, proceedsSolBruto) : 0;
   const proceedsNetoSol = proceedsSolBruto - fees;
@@ -245,7 +244,7 @@ function usdToSolNeto(usd, solPrice) {
   return Math.max(solMenosFeePump - OVERHEAD_RED_SOL, 0);
 }
 
-// ---------- Valor estimado de token ----------
+// ---------- Valor estimado ----------
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
   if (!process.env.JUPITER_API_KEY) return null;
   try {
@@ -305,8 +304,12 @@ async function cerrarCuentaDelToken(mint) {
   }
 }
 
-// ---------- WebSocket PumpPortal ----------
+// ---------- WS PumpPortal ----------
 function conectarWS() {
+  if (!process.env.PUMPPORTAL_API_KEY) {
+    log('warn', 'PUMPPORTAL_API_KEY no está definida; se omite conexión WS a PumpPortal');
+    return;
+  }
   if (ws && ws.readyState === WebSocket.OPEN) return;
   log('info', 'Conectando WebSocket a PumpPortal...');
   ws = new WebSocket(PUMP_PORTAL_WS);
@@ -319,8 +322,7 @@ function conectarWS() {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.pong) return; // ignore pings/pongs if any
-      // reutilizamos la lógica de procesar webhook (mismo formato)
+      if (msg.pong) return;
       procesarWebhookHelius(JSON.stringify(msg));
     } catch (e) {
       log('error', `Error procesando mensaje WS: ${e.message}`);
@@ -337,7 +339,7 @@ function conectarWS() {
 }
 function scheduleWSReconnect() {
   if (wsReconnectTimer) return;
-  const delay = Math.min(1000 * 2 ** ++wsReconnectAttempts, 30000); // max 30s
+  const delay = Math.min(1000 * 2 ** ++wsReconnectAttempts, 30000);
   log('info', `Reconexión WS en ${delay}ms (intento ${wsReconnectAttempts})`);
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null;
@@ -359,7 +361,7 @@ function resyncSubscriptions() {
     .catch(e => log('error', `Error resincronizando suscripciones: ${e.message}`));
 }
 
-// ---------- Webhook Helius (HTTP) ----------
+// ---------- Webhook Helius ----------
 function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
   if (!apiKey) { log('error', '⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
@@ -406,7 +408,7 @@ function crearOActualizarWebhookHelius() {
     .catch(e => log('error', `Error configurando webhook de Helius: ${e.message}`));
 }
 
-// ---------- Diagnóstico bajo demanda ----------
+// ---------- Diagnóstico ----------
 async function diagnosticoHelius(alias) {
   const apiKey = getHeliusApiKey();
   if (!apiKey) return { error: 'No se pudo extraer el api-key de HELIUS_RPC_URL' };
@@ -432,7 +434,7 @@ async function diagnosticoHelius(alias) {
   return { webhookInfo, historial, address, alias };
 }
 
-// ---------- Balance de la wallet PumpPortal ----------
+// ---------- Balance PumpPortal ----------
 async function getPumpPortalWalletBalance() {
   if (!connection) return null;
   try {
@@ -444,7 +446,7 @@ async function getPumpPortalWalletBalance() {
   }
 }
 
-// ---------- Información de token (con cache) ----------
+// ---------- Token info (cache) ----------
 async function getTokenInfoHelius(mint) {
   const cachedSym = cacheSimbolos.get(mint);
   const cachedDec = cacheDecimales.get(mint);
@@ -478,7 +480,7 @@ async function getTokenSymbol(mint) {
   return info.symbol;
 }
 
-// ---------- Holdings y balances ----------
+// ---------- Holdings ----------
 async function getHoldings(address) {
   if (!connection) { log('error', 'No hay conexión RPC, no se puede hacer snapshot real'); return []; }
   try {
@@ -515,7 +517,7 @@ async function getBalanceDeTokenEnWallet(walletAddress, mint) {
   }
 }
 
-// ---------- Base de datos ----------
+// ---------- DB ----------
 async function initDB() {
   try {
     await pool.query(`
@@ -576,7 +578,7 @@ async function initBaselineReal() {
   } catch (e) { log('error', `Error estableciendo baseline real: ${e.message}`); }
 }
 
-// ---------- Historial de trades ----------
+// ---------- Historial ----------
 async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
   try {
     await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol, modo) VALUES ($1,$2,$3,$4)', [walletAlias, symbol, profitSol, MODO_ACTUAL]);
@@ -605,20 +607,20 @@ async function getSolPriceUSD() {
   }
 }
 
-// ---------- Precio de curva de bonding ----------
+// ---------- Bonding curve ----------
 function bondingCurvePriceSol(trade) {
   if (!trade.vSolInBondingCurve || !trade.vTokensInBondingCurve) return null;
   return trade.vSolInBondingCurve / trade.vTokensInBondingCurve;
 }
 
-// ---------- Balance de SOL ----------
+// ---------- Balance SOL ----------
 async function getWalletSolBalance() {
   if (!connection || !walletKeypair) return 0;
   const lamports = await connection.getBalance(walletKeypair.publicKey);
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// ---------- Trade vía PumpPortal ----------
+// ---------- Trade PumpPortal ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
@@ -661,7 +663,7 @@ async function swapProfitToUsdc(amountSol) {
   }
 }
 
-// ---------- Reconciliación de posiciones ----------
+// ---------- Reconciliación ----------
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) {
@@ -814,7 +816,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
   }
 }
 
-// ---------- Manejo de compras ----------
+// ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) { log('info', `Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`); return; }
@@ -878,7 +880,7 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   }
 }
 
-// ---------- Manejo de ventas ----------
+// ---------- Venta ----------
 async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
   const symbol = await getTokenSymbol(trade.mint);
@@ -942,7 +944,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
   }
 }
 
-// ---------- Extraer cambios de balance (Helius) ----------
+// ---------- Extraer cambios de balance ----------
 function extraerCambiosDeBalance(acc) {
   const resultados = [];
   const nativeSol = Math.abs((acc.nativeBalanceChange || 0) / LAMPORTS_PER_SOL);
@@ -968,11 +970,10 @@ function extraerCambiosDeBalance(acc) {
   return resultados;
 }
 
-// ---------- Servidor de webhook HTTP ----------
+// ---------- Servidor webhook HTTP ----------
 function iniciarServidorWebhook() {
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
-    // límite de tasa muy básico (10 req/seg por IP) – se puede mejorar con un paquete real
     const ip = req.socket.remoteAddress;
     const now = Date.now();
     if (!global._webhookRate) global._webhookRate = new Map();
@@ -988,7 +989,6 @@ function iniciarServidorWebhook() {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
-      // validar authHeader
       const auth = req.headers['authheader'] || req.headers['AuthHeader'];
       if (auth !== HELIUS_WEBHOOK_SECRET) {
         res.writeHead(401, { 'Content-Type': 'text/plain' });
@@ -1070,8 +1070,8 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     }
     bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y cualquier DEX ✅`);
   } catch (e) {
+    log('error', `Error en /add: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 bot.onText(/\/setamount (\S+) (\S+)/, async (msg, match) => {
@@ -1086,8 +1086,8 @@ bot.onText(/\/setamount (\S+) (\S+)/, async (msg, match) => {
     if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `✅ ${alias} ahora usa $${nuevoMonto} USD por compra (efectivo desde la próxima señal).`);
     else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
   } catch (e) {
+    log('error', `Error en /setamount: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 bot.onText(/\/remove (.+)/, async (msg, match) => {
@@ -1102,8 +1102,8 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
       bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
     }
   } catch (e) {
+    log('error', `Error en /remove: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 bot.onText(/\/list/, async (msg) => {
@@ -1116,8 +1116,8 @@ bot.onText(/\/list/, async (msg) => {
     const lines = rows.map(r => `• ${r.alias} [${getLabel(r.chain)}] ${r.address} ($${r.amount})`);
     bot.sendMessage(msg.chat.id, `📋 Wallets trackeadas:\n${lines.join('\n')}`);
   } catch (e) {
+    log('error', `Error en /list: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 bot.onText(/\/diag (.+)/, async (msg, match) => {
@@ -1136,8 +1136,8 @@ bot.onText(/\/diag (.+)/, async (msg, match) => {
     txt += `📜 Últimas 10 tx: ${historial.error ? '❌ ' + historial.error : `✅ ${historial.length} transacciones obtenidas`}`;
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
+    log('error', `Error en /diag: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 bot.onText(/\/status/, async (msg) => {
@@ -1153,8 +1153,8 @@ bot.onText(/\/status/, async (msg) => {
     txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc})\n`;
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
+    log('error', `Error en /status: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-    log('error', e);
   }
 });
 
@@ -1162,23 +1162,20 @@ bot.onText(/\/status/, async (msg) => {
 (async () => {
   await initDB();
   await initBaselineReal();
-  conectarWS(); // inicia WS y programa reconexiones si falla
+  conectarWS();
   crearOActualizarWebhookHelius();
   iniciarServidorWebhook();
 
-  // loops periódicos
-  setInterval(reconciliarPosiciones, 60_000); // cada minuto (más agresivo que antes)
-  setInterval(revisarStopLoss, 60_000);       // cada minuto
+  setInterval(reconciliarPosiciones, 60_000);
+  setInterval(revisarStopLoss, 60_000);
   setInterval(async () => {
     const marca = new Date().toISOString();
     log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
-  }, 300_000); // cada 5 min
+  }, 300_000);
 
-  // manejo de señales para cierre ordenado
   const shutdown = async () => {
     log('info', 'Recibida señal de apagado, cerrando conexiones...');
     if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-    // servidor HTTP no tiene referencia directa; Node lo cerrará al salir
     await pool.end();
     process.exit(0);
   };
