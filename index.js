@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - DIAGNOSTICO COMPLETO DE WEBHOOK (para encontrar el hueco de Raydium/Moonshot) =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - + COMANDO /diag PARA VERIFICAR CONFIGURACION DE HELIUS SIN ESPERAR =========
 require('dotenv').config();
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -316,6 +316,36 @@ async function crearOActualizarWebhookHelius() {
       console.log(`🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
     }
   } catch (e) { console.error('Error configurando webhook de Helius:', e.message); }
+}
+
+// ===== NUEVO: diagnóstico bajo demanda — sin esperar nada, usa datos que ya existen =====
+async function diagnosticoHelius(alias) {
+  const apiKey = getHeliusApiKey();
+  if (!apiKey) return { error: 'No se pudo extraer el api-key de HELIUS_RPC_URL' };
+
+  const { rows } = await pool.query('SELECT * FROM tracked_wallets WHERE alias=$1', [alias]);
+  if (!rows[0]) return { error: `No existe ninguna wallet trackeada con el alias "${alias}"` };
+  const address = rows[0].address;
+
+  let webhookInfo = null;
+  try {
+    const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+    const webhookId = gb[0]?.helius_webhook_id;
+    if (webhookId) {
+      const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
+      webhookInfo = await res.json();
+    } else {
+      webhookInfo = { error: 'No hay webhookId guardado en la base de datos' };
+    }
+  } catch (e) { webhookInfo = { error: e.message }; }
+
+  let historial = [];
+  try {
+    const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${apiKey}&limit=10`);
+    historial = await res.json();
+  } catch (e) { historial = { error: e.message }; }
+
+  return { webhookInfo, historial, address, alias };
 }
 
 async function getPumpPortalWalletBalance() {
@@ -857,7 +887,6 @@ function iniciarServidorWebhook() {
   server.listen(port, () => console.log(`🌐 Servidor de webhooks escuchando en el puerto ${port} (tipo ANY, cualquier DEX)`));
 }
 
-// ===== DIAGNÓSTICO: ahora loguea SIEMPRE, sin condiciones, para saber con certeza si Helius nos toca la puerta =====
 async function procesarWebhookHelius(rawBody) {
   console.log(`📨 Webhook Helius recibido: ${rawBody.length} bytes`);
 
@@ -988,6 +1017,37 @@ bot.onText(/\/list/, async (msg) => {
   }
 });
 
+// ===== NUEVO: diagnóstico bajo demanda, sin esperar nada =====
+bot.onText(/\/diag (.+)/, async (msg, match) => {
+  try {
+    const alias = match[1].trim();
+    bot.sendMessage(msg.chat.id, `🔎 Investigando ${alias} en Helius (config del webhook + historial real)...`);
+    const { webhookInfo, historial, address, error } = await diagnosticoHelius(alias);
+    if (error) { bot.sendMessage(msg.chat.id, '❌ ' + error); return; }
+
+    const incluida = webhookInfo?.accountAddresses?.includes(address);
+    let resp = `🔎 Diagnóstico de ${alias} (${address.slice(0, 6)}...)\n\n`;
+    resp += `📌 Webhook registrado ahorita mismo:\n`;
+    resp += `- URL: ${webhookInfo?.webhookURL || '(no disponible)'}\n`;
+    resp += `- transactionTypes: ${JSON.stringify(webhookInfo?.transactionTypes || webhookInfo?.error || '?')}\n`;
+    resp += `- ¿Esta wallet está en la lista?: ${incluida ? 'SÍ ✅' : 'NO ❌'}\n`;
+    resp += `- Total wallets en el webhook: ${webhookInfo?.accountAddresses?.length ?? '?'}\n\n`;
+
+    if (Array.isArray(historial) && historial.length > 0) {
+      resp += `📜 Últimas ${Math.min(historial.length, 8)} transacciones reales de esta wallet (según Helius):\n`;
+      historial.slice(0, 8).forEach((tx, i) => {
+        const fecha = tx.timestamp ? new Date(tx.timestamp * 1000).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' }) : '?';
+        resp += `${i + 1}. type=${tx.type || '?'} source=${tx.source || '?'} · ${fecha}\n`;
+      });
+    } else {
+      resp += `📜 No se pudo obtener historial: ${JSON.stringify(historial).slice(0, 300)}`;
+    }
+    bot.sendMessage(msg.chat.id, resp);
+
+    console.log('🔎 DIAGNÓSTICO COMPLETO:', JSON.stringify({ webhookInfo, historial }, null, 2));
+  } catch (e) { bot.sendMessage(msg.chat.id, 'Error: ' + e.message); console.error(e); }
+});
+
 bot.onText(/\/resync/, async (msg) => {
   await resyncSubscriptions();
   await crearOActualizarWebhookHelius();
@@ -1076,6 +1136,7 @@ bot.onText(/\/help/, async (msg) => {
     '/remove alias - Elimina una wallet Y cierra sus posiciones del modo actual',
     '/closepos alias simbolo - Cierra manualmente una posición específica del modo actual',
     '/list - Muestra todas las wallets que sigues',
+    '/diag alias - Revisa AHORA la config del webhook + historial real de esa wallet en Helius',
     '/resync - Fuerza una resincronización (PumpPortal + webhook de cualquier DEX)',
     '/reconciliar - Revisa AHORA MISMO si alguna posición ya se vendió sin avisar',
     '/positions - Muestra las posiciones abiertas del modo actual (REAL o PAPER)',
