@@ -355,7 +355,8 @@ function resyncSubscriptions() {
     .then(({ rows }) => {
       if (rows.length > 0) {
         ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
-        log('info', `🔁 Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${rows.map(r => r.alias).join(', ') || 'ninguna'})`);
+        const aliases = rows.map(r => r.alias).join(', ') || 'ninguna';
+        log('info', `🔁 Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${aliases})`);
       }
     })
     .catch(e => log('error', `Error resincronizando suscripciones: ${e.message}`));
@@ -365,9 +366,10 @@ function resyncSubscriptions() {
 function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
   if (!apiKey) { log('error', '⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
-  pool.query('SELECT address FROM tracked_wallets')
+  pool.query('SELECT address, alias FROM tracked_wallets')
     .then(({ rows: walletRows }) => {
       const direcciones = walletRows.map(r => r.address);
+      const aliases = walletRows.map(r => r.alias);
       return pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')
         .then(({ rows }) => {
           const webhookIdExistente = rows[0]?.helius_webhook_id;
@@ -386,7 +388,7 @@ function crearOActualizarWebhookHelius() {
             })
               .then(res => {
                 if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${res.text()}`);
-                log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${direcciones.join(', ')})`);
+                log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
               });
           } else {
             return fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
@@ -1154,6 +1156,43 @@ bot.onText(/\/status/, async (msg) => {
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
     log('error', `Error en /status: ${e.message}`, e.stack);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+// ---------- NUEVO: /help ----------
+bot.onText(/\/help/, async (msg) => {
+  const ayuda = `
+🤖 *Comandos disponibles*:
+/add <alias> <dirección> <montoUSD> [cadena]   – Agrega una wallet a seguir (ej. /add miwallet 5EsYuW... 10 sol)
+/setamount <alias> <nuevoMontoUSD>            – Cambia el monto USD por compra para esa alias
+/remove <alias>                               – Elimina una wallet de seguimiento
+/list                                          – Lista todas las wallets trackeadas
+/diag <alias>                                 – Diagnóstico de webhook y últimas tx de una wallet
+/status                                        – Estado general del bot (modo, precio SOL, balances)
+/positions                                     – Muestra las posiciones abiertas del bot
+/help                                          – Esta ayuda
+`;
+  bot.sendMessage(msg.chat.id, ayuda, { parse_mode: 'Markdown' });
+});
+// ---------- NUEVO: /positions ----------
+bot.onText(/\/positions/, async (msg) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT bp.token_mint, bp.symbol, bp.chain, bp.amount, bp.cost_basis_sol, bp.wallet_alias, bp.modo
+      FROM bot_positions bp
+      WHERE bp.modo = $1
+    `, [MODO_ACTUAL]);
+    if (rows.length === 0) {
+      bot.sendMessage(msg.chat.id, `📭 No hay posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}.`);
+      return;
+    }
+    const lines = rows.map(r => {
+      const modoTag = r.modo === 'real' ? '🟢 REAL' : '🟡 PAPER';
+      return `• ${r.symbol} (${r.chain}) – ${r.amount.toFixed(4)} tokens – costo ${r.cost_basis_sol.toFixed(4)} SOL – wallet: ${r.wallet_alias} [${modoTag}]`;
+    });
+    bot.sendMessage(msg.chat.id, `📊 *Posiciones abiertas* (${MODO_ACTUAL.toUpperCase()}):\n${lines.join('\n')}`);
+  } catch (e) {
+    log('error', `Error en /positions: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
   }
 });
