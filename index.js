@@ -957,7 +957,8 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   const symbol = await getTokenSymbol(trade.mint);
   const link = `https://pump.fun/coin/${trade.mint}`;
   const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
-  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solPaid.toFixed(3)} SOL\n🔗 ${link}`);
+  const solTxt = trade.solAmountEstimado ? 'SOL no reportado por Helius' : `${solPaid.toFixed(3)} SOL`;
+  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solTxt}\n🔗 ${link}`);
   const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
   if (seen.rows.length > 0) {
     log('info', `R2: recompra/ya visto ignorado ${tracked.alias} ${symbol}`);
@@ -1127,28 +1128,43 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
   const porMint = new Map();
   const sumar = (mint, tokenDelta, decimals = 6) => {
     if (!mint || MINTS_A_IGNORAR.has(mint)) return;
-    const prev = porMint.get(mint) || { delta: 0, decimals };
+    const prev = porMint.get(mint) || { delta: 0, decimals, solDeltaLamports: 0 };
     prev.delta += tokenDelta;
     prev.decimals = decimals;
     porMint.set(mint, prev);
   };
 
-  let solDeltaLamports = 0;
+  const solDeltaPorMint = new Map();
+
   for (const nt of (tx.nativeTransfers || [])) {
     const amount = numeroSeguro(nt.amount);
-    if (nt.fromUserAccount === walletAddress) solDeltaLamports -= amount;
-    if (nt.toUserAccount === walletAddress) solDeltaLamports += amount;
+    if (nt.fromUserAccount === walletAddress) {
+      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) - amount);
+    }
+    if (nt.toUserAccount === walletAddress) {
+      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) + amount);
+    }
   }
 
   for (const tt of (tx.tokenTransfers || [])) {
     const amount = numeroSeguro(tt.tokenAmount);
     if (!amount || !tt.mint) continue;
-    if (tt.fromUserAccount === walletAddress) sumar(tt.mint, -amount, tt.decimals ?? 6);
-    if (tt.toUserAccount === walletAddress) sumar(tt.mint, amount, tt.decimals ?? 6);
+    const isWSol = tt.mint === SOL_MINT;
+    if (tt.fromUserAccount === walletAddress) {
+      sumar(tt.mint, -amount, tt.decimals ?? 6);
+      if (isWSol) solDeltaPorMint.set(tt.mint, (solDeltaPorMint.get(tt.mint) || 0) - amount);
+    }
+    if (tt.toUserAccount === walletAddress) {
+      sumar(tt.mint, amount, tt.decimals ?? 6);
+      if (isWSol) solDeltaPorMint.set(tt.mint, (solDeltaPorMint.get(tt.mint) || 0) + amount);
+    }
   }
 
   for (const acc of (tx.accountData || [])) {
-    if (acc.account === walletAddress) solDeltaLamports += numeroSeguro(acc.nativeBalanceChange);
+    if (acc.account === walletAddress) {
+      const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
+      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) + nativeDelta);
+    }
     for (const tbc of (acc.tokenBalanceChanges || [])) {
       const owner = tbc.userAccount || tbc.owner || acc.account;
       if (owner !== walletAddress) continue;
@@ -1156,19 +1172,39 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       const decimals = tbc.rawTokenAmount?.decimals ?? 6;
       const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
       const delta = rawAmount / Math.pow(10, decimals);
-      if (delta !== 0) sumar(tbc.mint, delta, decimals);
+      if (delta !== 0) {
+        sumar(tbc.mint, delta, decimals);
+        if (tbc.mint === SOL_MINT) {
+          solDeltaPorMint.set(tbc.mint, (solDeltaPorMint.get(tbc.mint) || 0) + rawAmount);
+        }
+      }
     }
   }
 
-  const solAmount = Math.abs(solDeltaLamports / LAMPORTS_PER_SOL);
   const cambios = [];
   for (const [mint, info] of porMint.entries()) {
     if (!info.delta) continue;
+
+    let solAmount = 0;
+    const solDeltaLamports = solDeltaPorMint.get(mint) || solDeltaPorMint.get('native') || 0;
+    if (solDeltaLamports !== 0) {
+      solAmount = Math.abs(solDeltaLamports / LAMPORTS_PER_SOL);
+    }
+
+    // Si no hay SOL detectado, estimar desde bonding curve price si existe en tx
+    let solAmountEstimado = false;
+    if (solAmount === 0 && tx.vSolInBondingCurve && tx.vTokensInBondingCurve) {
+      const price = tx.vSolInBondingCurve / tx.vTokensInBondingCurve;
+      solAmount = Math.abs(info.delta) * price;
+      solAmountEstimado = true;
+    }
+
     cambios.push({
       mint,
       tokenAmount: Math.abs(info.delta),
       solAmount,
-      direction: info.delta > 0 ? 'buy' : 'sell'
+      direction: info.delta > 0 ? 'buy' : 'sell',
+      solAmountEstimado
     });
   }
   return cambios;
@@ -1300,6 +1336,7 @@ async function procesarWebhookHelius(rawBody) {
           mint: cambio.mint,
           solAmount: cambio.solAmount,
           tokenAmount: cambio.tokenAmount,
+          solAmountEstimado: cambio.solAmountEstimado,
           traderPublicKey: tracked.address,
           txType: cambio.direction
         };
@@ -1321,6 +1358,7 @@ async function procesarWebhookHelius(rawBody) {
           mint: cambio.mint,
           solAmount: cambio.solAmount,
           tokenAmount: cambio.tokenAmount,
+          solAmountEstimado: cambio.solAmountEstimado,
           traderPublicKey: tracked.address,
           txType: cambio.direction
         };
