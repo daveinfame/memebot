@@ -1135,8 +1135,16 @@ function iniciarServidorWebhook() {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
-      const auth = req.headers['authheader'] || req.headers['AuthHeader'];
+      // Helius envía el secreto como header 'x-authheader' (o 'x-auth-header') por defecto.
+      // Aceptamos todas las variantes de casing/guiones para no rechazar envíos válidos.
+      const auth =
+        req.headers['x-authheader'] ||
+        req.headers['x-auth-header'] ||
+        req.headers['authheader'] ||
+        req.headers['AuthHeader'] ||
+        req.headers['authorization'];
       if (auth !== HELIUS_WEBHOOK_SECRET) {
+        log('warn', `⚠️ Webhook rechazado: authHeader no coincide. Recibido="${auth ? auth.slice(0, 24) + '...' : '(vacío)'}" esperado="${HELIUS_WEBHOOK_SECRET.slice(0, 8)}..." — si Helius no coincide, corregir HELIUS_WEBHOOK_SECRET o el secret del webhook.`);
         res.writeHead(401, { 'Content-Type': 'text/plain' });
         res.end('Unauthorized');
         return;
