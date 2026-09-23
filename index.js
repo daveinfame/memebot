@@ -504,12 +504,23 @@ async function diagnosticoHelius(alias) {
       webhookInfo = { error: 'No hay webhookId guardado en la base de datos' };
     }
   } catch (e) { webhookInfo = { error: e.message }; }
+  // Métricas de salud del webhook (Helius las reporta en el GET del webhook)
+  const saludWebhook = { failureRate: null, isUnderCooldown: null, lastSentAt: null, lastError: null, active: null };
+  try {
+    if (webhookInfo && !webhookInfo.error && typeof webhookInfo === 'object') {
+      saludWebhook.failureRate = webhookInfo.failureRate ?? null;
+      saludWebhook.isUnderCooldown = webhookInfo.isUnderCooldown ?? null;
+      saludWebhook.lastSentAt = webhookInfo.lastSentAt ? new Date(webhookInfo.lastSentAt).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' }) : null;
+      saludWebhook.lastError = webhookInfo.lastError ?? null;
+      saludWebhook.active = webhookInfo.active ?? null;
+    }
+  } catch (e) { /* ignorar */ }
   let historial = [];
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${apiKey}&limit=10`);
     historial = await res.json();
   } catch (e) { historial = { error: e.message }; }
-  return { webhookInfo, historial, address, alias };
+  return { webhookInfo, historial, address, alias, saludWebhook };
 }
 
 // ---------- Balance PumpPortal ----------
@@ -1260,11 +1271,19 @@ bot.onText(/\/diag (.+)/, async (msg, match) => {
       bot.sendMessage(msg.chat.id, `❌ Error en diagnóstico: ${diag.error}`);
       return;
     }
-    const { webhookInfo, historial, address, alias: diagAlias } = diag;
+    const { webhookInfo, historial, address, alias: diagAlias, saludWebhook } = diag;
     let txt = `🔍 Diagnóstico de ${diagAlias} (${address})\n`;
     txt += `🪝 Webhook registrado: ${webhookInfo.error ? '❌ ' + webhookInfo.error : '✅ OK'}\n`;
     if (!webhookInfo.error && webhookInfo.webhookURL) txt += `🔗 URL: ${webhookInfo.webhookURL}\n`;
     if (!webhookInfo.error && webhookInfo.transactionTypes) txt += `📦 Tipos: ${webhookInfo.transactionTypes.join(', ')}\n`;
+    if (saludWebhook) {
+      txt += `\n📈 *Salud del webhook*:\n`;
+      txt += `• Activo: ${saludWebhook.active === null ? 'n/d' : (saludWebhook.active ? '✅ sí' : '❌ NO')}\n`;
+      txt += `• Failure rate (24h): ${saludWebhook.failureRate === null ? 'n/d' : (saludWebhook.failureRate * 100).toFixed(1) + '%'}\n`;
+      txt += `• Cooldown: ${saludWebhook.isUnderCooldown === null ? 'n/d' : (saludWebhook.isUnderCooldown ? '🔴 SÍ (Helius suspendió envíos)' : 'no')}\n`;
+      txt += `• Último envío: ${saludWebhook.lastSentAt || 'nunca'}\n`;
+      if (saludWebhook.lastError) txt += `• Último error: ${saludWebhook.lastError}\n`;
+    }
     txt += `📜 Últimas 10 tx: ${historial.error ? '❌ ' + historial.error : `✅ ${historial.length} transacciones obtenidas`}`;
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
