@@ -1155,6 +1155,11 @@ function iniciarServidorWebhook() {
     });
   });
   const port = process.env.PORT || 3000;
+  server.on('error', (e) => {
+    // Si el puerto ya está ocupado o no se puede hacer bind, se ve claro en logs.
+    log('error', `❌ Servidor de webhooks NO pudo escuchar en el puerto ${port}: ${e.message} (${e.code})`);
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ El servidor de webhooks no pudo levantarse (${e.code}) — los trades de DEX que NO son pump no llegarán. Revisa logs.`, { disable_notification: true }).catch(() => {});
+  });
   server.listen(port, () => log('info', `🌐 Servidor de webhooks escuchando en el puerto ${port} (tipo ANY, cualquier DEX)`));
 }
 
