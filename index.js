@@ -1116,6 +1116,64 @@ function extraerCambiosDeBalance(acc) {
   return resultados;
 }
 
+function numeroSeguro(v) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Fallback para Helius enhanced: en PUMP_FUN/Raydium/Jupiter el cambio real puede venir
+// en tokenTransfers o en una token-account cuyo owner es la wallet, no en accountData[wallet].
+function extraerCambiosDeTxParaWallet(tx, walletAddress) {
+  const porMint = new Map();
+  const sumar = (mint, tokenDelta, decimals = 6) => {
+    if (!mint || MINTS_A_IGNORAR.has(mint)) return;
+    const prev = porMint.get(mint) || { delta: 0, decimals };
+    prev.delta += tokenDelta;
+    prev.decimals = decimals;
+    porMint.set(mint, prev);
+  };
+
+  let solDeltaLamports = 0;
+  for (const nt of (tx.nativeTransfers || [])) {
+    const amount = numeroSeguro(nt.amount);
+    if (nt.fromUserAccount === walletAddress) solDeltaLamports -= amount;
+    if (nt.toUserAccount === walletAddress) solDeltaLamports += amount;
+  }
+
+  for (const tt of (tx.tokenTransfers || [])) {
+    const amount = numeroSeguro(tt.tokenAmount);
+    if (!amount || !tt.mint) continue;
+    if (tt.fromUserAccount === walletAddress) sumar(tt.mint, -amount, tt.decimals ?? 6);
+    if (tt.toUserAccount === walletAddress) sumar(tt.mint, amount, tt.decimals ?? 6);
+  }
+
+  for (const acc of (tx.accountData || [])) {
+    if (acc.account === walletAddress) solDeltaLamports += numeroSeguro(acc.nativeBalanceChange);
+    for (const tbc of (acc.tokenBalanceChanges || [])) {
+      const owner = tbc.userAccount || tbc.owner || acc.account;
+      if (owner !== walletAddress) continue;
+      if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
+      const decimals = tbc.rawTokenAmount?.decimals ?? 6;
+      const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
+      const delta = rawAmount / Math.pow(10, decimals);
+      if (delta !== 0) sumar(tbc.mint, delta, decimals);
+    }
+  }
+
+  const solAmount = Math.abs(solDeltaLamports / LAMPORTS_PER_SOL);
+  const cambios = [];
+  for (const [mint, info] of porMint.entries()) {
+    if (!info.delta) continue;
+    cambios.push({
+      mint,
+      tokenAmount: Math.abs(info.delta),
+      solAmount,
+      direction: info.delta > 0 ? 'buy' : 'sell'
+    });
+  }
+  return cambios;
+}
+
 // ---------- Servidor webhook HTTP ----------
 function iniciarServidorWebhook() {
   const server = http.createServer((req, res) => {
@@ -1212,19 +1270,53 @@ async function procesarWebhookHelius(rawBody) {
   const trackedMap = new Map(trackedRows.map(r => [r.address, r]));
   for (const tx of eventos) {
     const cuentasEnTx = (tx.accountData || []).map(a => a.account);
-    const walletsInvolucradas = cuentasEnTx.filter(a => trackedMap.has(a)).map(a => trackedMap.get(a).alias);
+    const participantesExtra = [];
+    for (const tt of (tx.tokenTransfers || [])) {
+      if (tt.fromUserAccount) participantesExtra.push(tt.fromUserAccount);
+      if (tt.toUserAccount) participantesExtra.push(tt.toUserAccount);
+    }
+    for (const nt of (tx.nativeTransfers || [])) {
+      if (nt.fromUserAccount) participantesExtra.push(nt.fromUserAccount);
+      if (nt.toUserAccount) participantesExtra.push(nt.toUserAccount);
+    }
+    const cuentasDetectadas = [...new Set([...cuentasEnTx, ...participantesExtra])];
+    const walletsInvolucradas = cuentasDetectadas.filter(a => trackedMap.has(a)).map(a => trackedMap.get(a).alias);
     log('info', `📨 TX recibida: type=${tx.type || '(sin type)'} source=${tx.source || '(sin source)'} accountData.length=${cuentasEnTx.length} wallets-trackeadas=[${walletsInvolucradas.join(', ')}]`);
     if (trackedRows.length === 0) continue;
     const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
+    const cambiosProcesados = new Set();
     for (const acc of (tx.accountData || [])) {
       const tracked = trackedMap.get(acc.account);
       if (!tracked) continue;
       const cambios = extraerCambiosDeBalance(acc);
       if (cambios.length === 0) {
-        log('info', `📨 ${tracked.alias} apareció en esta TX pero SIN cambio de balance de token relevante — nativeBalanceChange=${acc.nativeBalanceChange ?? '(vacío)'} tokenBalanceChanges=${JSON.stringify(acc.tokenBalanceChanges || []).slice(0, 400)}`);
+        log('info', `📨 ${tracked.alias} apareció en esta TX pero SIN cambio directo de balance — probando fallback global de Helius.`);
       }
       for (const cambio of cambios) {
+        const key = `${tracked.address}:${cambio.mint}:${cambio.direction}`;
+        cambiosProcesados.add(key);
         log('info', `🌐 Actividad detectada: ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
+        const tradeCompatible = {
+          mint: cambio.mint,
+          solAmount: cambio.solAmount,
+          tokenAmount: cambio.tokenAmount,
+          traderPublicKey: tracked.address,
+          txType: cambio.direction
+        };
+        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
+        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
+        else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
+      }
+    }
+
+    for (const tracked of trackedRows) {
+      if (!cuentasDetectadas.includes(tracked.address)) continue;
+      const cambiosFallback = extraerCambiosDeTxParaWallet(tx, tracked.address);
+      for (const cambio of cambiosFallback) {
+        const key = `${tracked.address}:${cambio.mint}:${cambio.direction}`;
+        if (cambiosProcesados.has(key)) continue;
+        cambiosProcesados.add(key);
+        log('info', `🌐 Actividad detectada (fallback Helius): ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
         const tradeCompatible = {
           mint: cambio.mint,
           solAmount: cambio.solAmount,
