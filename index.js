@@ -348,20 +348,35 @@ async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT
 
 // ---------- Dispatcher de ejecución ----------
 async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_SLIPPAGE_BPS }) {
-  if (origen === 'PumpPortal' || origen === 'OnChain') {
-    // Usamos PumpPortal (rápido y barato) para Pump.fun
-    return await pumpPortalTrade({
-      action,
-      mint,
-      amount: action === 'buy' ? amount : '100%',
-      denominatedInSol: action === 'buy' ? true : false,
-      slippage,
-      priorityFee: 0.0005,
-      pool: 'auto'
-    });
-  } else {
+  const esPump = origen === 'PumpPortal' || origen === 'OnChain';
+  try {
+    if (esPump) {
+      // Usamos PumpPortal (rápido y barato) para Pump.fun
+      return await pumpPortalTrade({
+        action,
+        mint,
+        amount: action === 'buy' ? amount : '100%',
+        denominatedInSol: action === 'buy' ? true : false,
+        slippage,
+        priorityFee: 0.0005,
+        pool: 'auto'
+      });
+    }
     // Para cualquier otro DEX usamos Jupiter como router genérico
     return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
+  } catch (primerError) {
+    // En venta siempre intentamos Jupiter como respaldo (p. ej. token que ya salió de la curva o no es pump).
+    if (action === 'sell') {
+      log('warn', `Ruta PumpPortal falló para venta (${mint.slice(0, 6)}...), intentando Jupiter como respaldo: ${primerError.message}`);
+      return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
+    }
+    // En compra, si el origen era OnChain (posible token de otro DEX detectado de forma genérica),
+    // también probamos Jupiter antes de rendirnos.
+    if (esPump && origen === 'OnChain') {
+      log('warn', `Ruta PumpPortal falló para compra (${mint.slice(0, 6)}...), intentando Jupiter como respaldo: ${primerError.message}`);
+      return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
+    }
+    throw primerError;
   }
 }
 
@@ -1102,7 +1117,37 @@ async function procesarWebhookHelius(rawBody) {
     return;
   }
   if (!Array.isArray(eventos)) {
-    log('warn', `📨 Webhook Helius: el body no es un arreglo, tipo real: ${typeof eventos} — contenido: ${JSON.stringify(eventos).slice(0, 300)}`);
+    // ¿Es un objeto estilo PumpPortal ({signature, mint, traderPublicKey, txType, tokenAmount, solAmount})?
+    const esPumpPortal =
+      eventos.signature && eventos.mint && eventos.traderPublicKey &&
+      eventos.txType && eventos.tokenAmount !== undefined && eventos.solAmount !== undefined;
+
+    if (esPumpPortal) {
+      log('info', '📨 Webhook Helius: objeto estilo PumpPortal detectado, procesando directamente.');
+      const { mint, traderPublicKey, txType, tokenAmount, solAmount } = eventos;
+      const { rows: buscado } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [traderPublicKey]);
+      if (buscado.length === 0) {
+        log('warn', `📨 Objeto PumpPortal pero ${traderPublicKey} no está en tracked_wallets, se ignora.`);
+        return;
+      }
+      const tracked = buscado[0];
+      const direccion = (txType || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
+      const trade = {
+        mint,
+        solAmount: Number(solAmount),
+        tokenAmount: Number(tokenAmount),
+        traderPublicKey,
+        chain: 'solana',
+        txType: direccion
+      };
+      const horaDeteccion = eventos.timestamp ? eventos.timestamp * 1000 : Date.now();
+      const origen = eventos.source === 'PUMP_FUN' ? 'PumpPortal' : 'OnChain';
+      if (direccion === 'buy') await handleTrackedBuy(tracked, trade, origen, horaDeteccion);
+      else await handleTrackedSell(tracked, trade, origen, horaDeteccion);
+      return;
+    }
+
+    log('info', `📨 Webhook Helius: el body es un objeto simple (tipo: ${typeof eventos}), se envuelve en arreglo.`);
     eventos = [eventos];
   }
   log('info', `📨 Webhook Helius: ${eventos.length} transacción(es) en este lote`);
