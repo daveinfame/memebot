@@ -67,6 +67,7 @@ const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '0.50');
 const RETRASO_AVISO_MS = parseInt(process.env.RETRASO_AVISO_MS || '10000', 10);
 const JUPITER_TIMEOUT_MS = parseInt(process.env.JUPITER_TIMEOUT_MS || '8000', 10);
 const JUPITER_MAX_INTENTOS = parseInt(process.env.JUPITER_MAX_INTENTOS || '3', 10);
+const DEFAULT_SLIPPAGE_BPS = parseInt(process.env.DEFAULT_SLIPPAGE_BPS || '10', 10); // 10 bps = 0.1%
 
 // ---------- Estado ----------
 let connection = null;
@@ -304,7 +305,67 @@ async function cerrarCuentaDelToken(mint) {
   }
 }
 
-// ---------- WS PumpPortal ----------
+// ---------- Jupiter genérico swap (compra o venta) ----------
+async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT_SLIPPAGE_BPS }) {
+  if (!process.env.JUPITER_API_KEY) throw new Error('Falta JUPITER_API_KEY para ejecutar swaps vía Jupiter');
+  const tokenInfo = await getTokenInfoHelius(mint);
+  const decimals = tokenInfo.decimals;
+  let inputMint, outputMint, rawAmount;
+  if (action === 'buy') {
+    inputMint = SOL_MINT;
+    outputMint = mint;
+    rawAmount = Math.floor(amount * LAMPORTS_PER_SOL); // amount in SOL
+  } else { // sell
+    inputMint = mint;
+    outputMint = SOL_MINT;
+    rawAmount = Math.floor(amount * Math.pow(10, decimals)); // amount in token units
+  }
+  const quoteUrl = `${JUPITER_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippage}`;
+  const quoteRes = await fetch(quoteUrl, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
+  if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
+  const quoteData = await quoteRes.json();
+  const swapUrl = `${JUPITER_BASE}/swap`;
+  const swapRes = await fetch(swapUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.JUPITER_API_KEY,
+    },
+    body: JSON.stringify({
+      userPublicKey: walletKeypair.publicKey.toBase58(),
+      quoteResponse: quoteData,
+    }),
+  });
+  if (!swapRes.ok) throw new Error(`Jupiter swap failed: ${swapRes.status} ${await swapRes.text()}`);
+  const swapData = await swapRes.json();
+  const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([walletKeypair]);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  await confirmarYVerificarTx(sig);
+  return sig;
+}
+
+// ---------- Dispatcher de ejecución ----------
+async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_SLIPPAGE_BPS }) {
+  if (origen === 'PumpPortal' || origen === 'OnChain') {
+    // Usamos PumpPortal (rápido y barato) para Pump.fun
+    return await pumpPortalTrade({
+      action,
+      mint,
+      amount: action === 'buy' ? amount : '100%',
+      denominatedInSol: action === 'buy' ? true : false,
+      slippage,
+      priorityFee: 0.0005,
+      pool: 'auto'
+    });
+  } else {
+    // Para cualquier otro DEX usamos Jupiter como router genérico
+    return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
+  }
+}
+
+// ---------- WebSocket PumpPortal ----------
 function conectarWS() {
   if (!process.env.PUMPPORTAL_API_KEY) {
     log('warn', 'PUMPPORTAL_API_KEY no está definida; se omite conexión WS a PumpPortal');
@@ -622,7 +683,7 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// ---------- Trade PumpPortal ----------
+// ---------- Trade PumpPortal (manteniendo la función original) ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
   const res = await fetch(PUMP_PORTAL_TRADE, {
     method: 'POST',
@@ -643,7 +704,7 @@ async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippag
   return sig;
 }
 
-// ---------- Swap a USDC ----------
+// ---------- Swap a USDC (manteniendo la función original) ----------
 async function swapProfitToUsdc(amountSol) {
   if (!process.env.JUPITER_API_KEY) { log('error', 'Falta JUPITER_API_KEY, no se puede convertir a USDC'); return null; }
   try {
@@ -708,7 +769,13 @@ async function reconciliarPosiciones(forzado = false) {
       if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
         try {
           const before = await getWalletSolBalance();
-          const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
+          const sig = await ejecutarTrade({
+            action: 'sell',
+            mint: pos.token_mint,
+            amount: pos.amount,
+            origen: 'OnChain', // en reconciliación no conocemos el origen exacto, usamos OnChain para intentar PumpPortal primero
+            slippage: DEFAULT_SLIPPAGE_BPS
+          });
           await sleep(ESPERA_LECTURA_SALDO_MS);
           const after = await getWalletSolBalance();
           const proceedsSol = after - before;
@@ -777,7 +844,13 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
   if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
     try {
       const before = await getWalletSolBalance();
-      const sig = await pumpPortalTrade({ action: 'sell', mint: pos.token_mint, amount: '100%', denominatedInSol: false });
+      const sig = await ejecutarTrade({
+        action: 'sell',
+        mint: pos.token_mint,
+        amount: pos.amount,
+        origen: 'OnChain',
+        slippage: DEFAULT_SLIPPAGE_BPS
+      });
       await sleep(ESPERA_LECTURA_SALDO_MS);
       const after = await getWalletSolBalance();
       const proceedsSol = after - before;
@@ -863,7 +936,13 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       return;
     }
     try {
-      const sig = await pumpPortalTrade({ action: 'buy', mint: trade.mint, amount: amountSol, denominatedInSol: true });
+      const sig = await ejecutarTrade({
+        action: 'buy',
+        mint: trade.mint,
+        amount: amountSol,
+        origen,
+        slippage: DEFAULT_SLIPPAGE_BPS
+      });
       await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
         [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
       const saldoFinal = await getWalletSolBalance();
@@ -896,7 +975,13 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
   if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
     try {
       const before = await getWalletSolBalance();
-      const sig = await pumpPortalTrade({ action: 'sell', mint: trade.mint, amount: '100%', denominatedInSol: false });
+      const sig = await ejecutarTrade({
+        action: 'sell',
+        mint: trade.mint,
+        amount: position.amount,
+        origen,
+        slippage: DEFAULT_SLIPPAGE_BPS
+      });
       await sleep(ESPERA_LECTURA_SALDO_MS);
       const after = await getWalletSolBalance();
       const proceedsSol = after - before;
@@ -1104,7 +1189,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
       bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
     }
   } catch (e) {
-    log('error', `Error en /remove: ${e.message}`, e.stack);
+    log('error', `Error in /remove: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
   }
 });
