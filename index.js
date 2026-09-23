@@ -454,7 +454,8 @@ function crearOActualizarWebhookHelius() {
             transactionTypes: ['ANY'],
             accountAddresses: direcciones,
             webhookType: 'enhanced',
-            authHeader: HELIUS_WEBHOOK_SECRET
+            authHeader: HELIUS_WEBHOOK_SECRET,
+            active: true // 🔑 Clave: re-activa un webhook que Helius auto-deshabilitó
           };
           if (webhookIdExistente) {
             return fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
@@ -465,7 +466,8 @@ function crearOActualizarWebhookHelius() {
               .then(res => {
                 if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${res.text()}`);
                 log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
-              });
+              })
+              .then(() => verificarEstadoWebhook(apiKey, webhookIdExistente));
           } else {
             return fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
               method: 'POST',
@@ -478,12 +480,43 @@ function crearOActualizarWebhookHelius() {
               })
               .then(data => {
                 return pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID])
-                  .then(() => log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`));
+                  .then(() => log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`))
+                  .then(() => verificarEstadoWebhook(apiKey, data.webhookID));
               });
           }
         });
     })
     .catch(e => log('error', `Error configurando webhook de Helius: ${e.message}`));
+}
+
+// Verifica que el webhook esté ACTIVO; si no, lo reactiva (Helius lo auto-deshabilita tras fallos).
+async function verificarEstadoWebhook(apiKey, webhookId) {
+  try {
+    const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
+    const data = await res.json();
+    const activo = data.active;
+    if (activo === false) {
+      log('warn', '⚠️ Webhook de Helius está DESHABILITADO — intentando reactivar...');
+      const react = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: true })
+      });
+      if (!react.ok) {
+        log('error', `⚠️ No se pudo reactivar el webhook: ${react.status} ${await react.text()}`);
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ El webhook de Helius está deshabilitado y no pude reactivarlo (${react.status}). Los trades NO están llegando — revisa el authHeader.`, { disable_notification: true }).catch(() => {});
+        return false;
+      }
+      log('info', '✅ Webhook de Helius REACTIVADO (era active:false)');
+      if (CHAT_ID) bot.sendMessage(CHAT_ID, '✅ Webhook de Helius reactivado automáticamente. Vuelve a recibir eventos.', { disable_notification: true }).catch(() => {});
+      return true;
+    }
+    log('info', `🪝 Webhook de Helius verificado: ${activo ? 'ACTIVO' : 'inactivo'}`);
+    return activo;
+  } catch (e) {
+    log('error', `Error verificando estado del webhook: ${e.message}`);
+    return null;
+  }
 }
 
 // ---------- Diagnóstico ----------
@@ -1356,6 +1389,17 @@ bot.onText(/\/positions/, async (msg) => {
 
   setInterval(reconciliarPosiciones, 60_000);
   setInterval(revisarStopLoss, 60_000);
+  // Cada 5 min: si Helius deshabilitó el webhook, reactivarlo automáticamente.
+  setInterval(() => {
+    const apiKey = getHeliusApiKey();
+    if (!apiKey) return;
+    pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')
+      .then(({ rows }) => {
+        const webhookId = rows[0]?.helius_webhook_id;
+        if (webhookId) verificarEstadoWebhook(apiKey, webhookId);
+      })
+      .catch(e => log('error', `Error en chequeo periódico del webhook: ${e.message}`));
+  }, 300_000);
   setInterval(async () => {
     const marca = new Date().toISOString();
     log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
