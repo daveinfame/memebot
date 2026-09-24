@@ -1495,6 +1495,8 @@ bot.onText(/\/help/, async (msg) => {
 /diag <alias>                                 – Diagnóstico de webhook y últimas tx de una wallet
 /status                                        – Estado general del bot (modo, precio SOL, balances)
 /positions                                     – Muestra las posiciones abiertas del bot
+/ranking [real|paper]                          – Ranking wallets por PnL (modo actual o forzado)
+/pnl                                           – PnL rápido: realizado + no realizado + total
 /help                                          – Esta ayuda
 `;
   bot.sendMessage(msg.chat.id, ayuda, { parse_mode: 'Markdown' });
