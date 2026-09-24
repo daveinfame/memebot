@@ -1126,44 +1126,54 @@ function numeroSeguro(v) {
 // en tokenTransfers o en una token-account cuyo owner es la wallet, no en accountData[wallet].
 function extraerCambiosDeTxParaWallet(tx, walletAddress) {
   const porMint = new Map();
-  const sumar = (mint, tokenDelta, decimals = 6) => {
+  const sumar = (mint, tokenDelta, solDeltaLamports, decimals = 6) => {
     if (!mint || MINTS_A_IGNORAR.has(mint)) return;
-    const prev = porMint.get(mint) || { delta: 0, decimals, solDeltaLamports: 0 };
-    prev.delta += tokenDelta;
+    const prev = porMint.get(mint) || { tokenDelta: 0, solDeltaLamports: 0, decimals };
+    prev.tokenDelta += tokenDelta;
+    prev.solDeltaLamports += solDeltaLamports;
     prev.decimals = decimals;
     porMint.set(mint, prev);
   };
 
-  const solDeltaPorMint = new Map();
-
+  // 1. Native SOL transfers
+  let nativeSolSpent = 0; // positivo = gastó SOL
   for (const nt of (tx.nativeTransfers || [])) {
     const amount = numeroSeguro(nt.amount);
-    if (nt.fromUserAccount === walletAddress) {
-      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) - amount);
-    }
-    if (nt.toUserAccount === walletAddress) {
-      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) + amount);
-    }
+    if (nt.fromUserAccount === walletAddress) nativeSolSpent += amount;
+    if (nt.toUserAccount === walletAddress) nativeSolSpent -= amount;
   }
+
+  // 2. Token transfers (incluye wSOL)
+  const solSpentPorMint = new Map(); // mint -> lamports gastados en ese mint
+  const solReceivedPorMint = new Map(); // mint -> lamports recibidos por ese mint
 
   for (const tt of (tx.tokenTransfers || [])) {
     const amount = numeroSeguro(tt.tokenAmount);
     if (!amount || !tt.mint) continue;
+
     const isWSol = tt.mint === SOL_MINT;
+
     if (tt.fromUserAccount === walletAddress) {
-      sumar(tt.mint, -amount, tt.decimals ?? 6);
-      if (isWSol) solDeltaPorMint.set(tt.mint, (solDeltaPorMint.get(tt.mint) || 0) - amount);
+      if (isWSol) {
+        // envió wSOL = gastó SOL en ese mint
+        solSpentPorMint.set(tt.mint, (solSpentPorMint.get(tt.mint) || 0) + amount);
+      }
+      sumar(tt.mint, -amount, 0, tt.decimals ?? 6);
     }
     if (tt.toUserAccount === walletAddress) {
-      sumar(tt.mint, amount, tt.decimals ?? 6);
-      if (isWSol) solDeltaPorMint.set(tt.mint, (solDeltaPorMint.get(tt.mint) || 0) + amount);
+      if (isWSol) {
+        // recibió wSOL = recibió SOL por ese mint (venta)
+        solReceivedPorMint.set(tt.mint, (solReceivedPorMint.get(tt.mint) || 0) + amount);
+      }
+      sumar(tt.mint, amount, 0, tt.decimals ?? 6);
     }
   }
 
+  // 3. Account data balance changes
   for (const acc of (tx.accountData || [])) {
     if (acc.account === walletAddress) {
       const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
-      solDeltaPorMint.set('native', (solDeltaPorMint.get('native') || 0) + nativeDelta);
+      if (nativeDelta < 0) nativeSolSpent += -nativeDelta; // gastó SOL nativo
     }
     for (const tbc of (acc.tokenBalanceChanges || [])) {
       const owner = tbc.userAccount || tbc.owner || acc.account;
@@ -1173,40 +1183,109 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
       const delta = rawAmount / Math.pow(10, decimals);
       if (delta !== 0) {
-        sumar(tbc.mint, delta, decimals);
+        let solDelta = 0;
         if (tbc.mint === SOL_MINT) {
-          solDeltaPorMint.set(tbc.mint, (solDeltaPorMint.get(tbc.mint) || 0) + rawAmount);
+          // wSOL balance change en lamports
+          solDelta = rawAmount; // positivo = recibió wSOL, negativo = gastó wSOL
+          if (solDelta < 0) {
+            solSpentPorMint.set(SOL_MINT, (solSpentPorMint.get(SOL_MINT) || 0) + -solDelta);
+          } else {
+            solReceivedPorMint.set(SOL_MINT, (solReceivedPorMint.get(SOL_MINT) || 0) + solDelta);
+          }
         }
+        sumar(tbc.mint, delta, solDelta, decimals);
       }
     }
   }
 
+  // 4. Emparejar SOL gastado con tokens recibidos
+  // Estrategia: si hay SOL gastado (native + wSOL enviado) y tokens recibidos,
+  // el SOL se asigna al mint que recibió tokens y NO tiene SOL recibido (venta).
   const cambios = [];
-  for (const [mint, info] of porMint.entries()) {
-    if (!info.delta) continue;
 
-    let solAmount = 0;
-    const solDeltaLamports = solDeltaPorMint.get(mint) || solDeltaPorMint.get('native') || 0;
-    if (solDeltaLamports !== 0) {
-      solAmount = Math.abs(solDeltaLamports / LAMPORTS_PER_SOL);
+  // Primero: calcular neto de SOL gastado total
+  let totalSolSpentLamports = nativeSolSpent;
+  for (const v of solSpentPorMint.values()) totalSolSpentLamports += v;
+  for (const v of solReceivedPorMint.values()) totalSolSpentLamports -= v;
+
+  // Si no hay SOL neto gastado, no hay buys válidos
+  if (totalSolSpentLamports <= 0) {
+    // Solo pueden haber sells válidos
+    for (const [mint, info] of porMint.entries()) {
+      if (!info.tokenDelta) continue;
+      if (info.tokenDelta < 0) {
+        const solReceived = solReceivedPorMint.get(mint) || 0;
+        if (solReceived > 0) {
+          const solAmount = solReceived / LAMPORTS_PER_SOL;
+          cambios.push({
+            mint,
+            tokenAmount: Math.abs(info.tokenDelta),
+            solAmount,
+            direction: 'sell',
+            solAmountEstimado: false
+          });
+        }
+      }
     }
-
-    // Si no hay SOL detectado, estimar desde bonding curve price si existe en tx
-    let solAmountEstimado = false;
-    if (solAmount === 0 && tx.vSolInBondingCurve && tx.vTokensInBondingCurve) {
-      const price = tx.vSolInBondingCurve / tx.vTokensInBondingCurve;
-      solAmount = Math.abs(info.delta) * price;
-      solAmountEstimado = true;
-    }
-
-    cambios.push({
-      mint,
-      tokenAmount: Math.abs(info.delta),
-      solAmount,
-      direction: info.delta > 0 ? 'buy' : 'sell',
-      solAmountEstimado
-    });
+    return cambios;
   }
+
+  // Hay SOL gastado neto: buscar mints donde recibió tokens (tokenDelta > 0)
+  const candidatosBuy = [];
+  for (const [mint, info] of porMint.entries()) {
+    if (info.tokenDelta > 0) {
+      // Recibió este token
+      const solReceived = solReceivedPorMint.get(mint) || 0;
+      if (solReceived === 0) {
+        // No recibió SOL por este mint -> candidato a buy
+        candidatosBuy.push({ mint, info });
+      }
+    }
+  }
+
+  // Asignar SOL gastado a los candidatos
+  // Heurística: repartir proporcionalmente al tokenAmount recibido, o todo al único
+  let solRestante = totalSolSpentLamports;
+  for (const c of candidatosBuy) {
+    if (solRestante <= 0) break;
+    const asignado = Math.min(solRestante, Math.max(c.info.solDeltaLamports, 0) || 1_000_000);
+    c.info.solDeltaLamports = -asignado; // negativo = gastó
+    solRestante -= asignado;
+  }
+
+  // Construir cambios finales
+  for (const [mint, info] of porMint.entries()) {
+    if (!info.tokenDelta) continue;
+
+    const tokenDelta = info.tokenDelta;
+    const solDeltaLamports = info.solDeltaLamports;
+
+    if (tokenDelta > 0 && solDeltaLamports < 0) {
+      // BUY válido: recibió tokens Y gastó SOL
+      cambios.push({
+        mint,
+        tokenAmount: tokenDelta,
+        solAmount: Math.abs(solDeltaLamports / LAMPORTS_PER_SOL),
+        direction: 'buy',
+        solAmountEstimado: false
+      });
+    } else if (tokenDelta < 0) {
+      // SELL: envió tokens
+      const solReceived = solReceivedPorMint.get(mint) || 0;
+      if (solReceived > 0) {
+        cambios.push({
+          mint,
+          tokenAmount: Math.abs(tokenDelta),
+          solAmount: solReceived / LAMPORTS_PER_SOL,
+          direction: 'sell',
+          solAmountEstimado: false
+        });
+      }
+      // Si tokenDelta < 0 pero no recibió SOL -> transfer out, ignorar
+    }
+    // tokenDelta > 0 sin SOL gastado -> airdrop/transfer in, ignorar
+  }
+
   return cambios;
 }
 
