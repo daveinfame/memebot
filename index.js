@@ -1522,6 +1522,86 @@ bot.onText(/\/positions/, async (msg) => {
   }
 });
 
+// ---------- NUEVO: /ranking ----------
+bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
+  try {
+    const modoFiltro = match[1]?.toLowerCase();
+    const modo = modoFiltro === 'real' ? 'real' : modoFiltro === 'paper' ? 'paper' : MODO_ACTUAL;
+    const { rows } = await pool.query(`
+      SELECT
+        wallet_alias,
+        COUNT(*) as trades,
+        SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END) as losses,
+        SUM(profit_sol) as total_profit_sol,
+        AVG(profit_sol) as avg_profit_sol,
+        MAX(profit_sol) as best_trade,
+        MIN(profit_sol) as worst_trade
+      FROM trade_history
+      WHERE modo = $1
+      GROUP BY wallet_alias
+      ORDER BY total_profit_sol DESC
+    `, [modo]);
+    if (rows.length === 0) {
+      bot.sendMessage(msg.chat.id, `📭 No hay historial en modo ${modo.toUpperCase()}.`);
+      return;
+    }
+    const lines = rows.map((r, i) => {
+      const wr = r.trades > 0 ? ((r.wins / r.trades) * 100).toFixed(1) : '0.0';
+      const emoji = r.total_profit_sol >= 0 ? '🟢' : '🔴';
+      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${r.total_profit_sol.toFixed(4)} SOL (${r.trades} trades, ${wr}% WR, best ${parseFloat(r.best_trade).toFixed(4)}, worst ${parseFloat(r.worst_trade).toFixed(4)})`;
+    });
+    bot.sendMessage(msg.chat.id, `🏆 *Ranking wallets* (${modo.toUpperCase()}):\n${lines.join('\n')}`);
+  } catch (e) {
+    log('error', `Error en /ranking: ${e.message}`, e.stack);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// ---------- NUEVO: /pnl ----------
+bot.onText(/\/pnl/, async (msg) => {
+  try {
+    const { rows: hist } = await pool.query(`
+      SELECT SUM(profit_sol) as realized_sol
+      FROM trade_history
+      WHERE modo = $1
+    `, [MODO_ACTUAL]);
+    const realizedSol = hist[0]?.realized_sol || 0;
+
+    const { rows: pos } = await pool.query(`
+      SELECT bp.*, tw.address as wallet_address
+      FROM bot_positions bp
+      JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
+      WHERE bp.modo = $1
+    `, [MODO_ACTUAL]);
+
+    let unrealizedSol = 0;
+    if (pos.length > 0) {
+      for (const p of pos) {
+        const { decimals } = await getTokenInfoHelius(p.token_mint);
+        const valor = await estimarValorEnSol(p.token_mint, p.amount, decimals);
+        if (valor !== null) unrealizedSol += valor - p.cost_basis_sol;
+      }
+    }
+
+    const totalSol = realizedSol + unrealizedSol;
+    const emoji = totalSol >= 0 ? '🟢' : '🔴';
+
+    let txt = `💰 *PnL ${MODO_ACTUAL.toUpperCase()}* ${emoji}\n`;
+    txt += `🔒 Realizado: ${realizedSol.toFixed(4)} SOL\n`;
+    if (pos.length > 0) {
+      txt += `📈 No realizado: ${unrealizedSol.toFixed(4)} SOL (${pos.length} pos abiertas)\n`;
+    }
+    txt += `🧮 Total: ${totalSol.toFixed(4)} SOL`;
+    const solPrice = await getSolPriceUSD();
+    if (solPrice) txt += ` (~$${(totalSol * solPrice).toFixed(2)})`;
+    bot.sendMessage(msg.chat.id, txt);
+  } catch (e) {
+    log('error', `Error en /pnl: ${e.message}`, e.stack);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
 // ---------- Inicialización ----------
 (async () => {
   await initDB();
