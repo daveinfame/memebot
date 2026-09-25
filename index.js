@@ -518,6 +518,50 @@ async function verificarEstadoWebhook(apiKey, webhookId) {
     return null;
   }
 }
+// ---------- NUEVO: Monitoreo automático de webhook ----------
+async function monitoreoAutomaticoWebhook() {
+  try {
+    const apiKey = getHeliusApiKey();
+    if (!apiKey) { log('warn', '⚠️ No se pudo extraer api-key para monitoreo'); return; }
+
+    const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+    const webhookId = gb[0]?.helius_webhook_id;
+
+    if (!webhookId) {
+      log('warn', '⚠️ No hay webhookId guardado — se intentará crear al terminar');
+      return;
+    }
+
+    const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
+    const webhookInfo = await res.json();
+
+    const failureRate = webhookInfo.failureRate ?? null;
+    const lastSentAt = webhookInfo.lastSentAt ? new Date(webhookInfo.lastSentAt) : null;
+    const active = webhookInfo.active ?? null;
+
+    const hace10min = new Date(Date.now() - 10 * 60 * 1000);
+
+    const necesitaRecrear =
+      failureRate === null || isNaN(failureRate) ||
+      lastSentAt === null || lastSentAt < hace10min ||
+      active === false;
+
+    if (necesitaRecrear) {
+      log('warn', '🪝 Webhook detectado como caído o sin deliveries — recreando automáticamente...');
+      await pool.query('DELETE FROM global_balance WHERE id=1');
+      await crearOActualizarWebhookHelius();
+      if (CHAT_ID) {
+        try {
+          await bot.sendMessage(CHAT_ID, '🪝 Webhook auto-recreado: Helius volvía a estar sin deliveries. Se ha creado uno nuevo y el bot re-suscrito.');
+        } catch (e) {}
+      }
+    } else {
+      log('info', `✅ Monitoreo webhook: OK — failureRate=${failureRate}, último envío=${lastSentAt.toLocaleString('es-MX', {timeZone:'America/Mexico_City'})}`);
+    }
+  } catch (e) {
+    log('error', `Error en monitoreo automático de webhook: ${e.message}`);
+  }
+}
 
 // ---------- Diagnóstico ----------
 async function diagnosticoHelius(alias) {
@@ -1693,6 +1737,7 @@ bot.onText(/\/pnl/, async (msg) => {
 
   setInterval(reconciliarPosiciones, 60_000);
   setInterval(revisarStopLoss, 60_000);
+  setInterval(monitoreoAutomaticoWebhook, 600_000);
   // Cada 5 min: si Helius deshabilitó el webhook, reactivarlo automáticamente.
   setInterval(() => {
     const apiKey = getHeliusApiKey();
@@ -1706,6 +1751,7 @@ bot.onText(/\/pnl/, async (msg) => {
   }, 300_000);
   setInterval(async () => {
     const marca = new Date().toISOString();
+
     log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
   }, 300_000);
 
