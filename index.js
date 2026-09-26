@@ -455,14 +455,13 @@ function crearOActualizarWebhookHelius() {
             transactionTypes: ['ANY'],
             accountAddresses: direcciones,
             webhookType: 'enhanced',
-            authHeader: HELIUS_WEBHOOK_SECRET,
-            active: true // 🔑 Clave: re-activa un webhook que Helius auto-deshabilitó
+            authHeader: HELIUS_WEBHOOK_SECRET
           };
           if (webhookIdExistente) {
             return fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
+              body: JSON.stringify({ ...payload, active: true })
             })
               .then(async res => {
                 if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${await res.text()}`);
