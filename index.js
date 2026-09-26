@@ -464,8 +464,8 @@ function crearOActualizarWebhookHelius() {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
             })
-              .then(res => {
-                if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${res.text()}`);
+              .then(async res => {
+                if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${await res.text()}`);
                 log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
               })
               .then(() => verificarEstadoWebhook(apiKey, webhookIdExistente));
@@ -475,8 +475,8 @@ function crearOActualizarWebhookHelius() {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
             })
-              .then(res => {
-                if (!res.ok) throw new Error(`Error creando webhook de Helius: ${res.status} ${res.text()}`);
+              .then(async res => {
+                if (!res.ok) throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`);
                 return res.json();
               })
               .then(data => {
