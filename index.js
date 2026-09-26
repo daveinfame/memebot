@@ -1673,8 +1673,11 @@ bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
     }
     const lines = rows.map((r, i) => {
       const wr = r.trades > 0 ? ((r.wins / r.trades) * 100).toFixed(1) : '0.0';
-      const emoji = r.total_profit_sol >= 0 ? '🟢' : '🔴';
-      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${r.total_profit_sol.toFixed(4)} SOL (${r.trades} trades, ${wr}% WR, best ${parseFloat(r.best_trade).toFixed(4)}, worst ${parseFloat(r.worst_trade).toFixed(4)})`;
+      const emoji = (r.total_profit_sol || 0) >= 0 ? '🟢' : '🔴';
+      const best = r.best_trade !== null ? parseFloat(r.best_trade).toFixed(4) : '0.0000';
+      const worst = r.worst_trade !== null ? parseFloat(r.worst_trade).toFixed(4) : '0.0000';
+      const total = (r.total_profit_sol !== null ? r.total_profit_sol : 0).toFixed(4);
+      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${r.trades} trades, ${wr}% WR, best ${best}, worst ${worst})`;
     });
     bot.sendMessage(msg.chat.id, `🏆 *Ranking wallets* (${modo.toUpperCase()}):\n${lines.join('\n')}`);
   } catch (e) {
@@ -1724,6 +1727,23 @@ bot.onText(/\/pnl/, async (msg) => {
   } catch (e) {
     log('error', `Error en /pnl: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// ---------- NUEVO: /cleanup ----------
+bot.onText(/\/cleanup/, async (msg) => {
+  try {
+    const modo = MODO_ACTUAL;
+    const { rows: tracked } = await pool.query('SELECT alias FROM tracked_wallets');
+    const trackedAliases = tracked.map(r => r.alias);
+    const { rowCount } = await pool.query(
+      `DELETE FROM bot_positions WHERE wallet_alias NOT IN ($1) AND modo = $2`,
+      [trackedAliases.length ? `'${trackedAliases.join(',')}'` : "''", modo]
+    );
+    bot.sendMessage(msg.chat.id, `🧹 Cleanup ${modo.toUpperCase()}: ${rowCount} posición(es) de wallets no trackeadas eliminada(s).`);
+  } catch (e) {
+    log('error', `Error en /cleanup: ${e.message}`, e.stack);
+    bot.sendMessage(msg.chat.id, 'Error en cleanup: ' + e.message);
   }
 });
 
