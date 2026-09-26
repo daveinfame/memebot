@@ -1747,6 +1747,16 @@ bot.onText(/\/cleanup/, async (msg) => {
   }
 });
 
+bot.onText(/\/fixwebhook/, async (msg) => {
+  try {
+    await pool.query('DELETE FROM global_balance WHERE id = 1');
+    await pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id');
+    bot.sendMessage(msg.chat.id, '✅ global_balance actualizado con webhook ID existente. Reinicia el bot en Railway para que cargue el nuevo código.');
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+  }
+});
+
 // ---------- Inicialización ----------
 (async () => {
   await initDB();
