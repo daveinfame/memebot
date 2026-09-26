@@ -446,7 +446,7 @@ function crearOActualizarWebhookHelius() {
     .then(({ rows: walletRows }) => {
       const direcciones = walletRows.map(r => r.address);
       const aliases = walletRows.map(r => r.alias);
-      pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO NOTHING')
+      pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id')
         .catch(e => log('warn', 'Nota: global_balance ya existe o no se pudo crear'))
         .then(() => pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')).then(({ rows }) => {
           const webhookIdExistente = rows[0]?.helius_webhook_id;
