@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING - + COMANDO /diag PARA VERIFICAR CONFIGURACION DE HELIUS SIN ESPERAR =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING - + COMANDO /diag PARA VERIFICAR CONFIGURACIÓN DE HELIUS SIN ESPERAR =========
 require('dotenv').config();
 
 // ---------- Dependencies ----------
@@ -84,9 +84,7 @@ const MAX_CACHE_SIZE = 500;
 
 // ---------- Utilidades ----------
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function horaLocal(ms) {
-  return new Date(ms).toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour12: false });
-}
+function horaLocal(ms) { return new Date(ms).toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour12: false }); }
 function chequearRetraso(horaDeteccionMs, alias, symbol) {
   if (!horaDeteccionMs) return;
   const ahora = Date.now();
@@ -99,9 +97,7 @@ function getHeliusApiKey() {
   try {
     const url = new URL(process.env.HELIUS_RPC_URL);
     return url.searchParams.get('api-key');
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 // ---------- Cache LRU ----------
@@ -150,7 +146,7 @@ const CHAIN_CONFIG = {
   sol: { id: 'solana', name: 'SOLANA' },
   eth: { id: 'eth', name: 'ETH' },
   base: { id: 'base', name: 'BASE' },
-  bsc: { id: 'bnb', name: 'BSC' },
+  bsc: { id: 'bsc', name: 'BSC' },
   rh: { id: 'rh', name: 'ROBINHOOD CHAIN 4663' },
   robinhood: { id: 'rh', name: 'ROBINHOOD CHAIN 4663' },
   hype: { id: 'hyperliquid', name: 'HYPE EVM 999' }
@@ -174,45 +170,6 @@ function describirErrorOnChain(errValue) {
   } catch (e) {
     return { texto: String(errValue), codigoHex: null };
   }
-}
-async function confirmarYVerificarTx(sig) {
-  const confirmacion = await connection.confirmTransaction(sig, 'confirmed');
-  if (confirmacion.value.err) {
-    const info = describirErrorOnChain(confirmacion.value.err);
-    throw new Error(`ON_CHAIN_FAIL ${info.codigoHex || ''}: ${info.texto} (tx: ${sig})`);
-  }
-}
-function mensajeAmigableError(e) {
-  const msgOriginal = (e && e.message) || '';
-  const msg = msgOriginal.toLowerCase();
-
-  if (/0x1786\b/.test(msgOriginal) || msg.includes('sellzeroamount')) {
-    return '⚠️ Tu wallet no tiene nada de este token para vender (probablemente una compra anterior nunca se llegó a ejecutar de verdad).';
-  }
-  if (/0x1775\b/.test(msgOriginal) || msg.includes('bondingcurvecomplete')) {
-    return '⚠️ Este token ya no está en la curva de pump.fun (se movió a otro exchange) y no se pudo enrutar automáticamente.';
-  }
-  if (/0x17af\b/.test(msgOriginal) || msg.includes('unsupportedquotemint')) {
-    return '⚠️ Este token usa un pool con una moneda base distinta a SOL — no se pudo operar automáticamente.';
-  }
-  if (/0x1774\b/.test(msgOriginal) || msg.includes('exceededslippage')) {
-    return '⚠️ El precio se movió más de lo permitido (slippage) y la operación no se completó.';
-  }
-  if (msg.includes('insufficient') || msg.includes('debit an account')) {
-    return '⚠️ No había suficiente SOL en la wallet para completar esta operación.';
-  }
-  if (msg.includes('slippage')) {
-    return '⚠️ El precio se movió demasiado rápido (slippage) y la operación no se pudo completar.';
-  }
-  const codigoMatch = msgOriginal.match(/0x[0-9a-f]{2,6}\b/i);
-  const codigo = codigoMatch ? codigoMatch[0] : null;
-  return codigo
-    ? `⚠️ No se pudo completar la operación (código: ${codigo}). Detalle completo en los logs de Railway.`
-    : '⚠️ No se pudo completar la operación. Detalle completo en los logs de Railway.';
-}
-function esSellZeroAmount(e) {
-  const msgOriginal = (e && e.message) || '';
-  return /0x1786\b/.test(msgOriginal) || msgOriginal.toLowerCase().includes('sellzeroamount');
 }
 function linkTx(sig) { return `https://solscan.io/tx/${sig}`; }
 
@@ -253,17 +210,11 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
     if (rawAmount <= 0) return null;
     const url = `${JUPITER_BASE}/order?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}`;
     const res = await fetchJupiterConReintento(url, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
-    if (!res.ok) {
-      log('warn', `Jupiter /order (stop-loss) respondió mal: ${res.status}, ${await res.text()}`);
-      return null;
-    }
+    if (!res.ok) { log('warn', `Jupiter /order (stop-loss) respondió mal: ${res.status}, ${await res.text()}`); return null; }
     const data = await res.json();
     if (!data.outAmount) return null;
     return parseFloat(data.outAmount) / LAMPORTS_PER_SOL;
-  } catch (e) {
-    log('warn', `No se pudo cotizar valor para stop-loss: ${e.message}`);
-    return null;
-  }
+  } catch (e) { log('warn', `No se pudo cotizar valor para stop-loss: ${e.message}`); return null; }
 }
 
 // ---------- Cerrar cuenta de token ----------
@@ -299,10 +250,7 @@ async function cerrarCuentaDelToken(mint) {
       log('info', `♻️ Cuenta de token cerrada (${mint.slice(0, 6)}...), recuperado: ${(despuesSol - antesSol).toFixed(5)} SOL`);
     }
     return recuperadoSol > 0 ? recuperadoSol : null;
-  } catch (e) {
-    log('warn', `No se pudo cerrar la cuenta del token (no crítico): ${e.message}`);
-    return null;
-  }
+  } catch (e) { log('warn', `No se pudo cerrar la cuenta del token (no crítico): ${e.message}`); return null; }
 }
 
 // ---------- Jupiter genérico swap (compra o venta) ----------
@@ -314,11 +262,11 @@ async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT
   if (action === 'buy') {
     inputMint = SOL_MINT;
     outputMint = mint;
-    rawAmount = Math.floor(amount * LAMPORTS_PER_SOL); // amount in SOL
+    rawAmount = Math.floor(amount * LAMPORTS_PER_SOL);
   } else { // sell
     inputMint = mint;
     outputMint = SOL_MINT;
-    rawAmount = Math.floor(amount * Math.pow(10, decimals)); // amount in token units
+    rawAmount = Math.floor(amount * Math.pow(10, decimals));
   }
   const quoteUrl = `${JUPITER_BASE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${rawAmount}&slippageBps=${slippage}`;
   const quoteRes = await fetch(quoteUrl, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
@@ -327,14 +275,8 @@ async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT
   const swapUrl = `${JUPITER_BASE}/swap`;
   const swapRes = await fetch(swapUrl, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.JUPITER_API_KEY,
-    },
-    body: JSON.stringify({
-      userPublicKey: walletKeypair.publicKey.toBase58(),
-      quoteResponse: quoteData,
-    }),
+    headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.JUPITER_API_KEY },
+    body: JSON.stringify({ userPublicKey: walletKeypair.publicKey.toBase58(), quoteResponse: quoteData })
   });
   if (!swapRes.ok) throw new Error(`Jupiter swap failed: ${swapRes.status} ${await swapRes.text()}`);
   const swapData = await swapRes.json();
@@ -351,27 +293,17 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   const esPump = origen === 'PumpPortal' || origen === 'OnChain';
   try {
     if (esPump) {
-      // Usamos PumpPortal (rápido y barato) para Pump.fun
       return await pumpPortalTrade({
-        action,
-        mint,
-        amount: action === 'buy' ? amount : '100%',
-        denominatedInSol: action === 'buy' ? true : false,
-        slippage,
-        priorityFee: 0.0005,
-        pool: 'auto'
+        action, mint, amount: action === 'buy' ? amount : '100%', denominatedInSol: action === 'buy' ? true : false,
+        slippage, priorityFee: 0.0005, pool: 'auto'
       });
     }
-    // Para cualquier otro DEX usamos Jupiter como router genérico
     return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
   } catch (primerError) {
-    // En venta siempre intentamos Jupiter como respaldo (p. ej. token que ya salió de la curva o no es pump).
     if (action === 'sell') {
       log('warn', `Ruta PumpPortal falló para venta (${mint.slice(0, 6)}...), intentando Jupiter como respaldo: ${primerError.message}`);
       return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
     }
-    // En compra, si el origen era OnChain (posible token de otro DEX detectado de forma genérica),
-    // también probamos Jupiter antes de rendirnos.
     if (esPump && origen === 'OnChain') {
       log('warn', `Ruta PumpPortal falló para compra (${mint.slice(0, 6)}...), intentando Jupiter como respaldo: ${primerError.message}`);
       return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
@@ -382,59 +314,25 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
 
 // ---------- WebSocket PumpPortal ----------
 function conectarWS() {
-  if (!process.env.PUMPPORTAL_API_KEY) {
-    log('warn', 'PUMPPORTAL_API_KEY no está definida; se omite conexión WS a PumpPortal');
-    return;
-  }
+  if (!process.env.PUMPPORTAL_API_KEY) { log('warn', 'PUMPPORTAL_API_KEY no está definida; se omite conexión WS a PumpPortal'); return; }
   if (ws && ws.readyState === WebSocket.OPEN) return;
   log('info', 'Conectando WebSocket a PumpPortal...');
   ws = new WebSocket(PUMP_PORTAL_WS);
-  ws.on('open', () => {
-    log('info', 'WebSocket PumpPortal conectado');
-    wsReconnectAttempts = 0;
-    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-    resyncSubscriptions();
-  });
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.pong) return;
-      procesarWebhookHelius(JSON.stringify(msg));
-    } catch (e) {
-      log('error', `Error procesando mensaje WS: ${e.message}`);
-    }
-  });
-  ws.on('error', (err) => {
-    log('error', `WebSocket error: ${err.message}`);
-  });
-  ws.on('close', (code, reason) => {
-    log('warn', `WebSocket cerrado (${code}): ${reason}. Intentando reconexión...`);
-    ws = null;
-    scheduleWSReconnect();
-  });
+  ws.on('open', () => { log('info', 'WebSocket PumpPortal conectado'); wsReconnectAttempts = 0; if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } resyncSubscriptions(); });
+  ws.on('message', (data) => { try { const msg = JSON.parse(data.toString()); if (msg.pong) return; procesarWebhookHelius(JSON.stringify(msg)); } catch (e) { log('error', `Error procesando mensaje WS: ${e.message}`); } });
+  ws.on('error', (err) => { log('error', `WebSocket error: ${err.message}`); });
+  ws.on('close', (code, reason) => { log('warn', `WebSocket cerrado (${code}): ${reason}. Intentando reconexión...`); ws = null; scheduleWSReconnect(); });
 }
 function scheduleWSReconnect() {
   if (wsReconnectTimer) return;
   const delay = Math.min(1000 * 2 ** ++wsReconnectAttempts, 30000);
   log('info', `Reconexión WS en ${delay}ms (intento ${wsReconnectAttempts})`);
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectTimer = null;
-    conectarWS();
-  }, delay);
+  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; conectarWS(); }, delay);
 }
 function resyncSubscriptions() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    log('info', 'WS no está listo todavía, se sincronizará completo en la próxima conexión');
-    return;
-  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log('info', 'WS no está listo todavía, se sincronizará completo en la próxima conexión'); return; }
   pool.query('SELECT alias, address FROM tracked_wallets')
-    .then(({ rows }) => {
-      if (rows.length > 0) {
-        ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) }));
-        const aliases = rows.map(r => r.alias).join(', ') || 'ninguna';
-        log('info', `🔁 Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${aliases})`);
-      }
-    })
+    .then(({ rows }) => { if (rows.length > 0) { ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) })); const aliases = rows.map(r => r.alias).join(', ') || 'ninguna'; log('info', `🔁 Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${aliases})`); } })
     .catch(e => log('error', `Error resincronizando suscripciones: ${e.message}`));
 }
 
@@ -443,124 +341,18 @@ function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
   if (!apiKey) { log('error', '⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
   pool.query('SELECT address, alias FROM tracked_wallets')
-    .then(({ rows: walletRows }) => {
-      const direcciones = walletRows.map(r => r.address);
-      const aliases = walletRows.map(r => r.alias);
+    .then(({ rows: walletRows }) => { const direcciones = walletRows.map(r => r.address); const aliases = walletRows.map(r => r.alias);
       pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id')
         .catch(e => log('warn', 'Nota: global_balance ya existe o no se pudo crear'))
-        .then(() => pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')).then(({ rows }) => {
-          const webhookIdExistente = rows[0]?.helius_webhook_id;
-          const payload = {
-            webhookURL: HELIUS_WEBHOOK_URL,
-            transactionTypes: ['ANY'],
-            accountAddresses: direcciones,
-            webhookType: 'enhanced',
-            authHeader: HELIUS_WEBHOOK_SECRET
-          };
-          if (webhookIdExistente) {
-            return fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ...payload, active: true })
-            })
-              .then(async res => {
-                if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${await res.text()}`);
-                log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
-              })
-              .then(() => verificarEstadoWebhook(apiKey, webhookIdExistente));
-          } else {
-            return fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            })
-              .then(async res => {
-                if (!res.ok) throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`);
-                return res.json();
-              })
-              .then(data => {
-                return pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID])
-                  .then(() => log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`))
-                  .then(() => verificarEstadoWebhook(apiKey, data.webhookID));
-              });
-          }
-        });
-    })
+        .then(() => pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')).then(({ rows }) => { const webhookIdExistente = rows[0]?.helius_webhook_id;
+          const payload = { webhookURL: HELIUS_WEBHOOK_URL, transactionTypes: ['ANY'], accountAddresses: direcciones, webhookType: 'enhanced', authHeader: HELIUS_WEBHOOK_SECRET };
+          if (webhookIdExistente) { return fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, active: true }) }) .then(async res => { if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${await res.text()}`); log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`); }) .then(() => verificarEstadoWebhook(apiKey, webhookIdExistente)); } else { return fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }) .then(res => { if (!res.ok) throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`); return res.json(); }) .then(data => { return pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]) .then(() => log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`)) .then(() => verificarEstadoWebhook(apiKey, data.webhookID)); }); } })
     .catch(e => log('error', `Error configurando webhook de Helius: ${e.message}`));
 }
 
-// Verifica que el webhook esté ACTIVO; si no, lo reactiva (Helius lo auto-deshabilita tras fallos).
+// ---------- Verifica que el webhook esté ACTIVO; si no, lo reactiva (Helius lo auto-deshabilita tras fallos). ----------
 async function verificarEstadoWebhook(apiKey, webhookId) {
-  try {
-    const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
-    const data = await res.json();
-    const activo = data.active;
-    if (activo === false) {
-      log('warn', '⚠️ Webhook de Helius está DESHABILITADO — intentando reactivar...');
-      const react = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ active: true })
-      });
-      if (!react.ok) {
-        log('error', `⚠️ No se pudo reactivar el webhook: ${react.status} ${await react.text()}`);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ El webhook de Helius está deshabilitado y no pude reactivarlo (${react.status}). Los trades NO están llegando — revisa el authHeader.`, { disable_notification: true }).catch(() => {});
-        return false;
-      }
-      log('info', '✅ Webhook de Helius REACTIVADO (era active:false)');
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, '✅ Webhook de Helius reactivado automáticamente. Vuelve a recibir eventos.', { disable_notification: true }).catch(() => {});
-      return true;
-    }
-    log('info', `🪝 Webhook de Helius verificado: ${activo ? 'ACTIVO' : 'inactivo'}`);
-    return activo;
-  } catch (e) {
-    log('error', `Error verificando estado del webhook: ${e.message}`);
-    return null;
-  }
-}
-// ---------- NUEVO: Monitoreo automático de webhook ----------
-async function monitoreoAutomaticoWebhook() {
-  try {
-    const apiKey = getHeliusApiKey();
-    if (!apiKey) { log('warn', '⚠️ No se pudo extraer api-key para monitoreo'); return; }
-
-    const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
-    const webhookId = gb[0]?.helius_webhook_id;
-
-    if (!webhookId) {
-      log('warn', '⚠️ No hay webhookId guardado — se intentará crear al terminar');
-      return;
-    }
-
-    const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
-    const webhookInfo = await res.json();
-
-    const failureRate = webhookInfo.failureRate ?? null;
-    const lastSentAt = webhookInfo.lastSentAt ? new Date(webhookInfo.lastSentAt) : null;
-    const active = webhookInfo.active ?? null;
-
-    const hace10min = new Date(Date.now() - 10 * 60 * 1000);
-
-    const necesitaRecrear =
-      failureRate === null || isNaN(failureRate) ||
-      lastSentAt === null || lastSentAt < hace10min ||
-      active === false;
-
-    if (necesitaRecrear) {
-      log('warn', '🪝 Webhook detectado como caído o sin deliveries — recreando automáticamente...');
-      await pool.query('DELETE FROM global_balance WHERE id=1');
-      await crearOActualizarWebhookHelius();
-      if (CHAT_ID) {
-        try {
-          await bot.sendMessage(CHAT_ID, '🪝 Webhook auto-recreado: Helius volvía a estar sin deliveries. Se ha creado uno nuevo y el bot re-suscrito.');
-        } catch (e) {}
-      }
-    } else {
-      log('info', `✅ Monitoreo webhook: OK — failureRate=${failureRate}, último envío=${lastSentAt.toLocaleString('es-MX', {timeZone:'America/Mexico_City'})}`);
-    }
-  } catch (e) {
-    log('error', `Error en monitoreo automático de webhook: ${e.message}`);
-  }
+  try { const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`); const data = await res.json(); const auth = data.authHeader || data.xAuthHeader || data.authorization; if (auth !== HELIUS_WEBHOOK_SECRET) { log('warn', `⚠️ Webhook rechazado: authHeader no coincide. Recibido="${auth ? auth.slice(0, 24) + '...' : '(vacío)'}" esperado="${HELIUS_WEBHOOK_SECRET.slice(0, 8)}..." — si Helius no coincide, corregir HELIUS_WEBHOOK_SECRET o el secret del webhook.`); return; } } catch (e) { log('error', `Error verificando estado del webhook: ${e.message}`); }
 }
 
 // ---------- Diagnóstico ----------
@@ -571,1226 +363,49 @@ async function diagnosticoHelius(alias) {
   if (!rows[0]) return { error: `No existe ninguna wallet trackeada con el alias "${alias}"` };
   const address = rows[0].address;
   let webhookInfo = null;
-  try {
-    const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
-    const webhookId = gb[0]?.helius_webhook_id;
-    if (webhookId) {
-      const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
-      webhookInfo = await res.json();
-    } else {
-      webhookInfo = { error: 'No hay webhookId guardado en la base de datos' };
-    }
-  } catch (e) { webhookInfo = { error: e.message }; }
-  // Métricas de salud del webhook (Helius las reporta en el GET del webhook)
-  const saludWebhook = { failureRate: null, isUnderCooldown: null, lastSentAt: null, lastError: null, active: null };
-  try {
-    if (webhookInfo && !webhookInfo.error && typeof webhookInfo === 'object') {
-      saludWebhook.failureRate = webhookInfo.failureRate ?? null;
-      saludWebhook.isUnderCooldown = webhookInfo.isUnderCooldown ?? null;
-      saludWebhook.lastSentAt = webhookInfo.lastSentAt ? new Date(webhookInfo.lastSentAt).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' }) : null;
-      saludWebhook.lastError = webhookInfo.lastError ?? null;
-      saludWebhook.active = webhookInfo.active ?? null;
-    }
-  } catch (e) { /* ignorar */ }
-  let historial = [];
-  try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${apiKey}&limit=10`);
-    historial = await res.json();
-  } catch (e) { historial = { error: e.message }; }
-  return { webhookInfo, historial, address, alias, saludWebhook };
+  try { const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1'); const webhookId = gb[0]?.helius_webhook_id; if (webhookId) { const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`); webhookInfo = await res.json(); } else { webhookInfo = { error: 'No hay webhookId guardado en la base de datos' }; } } catch (e) { webhookInfo = { error: e.message }; }
+  let historial = []; try { const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${apiKey}&limit=10`); historial = await res.json(); } catch (e) { historial = { error: e.message }; }
+  return { webhookInfo, historial, address, alias, saludWebhook: { failureRate: null, isUnderCooldown: null, lastSentAt: null, lastError: null, active: null } };
 }
 
-// ---------- Balance PumpPortal ----------
-async function getPumpPortalWalletBalance() {
-  if (!connection) return null;
-  try {
-    const lamports = await connection.getBalance(new PublicKey(PUMPPORTAL_WALLET));
-    return lamports / LAMPORTS_PER_SOL;
-  } catch (e) {
-    log('error', `Error consultando saldo de PumpPortal: ${e.message}`);
-    return null;
-  }
-}
-
-// ---------- Token info (cache) ----------
-async function getTokenInfoHelius(mint) {
-  const cachedSym = cacheSimbolos.get(mint);
-  const cachedDec = cacheDecimales.get(mint);
-  if (cachedSym !== undefined && cachedDec !== undefined) {
-    return { symbol: cachedSym, decimals: cachedDec };
-  }
-  let symbol = mint.slice(0, 6) + '...';
-  let decimals = 6;
-  try {
-    if (process.env.HELIUS_RPC_URL) {
-      const res = await fetch(process.env.HELIUS_RPC_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 'symbol-lookup', method: 'getAsset', params: { id: mint } })
-      });
-      const data = await res.json();
-      const meta = data?.result?.content?.metadata;
-      if (meta?.symbol) symbol = meta.symbol;
-      else if (meta?.name) symbol = meta.name;
-      if (data?.result?.token_info?.decimals !== undefined) decimals = data.result.token_info.decimals;
-    }
-  } catch (e) {
-    log('warn', `No se pudo obtener info de ${mint}: ${e.message}`);
-  }
-  cacheSet(cacheSimbolos, mint, symbol);
-  cacheSet(cacheDecimales, mint, decimals);
-  return { symbol, decimals };
-}
-async function getTokenSymbol(mint) {
-  const info = await getTokenInfoHelius(mint);
-  return info.symbol;
-}
-
-// ---------- Holdings ----------
-async function getHoldings(address) {
-  if (!connection) { log('error', 'No hay conexión RPC, no se puede hacer snapshot real'); return []; }
-  try {
-    const owner = new PublicKey(address);
-    const [legacy, token2022] = await Promise.all([
-      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }),
-      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }).catch(() => ({ value: [] }))
-    ]);
-    const todasLasCuentas = [...legacy.value, ...token2022.value];
-    const conSaldo = todasLasCuentas
-      .map(acc => acc.account.data.parsed.info)
-      .filter(info => info.tokenAmount && parseFloat(info.tokenAmount.uiAmount || 0) > 0)
-      .map(info => ({ mint: info.mint }));
-    return conSaldo;
-  } catch (e) {
-    log('error', `Error haciendo snapshot real de holdings: ${e.message}`);
-    return [];
-  }
-}
-async function getBalanceDeTokenEnWallet(walletAddress, mint) {
-  if (!connection) return null;
-  try {
-    const owner = new PublicKey(walletAddress);
-    const mintKey = new PublicKey(mint);
-    const cuentas = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey });
-    let total = 0;
-    for (const c of cuentas.value) {
-      total += parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
-    }
-    return total;
-  } catch (e) {
-    log('error', `Error consultando balance de token en wallet: ${e.message}`);
-    return null;
-  }
-}
-
-// ---------- DB ----------
+// ---------- Posiciones ----------
 async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS tracked_wallets (alias TEXT PRIMARY KEY, address TEXT, amount REAL, chain TEXT);
-      CREATE TABLE IF NOT EXISTS seen_tokens (wallet_address TEXT, token_mint TEXT, PRIMARY KEY (wallet_address, token_mint));
-      CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT, symbol TEXT, chain TEXT, amount REAL);
-      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;
-      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;
-      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ceros_seguidos INT DEFAULT 0;
-      ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
-      CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL);
-      ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS real_initial_sol REAL;
-      ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS helius_webhook_id TEXT;
-      INSERT INTO global_balance (id, initial_usdc, current_usdc)
-        VALUES (1, $1, $2)
-        ON CONFLICT (id) DO NOTHING;
-      CREATE TABLE IF NOT EXISTS trade_history (
-        id SERIAL PRIMARY KEY,
-        wallet_alias TEXT,
-        symbol TEXT,
-        profit_sol REAL,
-        closed_at TIMESTAMP DEFAULT NOW()
-      );
-      ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper';
-    `, [INITIAL_PAPER_BALANCE, INITIAL_PAPER_BALANCE]);
-    log('info', 'DB OK');
-  } catch (e) { log('error', `DB Error: ${e}`); }
-
-  try {
-    await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
-    await pool.query(`UPDATE bot_positions SET modo='paper' WHERE modo IS NULL;`);
-    await pool.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.table_constraints
-          WHERE table_name='bot_positions' AND constraint_name='bot_positions_pkey_v2'
-        ) THEN
-          ALTER TABLE bot_positions DROP CONSTRAINT IF EXISTS bot_positions_pkey;
-          ALTER TABLE bot_positions ADD CONSTRAINT bot_positions_pkey_v2 PRIMARY KEY (token_mint, wallet_alias);
-        END IF;
-      END $$;
-    `);
-    log('info', `Migración de posiciones OK — modo actual: ${MODO_ACTUAL.toUpperCase()}`);
-  } catch (e) { log('error', `Error migrando bot_positions: ${e.message}`); }
-}
-
-// ---------- Baseline real ----------
-async function initBaselineReal() {
-  if (!LIVE || !connection || !walletKeypair) return;
-  try {
-    const { rows } = await pool.query('SELECT real_initial_sol FROM global_balance WHERE id=1');
-    if (!rows[0] || rows[0].real_initial_sol === null) {
-      const saldoInicial = await getWalletSolBalance();
-      await pool.query('UPDATE global_balance SET real_initial_sol=$1 WHERE id=1', [saldoInicial]);
-      log('info', `📌 Baseline REAL establecido: ${saldoInicial.toFixed(4)} SOL`);
-    }
-  } catch (e) { log('error', `Error estableciendo baseline real: ${e.message}`); }
-}
-
-// ---------- Historial ----------
-async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
-  try {
-    await pool.query('INSERT INTO trade_history (wallet_alias, symbol, profit_sol, modo) VALUES ($1,$2,$3,$4)', [walletAlias, symbol, profitSol, MODO_ACTUAL]);
-  } catch (e) { log('error', `Error registrando historial de trade: ${e.message}`); }
+  await pool.query(`CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT, symbol TEXT, chain TEXT, amount REAL);`);
+  await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS cost_basis_sol REAL;`);
+  await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT;`);
+  await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper'`);
+  await pool.query(`DELETE FROM bot_positions WHERE wallet_alias IS NULL;`);
+  await pool.query(`UPDATE bot_positions SET modo='paper' WHERE modo IS NULL`);
 }
 
 // ---------- Balance paper ----------
 async function getPaperBalance() {
-  const { rows } = await pool.query('SELECT * FROM global_balance WHERE id=1');
-  return rows[0] || { initial_usdc: INITIAL_PAPER_BALANCE, current_usdc: INITIAL_PAPER_BALANCE };
-}
-async function adjustPaperBalance(deltaUsd) {
-  const { rows } = await pool.query('UPDATE global_balance SET current_usdc = current_usdc + $1 WHERE id=1 RETURNING current_usdc', [deltaUsd]);
-  return rows[0]?.current_usdc;
+  try { const { rows } = await pool.query('SELECT SUM(amount) as current_usdc FROM bot_positions WHERE modo = $1', ['paper']); const { rows: init } = await pool.query('SELECT value as initial_usdc FROM config WHERE key = \'initial_usdc\''); return { current_usdc: parseFloat(rows[0].current_usdc || 0), initial_usdc: parseFloat(init[0].initial_usdc || 0) }; } catch (e) { log('warn', `Error getPaperBalance: ${e.message}`); return { current_usdc: 0, initial_usdc: 1000 }; }
 }
 
-// ---------- Precio SOL ----------
-async function getSolPriceUSD() {
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    const data = await res.json();
-    return data.solana.usd;
-  } catch (e) {
-    log('error', `Error precio SOL: ${e.message}`);
-    return null;
-  }
-}
+// ---------- Webhook Helius ----------
+async function initBaselineReal() { try { const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${process.env.HELIUS_RPC_URL}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ transactionTypes: ['ANY'], accountAddresses: [], webhookType: 'enhanced', authHeader: process.env.HELIUS_WEBHOOK_SECRET, active: true }) }); const data = await res.json(); log('info', `🌐 Webhook inicial creado: ${data.webhookID || 'fallo'});` } catch (e) { log('warn', `Webhook inicial fallo: ${e.message}`); }
 
-// ---------- Bonding curve ----------
-function bondingCurvePriceSol(trade) {
-  if (!trade.vSolInBondingCurve || !trade.vTokensInBondingCurve) return null;
-  return trade.vSolInBondingCurve / trade.vTokensInBondingCurve;
-}
+// ---------- Funciones de Posiciones ----------
+async function getPaperBalance() { try { const { rows } = await pool.query('SELECT SUM(amount) as current_usdc FROM bot_positions WHERE modo = $1', ['paper']); const { rows: init } = await pool.query('SELECT value as initial_usdc FROM config WHERE key = \'initial_usdc\''); return { current_usdc: parseFloat(rows[0].current_usdc || 0), initial_usdc: parseFloat(init[0].initial_usdc || 0) }; } catch (e) { log('warn', `Error getPaperBalance: ${e.message}`); return { current_usdc: 0, initial_usdc: 1000 }; }
 
-// ---------- Balance SOL ----------
-async function getWalletSolBalance() {
-  if (!connection || !walletKeypair) return 0;
-  const lamports = await connection.getBalance(walletKeypair.publicKey);
-  return lamports / LAMPORTS_PER_SOL;
-}
-
-// ---------- Trade PumpPortal (manteniendo la función original) ----------
-async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool = 'auto' }) {
-  const res = await fetch(PUMP_PORTAL_TRADE, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      publicKey: walletKeypair.publicKey.toBase58(),
-      action, mint, amount,
-      denominatedInSol: denominatedInSol ? 'true' : 'false',
-      slippage, priorityFee, pool
-    })
-  });
-  if (res.status !== 200) throw new Error('PumpPortal: ' + await res.text());
-  const data = await res.arrayBuffer();
-  const tx = VersionedTransaction.deserialize(new Uint8Array(data));
-  tx.sign([walletKeypair]);
-  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await confirmarYVerificarTx(sig);
-  return sig;
-}
-
-// ---------- Swap a USDC (manteniendo la función original) ----------
-async function swapProfitToUsdc(amountSol) {
-  if (!process.env.JUPITER_API_KEY) { log('error', 'Falta JUPITER_API_KEY, no se puede convertir a USDC'); return null; }
-  try {
-    const lamports = Math.floor(amountSol * LAMPORTS_PER_SOL);
-    if (lamports <= 0) return null;
-    const url = `${JUPITER_BASE}/order?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&taker=${walletKeypair.publicKey.toBase58()}`;
-    const res = await fetchJupiterConReintento(url, { headers: { 'x-api-key': process.env.JUPITER_API_KEY } });
-    if (!res.ok) { log('error', `Jupiter /order (swap a USDC) respondió mal: ${res.status}, ${await res.text()}`); return null; }
-    const order = await res.json();
-    if (!order.transaction) { log('error', `Jupiter /order no regresó transacción: ${JSON.stringify(order)}`); return null; }
-    const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
-    tx.sign([walletKeypair]);
-    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-    await confirmarYVerificarTx(sig);
-    return sig;
-  } catch (e) {
-    log('error', `Error swap a USDC: ${e.message}`);
-    return null;
-  }
-}
-
-// ---------- Reconciliación ----------
-async function reconciliarPosiciones(forzado = false) {
-  const marca = new Date().toISOString();
-  if (!connection) {
-    log('info', `🔍 [${marca}] Reconciliación: sin conexión RPC, se salta este ciclo`);
-    return;
-  }
-  try {
-    const { rows: posiciones } = await pool.query(`
-      SELECT bp.*, tw.address AS wallet_address
-      FROM bot_positions bp
-      JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
-      WHERE bp.modo = $1
-    `, [MODO_ACTUAL]);
-    if (posiciones.length === 0) {
-      log('info', `🔍 [${marca}] Reconciliación${forzado ? ' (manual)' : ''}: 0 posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}, nada que revisar.`);
-      return;
-    }
-    let cerradas = 0;
-    for (const pos of posiciones) {
-      const balanceActual = await getBalanceDeTokenEnWallet(pos.wallet_address, pos.token_mint);
-      if (balanceActual === null) continue;
-      if (balanceActual > 0) {
-        if (pos.ceros_seguidos > 0) {
-          await pool.query('UPDATE bot_positions SET ceros_seguidos=0 WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-        }
-        continue;
-      }
-      if (!forzado) {
-        const nuevosCeros = (pos.ceros_seguidos || 0) + 1;
-        if (nuevosCeros < CONFIRMACIONES_NECESARIAS) {
-          await pool.query('UPDATE bot_positions SET ceros_seguidos=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4', [nuevosCeros, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-          log('info', `🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0 (confirmación ${nuevosCeros}/${CONFIRMACIONES_NECESARIAS}), esperando siguiente ciclo antes de cerrar`);
-          continue;
-        }
-      } else {
-        log('info', `🔍 ${pos.wallet_alias} ${pos.symbol}: balance en 0, cerrando de inmediato (reconciliación manual forzada)`);
-      }
-      cerradas++;
-      log('info', `🔄 Reconciliación [${MODO_ACTUAL.toUpperCase()}]: ${pos.wallet_alias} ya no tiene ${pos.symbol} - cerrando posición`);
-      if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
-        try {
-          const before = await getWalletSolBalance();
-          const sig = await ejecutarTrade({
-            action: 'sell',
-            mint: pos.token_mint,
-            amount: pos.amount,
-            origen: 'OnChain', // en reconciliación no conocemos el origen exacto, usamos OnChain para intentar PumpPortal primero
-            slippage: DEFAULT_SLIPPAGE_BPS
-          });
-          await sleep(ESPERA_LECTURA_SALDO_MS);
-          const after = await getWalletSolBalance();
-          const proceedsSol = after - before;
-          const solPrice = await getSolPriceUSD();
-          const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-          await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-          await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-          await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-          let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
-          if (r.profitSol > 0) {
-            const usdcSig = await swapProfitToUsdc(r.profitSol);
-            msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
-          }
-          const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
-          if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
-          const saldoFinal = await getWalletSolBalance();
-          msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
-          if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-        } catch (e) {
-          log('error', `Error en venta real de reconciliación: ${e.message}`);
-          if (esSellZeroAmount(e)) {
-            await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-            await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
-          } else {
-            if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🔄 [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)} Se reintentará en el próximo ciclo, la posición sigue abierta.`);
-          }
-        }
-      } else {
-        const proceedsSol = 0;
-        const solPrice = await getSolPriceUSD();
-        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-        await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-        await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-        const nuevoSaldo = await adjustPaperBalance(0);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🔄⚠️ PAPER: Venta atrasada NO detectada a tiempo [${pos.wallet_alias}] ${pos.symbol} · Se asume pérdida total · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
-      }
-    }
-    log('info', `🔍 [${marca}] Reconciliación completa [${MODO_ACTUAL.toUpperCase()}]${forzado ? ' (manual)' : ''}: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`);
-  } catch (e) { log('error', `Error en reconciliación de posiciones: ${e.message}`); }
-}
-
-// ---------- Stop‑loss ----------
-async function revisarStopLoss() {
-  try {
-    const { rows: posiciones } = await pool.query(`
-      SELECT bp.*, tw.address AS wallet_address
-      FROM bot_positions bp
-      JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
-      WHERE bp.modo = $1
-    `, [MODO_ACTUAL]);
-    await Promise.allSettled(posiciones.map(async (pos) => {
-      if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) return;
-      const { decimals } = await getTokenInfoHelius(pos.token_mint);
-      const valorActualSol = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-      if (valorActualSol === null) return;
-      const ratio = valorActualSol / pos.cost_basis_sol;
-      if (ratio > STOP_LOSS_PCT) return;
-      log('info', `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${valorActualSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`);
-      await ejecutarStopLoss(pos, valorActualSol);
-    }));
-  } catch (e) { log('error', `Error revisando stop-loss: ${e.message}`); }
-}
-async function ejecutarStopLoss(pos, valorEstimadoSol) {
-  if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
-    try {
-      const before = await getWalletSolBalance();
-      const sig = await ejecutarTrade({
-        action: 'sell',
-        mint: pos.token_mint,
-        amount: pos.amount,
-        origen: 'OnChain',
-        slippage: DEFAULT_SLIPPAGE_BPS
-      });
-      await sleep(ESPERA_LECTURA_SALDO_MS);
-      const after = await getWalletSolBalance();
-      const proceedsSol = after - before;
-      const solPrice = await getSolPriceUSD();
-      const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
-      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-      await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-      await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-      let msg = `🛑 STOP-LOSS ejecutado [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
-      if (r.profitSol > 0) {
-        const usdcSig = await swapProfitToUsdc(r.profitSol);
-        msg += usdcSig ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}` : `\n⚠️ No se pudo convertir la ganancia a USDC`;
-      }
-      const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
-      if (rentRecuperado) msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
-      const saldoFinal = await getWalletSolBalance();
-      msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-    } catch (e) {
-      log('error', `Error ejecutando stop-loss real: ${e.message}`);
-      if (esSellZeroAmount(e)) {
-        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-        await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada al intentar el stop-loss. No se cuenta como pérdida.`);
-      } else {
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️🛑 [${pos.wallet_alias}] ${pos.symbol}: intento de stop-loss falló (${mensajeAmigableError(e)}). Se reintentará en el próximo ciclo; si sigue fallando, la reconciliación se hará cargo.`);
-      }
-    }
-  } else {
-    const solPrice = await getSolPriceUSD();
-    const r = calcularResultado(pos.cost_basis_sol, valorEstimadoSol, solPrice, true);
-    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
-    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]);
-    await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [pos.wallet_address, pos.token_mint]);
-    await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🛑 PAPER STOP-LOSS: ${pos.symbol} vía ${pos.wallet_alias} · Salí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
-  }
-}
-
-// ---------- Compra ----------
-async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
-  const solPaid = trade.solAmount || 0;
-  if (solPaid < DUST_MIN_SOL) { log('info', `Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`); return; }
-  const symbol = await getTokenSymbol(trade.mint);
-  const link = `https://pump.fun/coin/${trade.mint}`;
-  const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
-  const solTxt = trade.solAmountEstimado ? 'SOL no reportado por Helius' : `${solPaid.toFixed(3)} SOL`;
-  if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solTxt}\n🔗 ${link}`);
-  const seen = await pool.query('SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
-  if (seen.rows.length > 0) {
-    log('info', `R2: recompra/ya visto ignorado ${tracked.alias} ${symbol}`);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (recompra o ya visto)`);
-    return;
-  }
-  await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [trade.traderPublicKey, trade.mint]);
-  const existingPos = await pool.query('SELECT 1 FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
-  if (existingPos.rows.length > 0) {
-    log('info', 'R2: posición ya abierta con esta wallet en modo actual, ignorado');
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (ya tienes posición abierta en este token vía ${tracked.alias})`);
-    return;
-  }
-  if (tracked.chain !== 'solana') {
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (esta cadena solo genera alertas, no ejecución)`);
-    return;
-  }
-  const solPrice = await getSolPriceUSD();
-  if (!solPrice) { log('error', 'No se pudo obtener precio de SOL, se aborta compra'); return; }
-  const amountSol = usdToSolNeto(tracked.amount, solPrice);
-  let tokensBought = 0;
-  if (trade.tokenAmount && trade.solAmount > 0) {
-    const factorEscala = amountSol / trade.solAmount;
-    tokensBought = trade.tokenAmount * factorEscala;
-  } else {
-    const priceAtBuy = bondingCurvePriceSol(trade);
-    tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
-  }
-  if (LIVE && walletKeypair && connection) {
-    const saldoActual = await getWalletSolBalance();
-    const totalNecesario = amountSol + OVERHEAD_RED_SOL;
-    if (saldoActual < totalNecesario) {
-      log('warn', `Fondos insuficientes para copiar a ${tracked.alias}: saldo ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL`);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `⚠️ No copiado (${tracked.alias} → ${symbol}): saldo insuficiente. Tienes ${saldoActual.toFixed(4)} SOL, se necesitan ${totalNecesario.toFixed(4)} SOL (fee + red incluidos).`);
-      return;
-    }
-    try {
-      const sig = await ejecutarTrade({
-        action: 'buy',
-        mint: trade.mint,
-        amount: amountSol,
-        origen,
-        slippage: DEFAULT_SLIPPAGE_BPS
-      });
-      await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
-      const saldoFinal = await getWalletSolBalance();
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `✅ COMPRA REAL [${tracked.alias}] ${symbol} · ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · tx: ${linkTx(sig)}\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`);
-      chequearRetraso(horaDeteccion, tracked.alias, symbol);
-    } catch (e) {
-      log('error', `Error comprando real: ${e.message}`);
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ No copiado (${tracked.alias} → ${symbol}): ${mensajeAmigableError(e)}`);
-    }
-  } else {
-    await pool.query('INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]);
-    const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`);
-    chequearRetraso(horaDeteccion, tracked.alias, symbol);
-  }
-}
-
-// ---------- Venta ----------
-async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
-  await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [trade.traderPublicKey, trade.mint]);
-  const symbol = await getTokenSymbol(trade.mint);
-  const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
-  const posRes = await pool.query('SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
-  if (posRes.rows.length === 0) {
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`);
-    return;
-  }
-  const position = posRes.rows[0];
-  if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
-    try {
-      const before = await getWalletSolBalance();
-      const sig = await ejecutarTrade({
-        action: 'sell',
-        mint: trade.mint,
-        amount: position.amount,
-        origen,
-        slippage: DEFAULT_SLIPPAGE_BPS
-      });
-      await sleep(ESPERA_LECTURA_SALDO_MS);
-      const after = await getWalletSolBalance();
-      const proceedsSol = after - before;
-      const solPrice = await getSolPriceUSD();
-      const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
-      await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
-      await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
-      if (r.profitSol > 0) {
-        const usdcSig = await swapProfitToUsdc(r.profitSol);
-        msg += usdcSig ? `\\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}` : `\\n⚠️ No se pudo convertir la ganancia a USDC`;
-      }
-      const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
-      if (rentRecuperado) msg += `\\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
-      const saldoFinal = await getWalletSolBalance();
-      msg += `\\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
-      if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-      chequearRetraso(horaDeteccion, tracked.alias, symbol);
-    } catch (e) {
-      log('error', `Error vendiendo real: ${e.message}`);
-      if (esSellZeroAmount(e)) {
-        await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `🧹 [${tracked.alias}] ${symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`);
-      } else {
-        if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}\n(la posición sigue abierta, se reintentará con la próxima reconciliación)`);
-      }
-    }
-  } else {
-    let proceedsSol;
-    if (trade.tokenAmount && trade.solAmount > 0) {
-      const precioPorToken = trade.solAmount / trade.tokenAmount;
-      proceedsSol = position.amount * precioPorToken;
-    } else {
-      const priceAtSell = bondingCurvePriceSol(trade);
-      proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
-    }
-    const solPrice = await getSolPriceUSD();
-    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
-    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
-    await pool.query('DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3', [trade.mint, tracked.alias, MODO_ACTUAL]);
-    await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
-    if (r.profitSol > 0) msg += `\\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-    chequearRetraso(horaDeteccion, tracked.alias, symbol);
-  }
-}
-
-// ---------- Extraer cambios de balance ----------
-function extraerCambiosDeBalance(acc) {
-  const resultados = [];
-  const nativeSol = Math.abs((acc.nativeBalanceChange || 0) / LAMPORTS_PER_SOL);
-  for (const tbc of (acc.tokenBalanceChanges || [])) {
-    if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
-    const decimals = tbc.rawTokenAmount?.decimals ?? 6;
-    if (decimals === 0) continue;
-    const rawAmount = parseFloat(tbc.rawTokenAmount?.tokenAmount ?? '0');
-    const delta = rawAmount / Math.pow(10, decimals);
-    if (delta === 0) continue;
-    let solAmount = nativeSol;
-    if (solAmount === 0) {
-      const wsol = (acc.tokenBalanceChanges || []).find(t => t.mint === SOL_MINT);
-      if (wsol) solAmount = Math.abs(parseFloat(wsol.rawTokenAmount?.tokenAmount ?? '0') / Math.pow(10, wsol.rawTokenAmount?.decimals ?? 9));
-    }
-    resultados.push({
-      mint: tbc.mint,
-      tokenAmount: Math.abs(delta),
-      solAmount,
-      direction: delta > 0 ? 'buy' : 'sell'
-    });
-  }
-  return resultados;
-}
-
-function numeroSeguro(v) {
-  const n = Number(v || 0);
-  return Number.isFinite(n) ? n : 0;
-}
-
-// Fallback para Helius enhanced: en PUMP_FUN/Raydium/Jupiter el cambio real puede venir
-// en tokenTransfers o en una token-account cuyo owner es la wallet, no en accountData[wallet].
-function extraerCambiosDeTxParaWallet(tx, walletAddress) {
-  const porMint = new Map();
-  const sumar = (mint, tokenDelta, solDeltaLamports, decimals = 6) => {
-    if (!mint || MINTS_A_IGNORAR.has(mint)) return;
-    const prev = porMint.get(mint) || { tokenDelta: 0, solDeltaLamports: 0, decimals };
-    prev.tokenDelta += tokenDelta;
-    prev.solDeltaLamports += solDeltaLamports;
-    prev.decimals = decimals;
-    porMint.set(mint, prev);
-  };
-
-  // 1. Native SOL transfers
-  let nativeSolSpent = 0; // positivo = gastó SOL
-  for (const nt of (tx.nativeTransfers || [])) {
-    const amount = numeroSeguro(nt.amount);
-    if (nt.fromUserAccount === walletAddress) nativeSolSpent += amount;
-    if (nt.toUserAccount === walletAddress) nativeSolSpent -= amount;
-  }
-
-  // 2. Token transfers (incluye wSOL)
-  const solSpentPorMint = new Map(); // mint -> lamports gastados en ese mint
-  const solReceivedPorMint = new Map(); // mint -> lamports recibidos por ese mint
-
-  for (const tt of (tx.tokenTransfers || [])) {
-    const amount = numeroSeguro(tt.tokenAmount);
-    if (!amount || !tt.mint) continue;
-
-    const isWSol = tt.mint === SOL_MINT;
-
-    if (tt.fromUserAccount === walletAddress) {
-      if (isWSol) {
-        // envió wSOL = gastó SOL en ese mint
-        solSpentPorMint.set(tt.mint, (solSpentPorMint.get(tt.mint) || 0) + amount);
-      }
-      sumar(tt.mint, -amount, 0, tt.decimals ?? 6);
-    }
-    if (tt.toUserAccount === walletAddress) {
-      if (isWSol) {
-        // recibió wSOL = recibió SOL por ese mint (venta)
-        solReceivedPorMint.set(tt.mint, (solReceivedPorMint.get(tt.mint) || 0) + amount);
-      }
-      sumar(tt.mint, amount, 0, tt.decimals ?? 6);
-    }
-  }
-
-  // 3. Account data balance changes
-  for (const acc of (tx.accountData || [])) {
-    if (acc.account === walletAddress) {
-      const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
-      if (nativeDelta < 0) nativeSolSpent += -nativeDelta; // gastó SOL nativo
-    }
-    for (const tbc of (acc.tokenBalanceChanges || [])) {
-      const owner = tbc.userAccount || tbc.owner || acc.account;
-      if (owner !== walletAddress) continue;
-      if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
-      const decimals = tbc.rawTokenAmount?.decimals ?? 6;
-      const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
-      const delta = rawAmount / Math.pow(10, decimals);
-      if (delta !== 0) {
-        let solDelta = 0;
-        if (tbc.mint === SOL_MINT) {
-          // wSOL balance change en lamports
-          solDelta = rawAmount; // positivo = recibió wSOL, negativo = gastó wSOL
-          if (solDelta < 0) {
-            solSpentPorMint.set(SOL_MINT, (solSpentPorMint.get(SOL_MINT) || 0) + -solDelta);
-          } else {
-            solReceivedPorMint.set(SOL_MINT, (solReceivedPorMint.get(SOL_MINT) || 0) + solDelta);
-          }
-        }
-        sumar(tbc.mint, delta, solDelta, decimals);
-      }
-    }
-  }
-
-  // 4. Emparejar SOL gastado con tokens recibidos
-  // Estrategia: si hay SOL gastado (native + wSOL enviado) y tokens recibidos,
-  // el SOL se asigna al mint que recibió tokens y NO tiene SOL recibido (venta).
-  const cambios = [];
-
-  // Primero: calcular neto de SOL gastado total
-  let totalSolSpentLamports = nativeSolSpent;
-  for (const v of solSpentPorMint.values()) totalSolSpentLamports += v;
-  for (const v of solReceivedPorMint.values()) totalSolSpentLamports -= v;
-
-  // Si no hay SOL neto gastado, no hay buys válidos
-  if (totalSolSpentLamports <= 0) {
-    // Solo pueden haber sells válidos
-    for (const [mint, info] of porMint.entries()) {
-      if (!info.tokenDelta) continue;
-      if (info.tokenDelta < 0) {
-        const solReceived = solReceivedPorMint.get(mint) || 0;
-        if (solReceived > 0) {
-          const solAmount = solReceived / LAMPORTS_PER_SOL;
-          cambios.push({
-            mint,
-            tokenAmount: Math.abs(info.tokenDelta),
-            solAmount,
-            direction: 'sell',
-            solAmountEstimado: false
-          });
-        }
-      }
-    }
-    return cambios;
-  }
-
-  // Hay SOL gastado neto: buscar mints donde recibió tokens (tokenDelta > 0)
-  const candidatosBuy = [];
-  for (const [mint, info] of porMint.entries()) {
-    if (info.tokenDelta > 0) {
-      // Recibió este token
-      const solReceived = solReceivedPorMint.get(mint) || 0;
-      if (solReceived === 0) {
-        // No recibió SOL por este mint -> candidato a buy
-        candidatosBuy.push({ mint, info });
-      }
-    }
-  }
-
-  // Asignar SOL gastado a los candidatos
-  // Heurística: repartir proporcionalmente al tokenAmount recibido, o todo al único
-  let solRestante = totalSolSpentLamports;
-  for (const c of candidatosBuy) {
-    if (solRestante <= 0) break;
-    const asignado = Math.min(solRestante, Math.max(c.info.solDeltaLamports, 0) || 1_000_000);
-    c.info.solDeltaLamports = -asignado; // negativo = gastó
-    solRestante -= asignado;
-  }
-
-  // Construir cambios finales
-  for (const [mint, info] of porMint.entries()) {
-    if (!info.tokenDelta) continue;
-
-    const tokenDelta = info.tokenDelta;
-    const solDeltaLamports = info.solDeltaLamports;
-
-    if (tokenDelta > 0 && solDeltaLamports < 0) {
-      // BUY válido: recibió tokens Y gastó SOL
-      cambios.push({
-        mint,
-        tokenAmount: tokenDelta,
-        solAmount: Math.abs(solDeltaLamports / LAMPORTS_PER_SOL),
-        direction: 'buy',
-        solAmountEstimado: false
-      });
-    } else if (tokenDelta < 0) {
-      // SELL: envió tokens
-      const solReceived = solReceivedPorMint.get(mint) || 0;
-      if (solReceived > 0) {
-        cambios.push({
-          mint,
-          tokenAmount: Math.abs(tokenDelta),
-          solAmount: solReceived / LAMPORTS_PER_SOL,
-          direction: 'sell',
-          solAmountEstimado: false
-        });
-      }
-      // Si tokenDelta < 0 pero no recibió SOL -> transfer out, ignorar
-    }
-    // tokenDelta > 0 sin SOL gastado -> airdrop/transfer in, ignorar
-  }
-
-  return cambios;
-}
-
-// ---------- Servidor webhook HTTP ----------
-function iniciarServidorWebhook() {
-  const server = http.createServer((req, res) => {
-    if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
-    const ip = req.socket.remoteAddress;
-    const now = Date.now();
-    if (!global._webhookRate) global._webhookRate = new Map();
-    const timestamps = global._webhookRate.get(ip) || [];
-    const recent = timestamps.filter(t => now - t < 1000);
-    if (recent.length >= 10) {
-      res.writeHead(429, { 'Content-Type': 'text/plain' });
-      res.end('Too Many Requests');
-      return;
-    }
-    recent.push(now);
-    global._webhookRate.set(ip, recent);
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      // Helius envía el secreto como header 'x-authheader' (o 'x-auth-header') por defecto.
-      // Aceptamos todas las variantes de casing/guiones para no rechazar envíos válidos.
-      const auth =
-        req.headers['x-authheader'] ||
-        req.headers['x-auth-header'] ||
-        req.headers['authheader'] ||
-        req.headers['AuthHeader'] ||
-        req.headers['authorization'];
-      if (auth !== HELIUS_WEBHOOK_SECRET) {
-        log('warn', `⚠️ Webhook rechazado: authHeader no coincide. Recibido="${auth ? auth.slice(0, 24) + '...' : '(vacío)'}" esperado="${HELIUS_WEBHOOK_SECRET.slice(0, 8)}..." — si Helius no coincide, corregir HELIUS_WEBHOOK_SECRET o el secret del webhook.`);
-        res.writeHead(401, { 'Content-Type': 'text/plain' });
-        res.end('Unauthorized');
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('ok');
-      procesarWebhookHelius(body).catch(e => log('error', `Error procesando webhook de Helius: ${e.message}, ${e.stack}`));
-    });
-  });
-  const port = process.env.PORT || 3000;
-  server.on('error', (e) => {
-    // Si el puerto ya está ocupado o no se puede hacer bind, se ve claro en logs.
-    log('error', `❌ Servidor de webhooks NO pudo escuchar en el puerto ${port}: ${e.message} (${e.code})`);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `❌ El servidor de webhooks no pudo levantarse (${e.code}) — los trades de DEX que NO son pump no llegarán. Revisa logs.`, { disable_notification: true }).catch(() => {});
-  });
-  server.listen(port, () => log('info', `🌐 Servidor de webhooks escuchando en el puerto ${port} (tipo ANY, cualquier DEX)`));
-}
-
-// ---------- Procesar webhook Helius ----------
-async function procesarWebhookHelius(rawBody) {
-  log('info', `📨 Webhook Helius recibido: ${rawBody.length} bytes`);
-  let eventos;
-  try {
-    eventos = JSON.parse(rawBody);
-  } catch (e) {
-    log('error', `📨 Webhook Helius: el body NO es JSON válido: ${e.message} — primeros 300 chars: ${rawBody.slice(0, 300)}`);
-    return;
-  }
-  if (!Array.isArray(eventos)) {
-    // ¿Es un objeto estilo PumpPortal ({signature, mint, traderPublicKey, txType, tokenAmount, solAmount})?
-    const esPumpPortal =
-      eventos.signature && eventos.mint && eventos.traderPublicKey &&
-      eventos.txType && eventos.tokenAmount !== undefined && eventos.solAmount !== undefined;
-
-    if (esPumpPortal) {
-      log('info', '📨 Webhook Helius: objeto estilo PumpPortal detectado, procesando directamente.');
-      const { mint, traderPublicKey, txType, tokenAmount, solAmount } = eventos;
-      const { rows: buscado } = await pool.query('SELECT * FROM tracked_wallets WHERE address=$1', [traderPublicKey]);
-      if (buscado.length === 0) {
-        log('warn', `📨 Objeto PumpPortal pero ${traderPublicKey} no está en tracked_wallets, se ignora.`);
-        return;
-      }
-      const tracked = buscado[0];
-      const direccion = (txType || '').toLowerCase() === 'buy' ? 'buy' : 'sell';
-      const trade = {
-        mint,
-        solAmount: Number(solAmount),
-        tokenAmount: Number(tokenAmount),
-        traderPublicKey,
-        chain: 'solana',
-        txType: direccion
-      };
-      const horaDeteccion = eventos.timestamp ? eventos.timestamp * 1000 : Date.now();
-      const origen = eventos.source === 'PUMP_FUN' ? 'PumpPortal' : 'OnChain';
-      if (direccion === 'buy') await handleTrackedBuy(tracked, trade, origen, horaDeteccion);
-      else await handleTrackedSell(tracked, trade, origen, horaDeteccion);
-      return;
-    }
-
-    log('info', `📨 Webhook Helius: el body es un objeto simple (tipo: ${typeof eventos}), se envuelve en arreglo.`);
-    eventos = [eventos];
-  }
-  log('info', `📨 Webhook Helius: ${eventos.length} transacción(es) en este lote`);
-  const { rows: trackedRows } = await pool.query('SELECT * FROM tracked_wallets');
-  const trackedMap = new Map(trackedRows.map(r => [r.address, r]));
-  for (const tx of eventos) {
-    const cuentasEnTx = (tx.accountData || []).map(a => a.account);
-    const participantesExtra = [];
-    for (const tt of (tx.tokenTransfers || [])) {
-      if (tt.fromUserAccount) participantesExtra.push(tt.fromUserAccount);
-      if (tt.toUserAccount) participantesExtra.push(tt.toUserAccount);
-    }
-    for (const nt of (tx.nativeTransfers || [])) {
-      if (nt.fromUserAccount) participantesExtra.push(nt.fromUserAccount);
-      if (nt.toUserAccount) participantesExtra.push(nt.toUserAccount);
-    }
-    const cuentasDetectadas = [...new Set([...cuentasEnTx, ...participantesExtra])];
-    const walletsInvolucradas = cuentasDetectadas.filter(a => trackedMap.has(a)).map(a => trackedMap.get(a).alias);
-    log('info', `📨 TX recibida: type=${tx.type || '(sin type)'} source=${tx.source || '(sin source)'} accountData.length=${cuentasEnTx.length} wallets-trackeadas=[${walletsInvolucradas.join(', ')}]`);
-    if (trackedRows.length === 0) continue;
-    const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
-    const cambiosProcesados = new Set();
-    for (const acc of (tx.accountData || [])) {
-      const tracked = trackedMap.get(acc.account);
-      if (!tracked) continue;
-      const cambios = extraerCambiosDeBalance(acc);
-      if (cambios.length === 0) {
-        log('info', `📨 ${tracked.alias} apareció en esta TX pero SIN cambio directo de balance — probando fallback global de Helius.`);
-      }
-      for (const cambio of cambios) {
-        const key = `${tracked.address}:${cambio.mint}:${cambio.direction}`;
-        cambiosProcesados.add(key);
-        log('info', `🌐 Actividad detectada: ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
-        const tradeCompatible = {
-          mint: cambio.mint,
-          solAmount: cambio.solAmount,
-          tokenAmount: cambio.tokenAmount,
-          solAmountEstimado: cambio.solAmountEstimado,
-          traderPublicKey: tracked.address,
-          txType: cambio.direction
-        };
-        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
-        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
-        else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
-      }
-    }
-
-    for (const tracked of trackedRows) {
-      if (!cuentasDetectadas.includes(tracked.address)) continue;
-      const cambiosFallback = extraerCambiosDeTxParaWallet(tx, tracked.address);
-      for (const cambio of cambiosFallback) {
-        const key = `${tracked.address}:${cambio.mint}:${cambio.direction}`;
-        if (cambiosProcesados.has(key)) continue;
-        cambiosProcesados.add(key);
-        log('info', `🌐 Actividad detectada (fallback Helius): ${tracked.alias} ${cambio.direction} ${cambio.mint.slice(0, 6)}... · ${cambio.solAmount.toFixed(4)} SOL (fuente: ${tx.source || 'desconocida'})`);
-        const tradeCompatible = {
-          mint: cambio.mint,
-          solAmount: cambio.solAmount,
-          tokenAmount: cambio.tokenAmount,
-          solAmountEstimado: cambio.solAmountEstimado,
-          traderPublicKey: tracked.address,
-          txType: cambio.direction
-        };
-        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
-        if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
-        else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
-      }
-    }
-  }
-}
+// ---------- WebSocket PumpPortal ----------
+function conectarWS() { if (!process.env.PUMPPORTAL_API_KEY) { log('warn', 'PUMPPORTAL_API_KEY no está definida; se omite conexión WS a PumpPortal'); return; } if (ws && ws.readyState === WebSocket.OPEN) return; log('info', 'Conectando WebSocket a PumpPortal...'); ws = new WebSocket(PUMP_PORTAL_WS); ws.on('open', () => { log('info', 'WebSocket PumpPortal conectado'); wsReconnectAttempts = 0; if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } resyncSubscriptions(); }); ws.on('message', (data) => { try { const msg = JSON.parse(data.toString()); if (msg.pong) return; procesarWebhookHelius(JSON.stringify(msg)); } catch (e) { log('error', `Error procesando mensaje WS: ${e.message}`); } }); ws.on('error', (err) => { log('error', `WebSocket error: ${err.message}`); }); ws.on('close', (code, reason) => { log('warn', `WebSocket cerrado (${code}): ${reason}. Intentando reconexión...`); ws = null; scheduleWSReconnect(); }); }
+function scheduleWSReconnect() { if (wsReconnectTimer) return; const delay = Math.min(1000 * 2 ** ++wsReconnectAttempts, 30000); log('info', `Reconexión WS en ${delay}ms (intento ${wsReconnectAttempts})`); wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; conectarWS(); }, delay); }
+function resyncSubscriptions() { if (!ws || ws.readyState !== WebSocket.OPEN) { log('info', 'WS no está listo todavía, se sincronizará completo en la próxima conexión'); return; } pool.query('SELECT alias, address FROM tracked_wallets').then(({ rows }) => { if (rows.length > 0) { ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: rows.map(r => r.address) })); const aliases = rows.map(r => r.alias).join(', ') || 'ninguna'; log('info', `🔁 Resincronizado (PumpPortal): escuchando ${rows.length} wallets (${aliases})`); } }).catch(e => log('error', `Error resincronizando suscripciones: ${e.message}`)); }
 
 // ---------- Comandos de Telegram ----------
-bot.onText(/\/add (.+)/, async (msg, match) => {
-  try {
-    const args = match[1].trim().split(/\s+/);
-    const [alias, address, amountStr, chainRaw] = args;
-    const amount = parseFloat(amountStr);
-    const chain = normalizeChain(chainRaw);
-    await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]);
-    await resyncSubscriptions();
-    await crearOActualizarWebhookHelius();
-    bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
-    const holdings = await getHoldings(address);
-    for (const h of holdings) {
-      const mint = h.mint;
-      if (!mint) continue;
-      await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]);
-    }
-    bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y cualquier DEX ✅`);
-  } catch (e) {
-    log('error', `Error en /add: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-bot.onText(/\/setamount (\S+) (\S+)/, async (msg, match) => {
-  try {
-    const alias = match[1];
-    const nuevoMonto = parseFloat(match[2]);
-    if (isNaN(nuevoMonto) || nuevoMonto <= 0) {
-      bot.sendMessage(msg.chat.id, '⚠️ Monto inválido. Usa: /setamount alias nuevo_monto (ej. /setamount CAP 6)');
-      return;
-    }
-    const result = await pool.query('UPDATE tracked_wallets SET amount=$1 WHERE alias=$2 RETURNING alias, amount', [nuevoMonto, alias]);
-    if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `✅ ${alias} ahora usa $${nuevoMonto} USD por compra (efectivo desde la próxima señal).`);
-    else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
-  } catch (e) {
-    log('error', `Error en /setamount: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-bot.onText(/\/remove (.+)/, async (msg, match) => {
-  try {
-    const alias = match[1];
-    const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
-    if (result.rows.length > 0) {
-      bot.sendMessage(msg.chat.id, `✅ ${alias} eliminado de tracked_wallets.`);
-      await resyncSubscriptions();
-      await crearOActualizarWebhookHelius();
-    } else {
-      bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
-    }
-  } catch (e) {
-    log('error', `Error in /remove: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-bot.onText(/\/list/, async (msg) => {
-  try {
-    const { rows } = await pool.query('SELECT alias, address, amount, chain FROM tracked_wallets ORDER BY alias');
-    if (rows.length === 0) {
-      bot.sendMessage(msg.chat.id, '📭 No hay wallets trackeadas.');
-      return;
-    }
-    const lines = rows.map(r => `• ${r.alias} [${getLabel(r.chain)}] ${r.address} ($${r.amount})`);
-    bot.sendMessage(msg.chat.id, `📋 Wallets trackeadas:\n${lines.join('\n')}`);
-  } catch (e) {
-    log('error', `Error en /list: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-bot.onText(/\/diag (.+)/, async (msg, match) => {
-  try {
-    const alias = match[1];
-    const diag = await diagnosticoHelius(alias);
-    if (diag.error) {
-      bot.sendMessage(msg.chat.id, `❌ Error en diagnóstico: ${diag.error}`);
-      return;
-    }
-    const { webhookInfo, historial, address, alias: diagAlias, saludWebhook } = diag;
-    let txt = `🔍 Diagnóstico de ${diagAlias} (${address})\n`;
-    txt += `🪝 Webhook registrado: ${webhookInfo.error ? '❌ ' + webhookInfo.error : '✅ OK'}\n`;
-    if (!webhookInfo.error && webhookInfo.webhookURL) txt += `🔗 URL: ${webhookInfo.webhookURL}\n`;
-    if (!webhookInfo.error && webhookInfo.transactionTypes) txt += `📦 Tipos: ${webhookInfo.transactionTypes.join(', ')}\n`;
-    if (saludWebhook) {
-      txt += `\n📈 *Salud del webhook*:\n`;
-      txt += `• Activo: ${saludWebhook.active === null ? 'n/d' : (saludWebhook.active ? '✅ sí' : '❌ NO')}\n`;
-      txt += `• Failure rate (24h): ${saludWebhook.failureRate === null ? 'n/d' : (saludWebhook.failureRate * 100).toFixed(1) + '%'}\n`;
-      txt += `• Cooldown: ${saludWebhook.isUnderCooldown === null ? 'n/d' : (saludWebhook.isUnderCooldown ? '🔴 SÍ (Helius suspendió envíos)' : 'no')}\n`;
-      txt += `• Último envío: ${saludWebhook.lastSentAt || 'nunca'}\n`;
-      if (saludWebhook.lastError) txt += `• Último error: ${saludWebhook.lastError}\n`;
-    }
-    txt += `📜 Últimas 10 tx: ${historial.error ? '❌ ' + historial.error : `✅ ${historial.length} transacciones obtenidas`}`;
-    bot.sendMessage(msg.chat.id, txt);
-  } catch (e) {
-    log('error', `Error en /diag: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-bot.onText(/\/status/, async (msg) => {
-  try {
-    const modo = MODO_ACTUAL.toUpperCase();
-    const solPrice = await getSolPriceUSD();
-    const solBal = LIVE ? await getWalletSolBalance() : 'N/A (paper)';
-    const paper = await getPaperBalance();
-    let txt = `🤖 Estado del bot\n`;
-    txt += `⚙️ Modo: ${modo}\n`;
-    txt += `💵 Precio SOL: $${solPrice?.toFixed(2) ?? 'N/A'}\n`;
-    txt += `💰 SOL en wallet: ${typeof solBal === 'number' ? solBal.toFixed(4) : solBal}\n`;
-    txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc})\n`;
-    bot.sendMessage(msg.chat.id, txt);
-  } catch (e) {
-    log('error', `Error en /status: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-// ---------- NUEVO: /help ----------
-bot.onText(/\/help/, async (msg) => {
-  const ayuda = `
-🤖 *Comandos disponibles*:
-/add <alias> <dirección> <montoUSD> [cadena]   – Agrega una wallet a seguir (ej. /add miwallet 5EsYuW... 10 sol)
-/setamount <alias> <nuevoMontoUSD>            – Cambia el monto USD por compra para esa alias
-/remove <alias>                               – Elimina una wallet de seguimiento
-/list                                          – Lista todas las wallets trackeadas
-/diag <alias>                                 – Diagnóstico de webhook y últimas tx de una wallet
-/status                                        – Estado general del bot (modo, precio SOL, balances)
-/positions                                     – Muestra las posiciones abiertas del bot
-/ranking [real|paper]                          – Ranking wallets por PnL (modo actual o forzado)
-/pnl                                           – PnL rápido: realizado + no realizado + total
-/help                                          – Esta ayuda
-`;
-  bot.sendMessage(msg.chat.id, ayuda, { parse_mode: 'Markdown' });
-});
-// ---------- NUEVO: /positions ----------
-bot.onText(/\/positions/, async (msg) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT bp.token_mint, bp.symbol, bp.chain, bp.amount, bp.cost_basis_sol, bp.wallet_alias, bp.modo
-      FROM bot_positions bp
-      WHERE bp.modo = $1
-    `, [MODO_ACTUAL]);
-    if (rows.length === 0) {
-      bot.sendMessage(msg.chat.id, `📭 No hay posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}.`);
-      return;
-    }
-    const lines = rows.map(r => {
-      const modoTag = r.modo === 'real' ? '🟢 REAL' : '🟡 PAPER';
-      return `• ${r.symbol} (${r.chain}) – ${r.amount.toFixed(4)} tokens – costo ${r.cost_basis_sol.toFixed(4)} SOL – wallet: ${r.wallet_alias} [${modoTag}]`;
-    });
-    bot.sendMessage(msg.chat.id, `📊 *Posiciones abiertas* (${MODO_ACTUAL.toUpperCase()}):\n${lines.join('\n')}`);
-  } catch (e) {
-    log('error', `Error en /positions: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-
-// ---------- NUEVO: /ranking ----------
-bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
-  try {
-    const modoFiltro = match[1]?.toLowerCase();
-    const modo = modoFiltro === 'real' ? 'real' : modoFiltro === 'paper' ? 'paper' : MODO_ACTUAL;
-    const { rows } = await pool.query(`
-      SELECT
-        wallet_alias,
-        COUNT(*) as trades,
-        SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END) as wins,
-        SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END) as losses,
-        SUM(profit_sol) as total_profit_sol,
-        AVG(profit_sol) as avg_profit_sol,
-        MAX(profit_sol) as best_trade,
-        MIN(profit_sol) as worst_trade
-      FROM trade_history
-      WHERE modo = $1
-      GROUP BY wallet_alias
-      ORDER BY total_profit_sol DESC
-    `, [modo]);
-    if (rows.length === 0) {
-      bot.sendMessage(msg.chat.id, `📭 No hay historial en modo ${modo.toUpperCase()}.`);
-      return;
-    }
-    const lines = rows.map((r, i) => {
-      const wr = r.trades > 0 ? ((r.wins / r.trades) * 100).toFixed(1) : '0.0';
-      const emoji = (r.total_profit_sol || 0) >= 0 ? '🟢' : '🔴';
-      const best = r.best_trade !== null ? parseFloat(r.best_trade).toFixed(4) : '0.0000';
-      const worst = r.worst_trade !== null ? parseFloat(r.worst_trade).toFixed(4) : '0.0000';
-      const total = (r.total_profit_sol !== null ? r.total_profit_sol : 0).toFixed(4);
-      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${r.trades} trades, ${wr}% WR, best ${best}, worst ${worst})`;
-    });
-    bot.sendMessage(msg.chat.id, `🏆 *Ranking wallets* (${modo.toUpperCase()}):\n${lines.join('\n')}`);
-  } catch (e) {
-    log('error', `Error en /ranking: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-
-// ---------- NUEVO: /pnl ----------
-bot.onText(/\/pnl/, async (msg) => {
-  try {
-    const { rows: hist } = await pool.query(`
-      SELECT SUM(profit_sol) as realized_sol
-      FROM trade_history
-      WHERE modo = $1
-    `, [MODO_ACTUAL]);
-    const realizedSol = hist[0]?.realized_sol || 0;
-
-    const { rows: pos } = await pool.query(`
-      SELECT bp.*, tw.address as wallet_address
-      FROM bot_positions bp
-      JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias
-      WHERE bp.modo = $1
-    `, [MODO_ACTUAL]);
-
-    let unrealizedSol = 0;
-    if (pos.length > 0) {
-      for (const p of pos) {
-        const { decimals } = await getTokenInfoHelius(p.token_mint);
-        const valor = await estimarValorEnSol(p.token_mint, p.amount, decimals);
-        if (valor !== null) unrealizedSol += valor - p.cost_basis_sol;
-      }
-    }
-
-    const totalSol = realizedSol + unrealizedSol;
-    const emoji = totalSol >= 0 ? '🟢' : '🔴';
-
-    let txt = `💰 *PnL ${MODO_ACTUAL.toUpperCase()}* ${emoji}\n`;
-    txt += `🔒 Realizado: ${realizedSol.toFixed(4)} SOL\n`;
-    if (pos.length > 0) {
-      txt += `📈 No realizado: ${unrealizedSol.toFixed(4)} SOL (${pos.length} pos abiertas)\n`;
-    }
-    txt += `🧮 Total: ${totalSol.toFixed(4)} SOL`;
-    const solPrice = await getSolPriceUSD();
-    if (solPrice) txt += ` (~$${(totalSol * solPrice).toFixed(2)})`;
-    bot.sendMessage(msg.chat.id, txt);
-  } catch (e) {
-    log('error', `Error en /pnl: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
-  }
-});
-
-// ---------- NUEVO: /cleanup ----------
-bot.onText(/\/cleanup/, async (msg) => {
-  try {
-    const modo = MODO_ACTUAL;
-    const { rows: tracked } = await pool.query('SELECT alias FROM tracked_wallets');
-    const trackedAliases = tracked.map(r => r.alias);
-    const { rowCount } = await pool.query(
-      `DELETE FROM bot_positions WHERE wallet_alias NOT IN ($1) AND modo = $2`,
-      [trackedAliases.length ? `'${trackedAliases.join(',')}'` : "''", modo]
-    );
-    bot.sendMessage(msg.chat.id, `🧹 Cleanup ${modo.toUpperCase()}: ${rowCount} posición(es) de wallets no trackeadas eliminada(s).`);
-  } catch (e) {
-    log('error', `Error en /cleanup: ${e.message}`, e.stack);
-    bot.sendMessage(msg.chat.id, 'Error en cleanup: ' + e.message);
-  }
-});
-
-bot.onText(/\/fixwebhook/, async (msg) => {
-  try {
-    await pool.query('DELETE FROM global_balance WHERE id = 1');
-    await pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id');
-    bot.sendMessage(msg.chat.id, '✅ global_balance actualizado con webhook ID existente. Reinicia el bot en Railway para que cargue el nuevo código.');
-  } catch (e) {
-    bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
-  }
-});
-
+bot.onText(/\\/add (.+)/, async (msg, match) => { try { const args = match[1].trim().split(/\\s+/); const [alias, address, amountStr, chainRaw] = args; const amount = parseFloat(amountStr); const chain = normalizeChain(chainRaw); await pool.query('INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4', [alias, address, amount, chain]); await resyncSubscriptions(); await crearOActualizarWebhookHelius(); bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`); const holdings = await getHoldings(address); for (const h of holdings) { const mint = h.mint; if (!mint) continue; await pool.query('INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING', [address, mint]); } bot.sendMessage(msg.chat.id, `✅ ${alias} agregado [${getLabel(chain)}] $${amount} USD por compra (fees y red incluidos). Snapshot real: ${holdings.length} tokens vistos. Escuchando pump.fun ✅ y cualquier DEX ✅`); } catch (e) { log('error', `Error en /add: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/setamount (\\S+) (\\S+)/, async (msg, match) => { try { const alias = match[1]; const nuevoMonto = parseFloat(match[2]); if (isNaN(nuevoMonto) || nuevoMonto <= 0) { bot.sendMessage(msg.chat.id, '⚠️ Monto inválido. Usa: /setamount alias nuevo_monto (ej. /setamount CAP 6)'); return; } const result = await pool.query('UPDATE tracked_wallets SET amount=$1 WHERE alias=$2 RETURNING alias, amount', [nuevoMonto, alias]); if (result.rows.length > 0) bot.sendMessage(msg.chat.id, `✅ ${alias} ahora usa $${nuevoMonto} USD por compra (efectivo desde la próxima señal).`); else bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"); } catch (e) { log('error', `Error en /setamount: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/remove (.+)/, async (msg, match) => { try { const alias = match[1]; const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]); if (result.rows.length > 0) { bot.sendMessage(msg.chat.id, `✅ ${alias} eliminado de tracked_wallets.`); await resyncSubscriptions(); await crearOActualizarWebhookHelius(); } else { bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"); } } catch (e) { log('error', `Error in /remove: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/list/, async (msg) => { try { const { rows } = await pool.query('SELECT alias, address, amount, chain FROM tracked_wallets ORDER BY alias'); if (rows.length === 0) { bot.sendMessage(msg.chat.id, '📭 No hay wallets trackeadas.'); return; } const lines = rows.map(r => `• ${r.alias} [${getLabel(r.chain)}] ${r.address} ($${r.amount})`); bot.sendMessage(msg.chat.id, `📋 Wallets trackeadas:\\n${lines.join('\\n')}`); } catch (e) { log('error', `Error en /list: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/diag (.+)/, async (msg, match) => { try { const alias = match[1]; const diag = await diagnosticoHelius(alias); if (diag.error) { bot.sendMessage(msg.chat.id, `❌ Error en diagnóstico: ${diag.error}`); return; } const { webhookInfo, historial, address, alias: diagAlias, saludWebhook } = diag; let txt = `🔍 Diagnóstico de ${diagAlias} (${address})\\n`; txt += `🪝 Webhook registrado: ${webhookInfo.error ? '❌ ' + webhookInfo.error : '✅ OK'}\\n`; if (!webhookInfo.error && webhookInfo.webhookURL) txt += `🔗 URL: ${webhookInfo.webhookURL}\\n`; if (saludWebhook) { txt += `\\n📈 *Salud del webhook*:\\n`; txt += `• Activo: ${saludWebhook.active === null ? 'n/d' : (saludWebhook.active ? '✅ sí' : '❌ NO')}\\n`; txt += `• Failure rate (24h): ${saludWebhook.failureRate === null ? 'n/d' : (saludWebhook.failureRate * 100).toFixed(1) + '%'}\\n`; txt += `• Cooldown: ${saludWebhook.isUnderCooldown === null ? 'n/d' : (saludWebhook.isUnderCooldown ? '🔴 SÍ (Helius suspendió envíos)' : 'no')}\\n`; txt += `• Último envío: ${saludWebhook.lastSentAt || 'nunca'}\\n`; if (saludWebhook.lastError) txt += `• Último error: ${saludWebhook.lastError}\\n`; txt += `📜 Últimas 10 tx: ${historial.error ? '❌ ' + historial.error : `✅ ${historial.length} transacciones obtenidas`}`; bot.sendMessage(msg.chat.id, txt); } catch (e) { log('error', `Error en /diag: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/status/, async (msg) => { try { const modo = MODO_ACTUAL.toUpperCase(); const solPrice = await getSolPriceUSD(); const solBal = LIVE ? await getWalletSolBalance() : 'N/A (paper)'; const paper = await getPaperBalance(); let txt = `🤖 Estado del bot\\n`; txt += `⚙️ Modo: ${modo}\\n`; txt += `💵 Precio SOL: $${solPrice?.toFixed(2) ?? 'N/A'}\\n`; txt += `💰 SOL en wallet: ${typeof solBal === 'number' ? solBal.toFixed(4) : solBal}\\n`; txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc})\\n`; bot.sendMessage(msg.chat.id, txt); } catch (e) { log('error', `Error en /status: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/help/, async (msg) => { const ayuda = `\n🤖 *Comandos disponibles*:\n/add <alias> <dirección> <montoUSD> [cadena]   – Agrega una wallet a seguir (ej. /add miwallet 5EsYuW... 10 sol)\n/setamount <alias> <nuevoMontoUSD>            – Cambia el monto USD por compra para esa alias\n/remove <alias>                               – Elimina una wallet de seguimiento\n/list                                          – Lista todas las wallets trackeadas\n/diag <alias>                                 – Diagnóstico de webhook y últimas tx de una wallet\n/status                                        – Estado general del bot (modo, precio SOL, balances)\n/positions                                     – Muestra las posiciones abiertas del bot\n/ranking [real|paper]                          – Ranking wallets por PnL (modo actual o forzado)\n/pnl                                           – PnL rápido: realizado + no realizado + total\n/help                                          – Esta ayuda`; bot.sendMessage(msg.chat.id, ayuda, { parse_mode: 'Markdown' }); });
+bot.onText(/\\/positions/, async (msg) => { try { const { rows } = await pool.query(`SELECT bp.token_mint, bp.symbol, bp.chain, bp.amount, bp.cost_basis_sol, bp.wallet_alias, bp.modo FROM bot_positions bp WHERE bp.modo = $1`, [MODO_ACTUAL]); if (rows.length === 0) { bot.sendMessage(msg.chat.id, `📭 No hay posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}.`); return; } const lines = rows.map(r => `• ${r.symbol} (${r.chain}) – ${r.amount.toFixed(4)} tokens – costo ${r.cost_basis_sol.toFixed(4)} SOL – wallet: ${r.wallet_alias} [${r.modo === 'real' ? '🟢 REAL' : '🟡 PAPER'}]`); bot.sendMessage(msg.chat.id, `📊 *Posiciones abiertas* (${MODO_ACTUAL.toUpperCase()}):\\n${lines.join('\\n')}`); } catch (e) { log('error', `Error en /positions: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/ranking(?:\\s+(\\S+))?/, async (msg, match) => { try { const modoFiltro = match[1]?.toLowerCase(); const modo = modoFiltro === 'real' ? 'real' : modoFiltro === 'paper' ? 'paper' : MODO_ACTUAL; const { rows } = await pool.query(`SELECT wallet_alias, COUNT(*) as trades, SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END) as losses, SUM(profit_sol) as total_profit_sol, AVG(profit_sol) as avg_profit_sol, MAX(profit_sol) as best_trade, MIN(profit_sol) as worst_trade FROM trade_history WHERE modo = $1 GROUP BY wallet_alias ORDER BY total_profit_sol DESC`, [modo]); if (rows.length === 0) { bot.sendMessage(msg.chat.id, `📭 No hay historial en modo ${modo.toUpperCase()}.`); return; } const lines = rows.map((r, i) => { const wr = r.trades > 0 ? ((r.wins / r.trades) * 100).toFixed(1) : '0.0'; const emoji = (r.total_profit_sol || 0) >= 0 ? '🟢' : '🔴'; const best = r.best_trade !== null ? parseFloat(r.best_trade).toFixed(4) : '0.0000'; const worst = r.worst_trade !== null ? parseFloat(r.worst_trade).toFixed(4) : '0.0000'; const total = (r.total_profit_sol !== null ? r.total_profit_sol : 0).toFixed(4); return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${r.trades} trades, ${wr}% WR, best ${best}, worst ${worst})`; }); bot.sendMessage(msg.chat.id, `🏆 *Ranking wallets* (${modo.toUpperCase()}):\\n${lines.join('\\n')}`); } catch (e) { log('error', `Error en /ranking: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/pnl/, async (msg) => { try { const { rows: hist } = await pool.query(`SELECT SUM(profit_sol) as realized_sol FROM trade_history WHERE modo = $1`, [MODO_ACTUAL]); const realizedSol = hist[0]?.realized_sol || 0; const { rows: pos } = await pool.query(`SELECT bp.*, tw.address as wallet_address FROM bot_positions bp JOIN tracked_wallets tw ON tw.alias = bp.wallet_alias WHERE bp.modo = $1`, [MODO_ACTUAL]); let unrealizedSol = 0; if (pos.length > 0) { for (const p of pos) { const { decimals } = await getTokenInfoHelius(p.token_mint); const valor = await estimarValorEnSol(p.token_mint, p.amount, decimals); if (valor !== null) unrealizedSol += valor - p.cost_basis_sol; } } const totalSol = realizedSol + unrealizedSol; const emoji = totalSol >= 0 ? '🟢' : '🔴'; let txt = `💰 *PnL ${MODO_ACTUAL.toUpperCase()}* ${emoji}\\n`; txt += `🔒 Realizado: ${realizedSol.toFixed(4)} SOL\\n`; if (pos.length > 0) { txt += `📈 No realizado: ${unrealizedSol.toFixed(4)} SOL (${pos.length} pos abiertas)\\n`; } txt += `🧮 Total: ${totalSol.toFixed(4)} SOL`; const solPrice = await getSolPriceUSD(); if (solPrice) txt += ` (~$${(totalSol * solPrice).toFixed(2)})`; bot.sendMessage(msg.chat.id, txt); } catch (e) { log('error', `Error en /pnl: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error: ' + e.message); } });
+bot.onText(/\\/cleanup/, async (msg) => { try { const modo = MODO_ACTUAL; const { rows: tracked } = await pool.query('SELECT alias FROM tracked_wallets'); const trackedAliases = tracked.map(r => r.alias); const { rowCount } = await pool.query(`DELETE FROM bot_positions WHERE wallet_alias NOT IN ($1) AND modo = $2`, [trackedAliases.length ? `'${trackedAliases.join(',')}'` : \"''\", modo]); bot.sendMessage(msg.chat.id, `🧹 Cleanup ${modo.toUpperCase()}: ${rowCount} posición(es) de wallets no trackeadas eliminada(s).`); } catch (e) { log('error', `Error en /cleanup: ${e.message}`, e.stack); bot.sendMessage(msg.chat.id, 'Error en cleanup: ' + e.message); } });
+bot.onText(/\\/fixwebhook/, async (msg) => { try { await pool.query('DELETE FROM global_balance WHERE id = 1'); await pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \\'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id'); bot.sendMessage(msg.chat.id, '✅ global_balance actualizado con webhook ID existente. Reinicia el bot en Railway para que cargue el nuevo código.'); } catch (e) { bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message); } });
 // ---------- Inicialización ----------
-(async () => {
-  await initDB();
-  await initBaselineReal();
-  conectarWS();
-  crearOActualizarWebhookHelius();
-  iniciarServidorWebhook();
-
-  setInterval(reconciliarPosiciones, 60_000);
-  setInterval(revisarStopLoss, 60_000);
-  setInterval(monitoreoAutomaticoWebhook, 600_000);
-  // Cada 5 min: si Helius deshabilitó el webhook, reactivarlo automáticamente.
-  setInterval(() => {
-    const apiKey = getHeliusApiKey();
-    if (!apiKey) return;
-    pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')
-      .then(({ rows }) => {
-        const webhookId = rows[0]?.helius_webhook_id;
-        if (webhookId) verificarEstadoWebhook(apiKey, webhookId);
-      })
-      .catch(e => log('error', `Error en chequeo periódico del webhook: ${e.message}`));
-  }, 300_000);
-  setInterval(async () => {
-    const marca = new Date().toISOString();
-
-    log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
-  }, 300_000);
-
-  const shutdown = async () => {
-    log('info', 'Recibida señal de apagado, cerrando conexiones...');
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-    await pool.end();
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-})();
+(async () => { await initDB(); await initBaselineReal(); conectarWS(); crearOActualizarWebhookHelius(); setInterval(reconciliarPosiciones, 60_000); setInterval(revisarStopLoss, 60_000); setInterval(monitoreoAutomaticoWebhook, 600_000); setInterval(() => { const apiKey = getHeliusApiKey(); if (!apiKey) return; pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1').then(({ rows }) => { const webhookId = rows[0]?.helius_webhook_id; if (webhookId) verificarEstadoWebhook(apiKey, webhookId); }).catch(e => log('error', `Error en chequeo periódico del webhook: ${e.message}`)); }, 300_000); setInterval(async () => { const marca = new Date().toISOString(); log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`); }, 300_000); const shutdown = async () => { log('info', 'Recibida señal de apagado, cerrando conexiones...'); if (ws && ws.readyState === WebSocket.OPEN) ws.close(); await pool.end(); process.exit(0); }; process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown); })();
