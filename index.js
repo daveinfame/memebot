@@ -439,54 +439,66 @@ function resyncSubscriptions() {
 }
 
 // ---------- Webhook Helius ----------
-function crearOActualizarWebhookHelius() {
+async function crearOActualizarWebhookHelius() {
   const apiKey = getHeliusApiKey();
   if (!apiKey) { log('error', '⚠️ No se pudo extraer el api-key de HELIUS_RPC_URL — el webhook no se puede configurar'); return; }
-  pool.query('SELECT address, alias FROM tracked_wallets')
-    .then(({ rows: walletRows }) => {
-      const direcciones = walletRows.map(r => r.address);
-      const aliases = walletRows.map(r => r.alias);
-      pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id')
-        .catch(e => log('warn', 'Nota: global_balance ya existe o no se pudo crear'))
-        .then(() => pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1')).then(({ rows }) => {
-          const webhookIdExistente = rows[0]?.helius_webhook_id;
-          const payload = {
-            webhookURL: HELIUS_WEBHOOK_URL,
-            transactionTypes: ['ANY'],
-            accountAddresses: direcciones,
-            webhookType: 'enhanced',
-            authHeader: HELIUS_WEBHOOK_SECRET
-          };
-          if (webhookIdExistente) {
-            return fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ...payload, active: true })
-            })
-              .then(async res => {
-                if (!res.ok) throw new Error(`Error actualizando webhook de Helius: ${res.status} ${await res.text()}`);
-                log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
-              })
-              .then(() => verificarEstadoWebhook(apiKey, webhookIdExistente));
-          } else {
-            return fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            })
-              .then(async res => {
-                if (!res.ok) throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`);
-                return res.json();
-              })
-              .then(data => {
-                return pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID])
-                  .then(() => log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`))
-                  .then(() => verificarEstadoWebhook(apiKey, data.webhookID));
-              });
-          }
+  try {
+    const { rows: walletRows } = await pool.query('SELECT address, alias FROM tracked_wallets');
+    const direcciones = walletRows.map(r => r.address);
+    const aliases = walletRows.map(r => r.alias);
+
+    await pool.query('INSERT INTO global_balance (id) VALUES (1) ON CONFLICT (id) DO NOTHING');
+    const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
+    let webhookIdExistente = gb[0]?.helius_webhook_id;
+
+    const payload = {
+      webhookURL: HELIUS_WEBHOOK_URL,
+      transactionTypes: ['ANY'],
+      accountAddresses: direcciones,
+      webhookType: 'enhanced',
+      authHeader: HELIUS_WEBHOOK_SECRET
+    };
+
+    let exito = false;
+    if (webhookIdExistente) {
+      try {
+        const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookIdExistente}?api-key=${apiKey}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...payload, active: true })
         });
-    })
-    .catch(e => log('error', `Error configurando webhook de Helius: ${e.message}`));
+        if (res.ok) {
+          log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
+          exito = true;
+        } else {
+          log('warn', `⚠️ No se pudo actualizar webhook ${webhookIdExistente} (${res.status}), se creará uno nuevo`);
+        }
+      } catch (err) {
+        log('warn', `⚠️ Error haciendo PUT a webhook existente: ${err.message}`);
+      }
+    }
+
+    if (!exito) {
+      const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`);
+      }
+      const data = await res.json();
+      await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]);
+      webhookIdExistente = data.webhookID;
+      log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
+    }
+
+    if (webhookIdExistente) {
+      await verificarEstadoWebhook(apiKey, webhookIdExistente);
+    }
+  } catch (e) {
+    log('error', `Error configurando webhook de Helius: ${e.message}`);
+  }
 }
 
 // Verifica que el webhook esté ACTIVO; si no, lo reactiva (Helius lo auto-deshabilita tras fallos).
@@ -528,35 +540,39 @@ async function monitoreoAutomaticoWebhook() {
     const webhookId = gb[0]?.helius_webhook_id;
 
     if (!webhookId) {
-      log('warn', '⚠️ No hay webhookId guardado — se intentará crear al terminar');
+      log('warn', '⚠️ No hay webhookId guardado — creando webhook...');
+      await crearOActualizarWebhookHelius();
       return;
     }
 
     const res = await fetch(`https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${apiKey}`);
+    if (!res.ok) {
+      log('warn', `⚠️ GET webhook en Helius falló con status ${res.status} — recreando webhook...`);
+      await pool.query('UPDATE global_balance SET helius_webhook_id=NULL WHERE id=1');
+      await crearOActualizarWebhookHelius();
+      return;
+    }
     const webhookInfo = await res.json();
 
     const failureRate = webhookInfo.failureRate ?? null;
     const lastSentAt = webhookInfo.lastSentAt ? new Date(webhookInfo.lastSentAt) : null;
     const active = webhookInfo.active ?? null;
 
-    const hace10min = new Date(Date.now() - 10 * 60 * 1000);
-
     const necesitaRecrear =
-      failureRate === null || isNaN(failureRate) ||
-      lastSentAt === null || lastSentAt < hace10min ||
-      active === false;
+      active === false ||
+      (failureRate !== null && failureRate > 0.5);
 
     if (necesitaRecrear) {
-      log('warn', '🪝 Webhook detectado como caído o sin deliveries — recreando automáticamente...');
-      await pool.query('DELETE FROM global_balance WHERE id=1');
+      log('warn', '🪝 Webhook detectado como inactivo o con alta tasa de fallos — recreando...');
+      await pool.query('UPDATE global_balance SET helius_webhook_id=NULL WHERE id=1');
       await crearOActualizarWebhookHelius();
       if (CHAT_ID) {
         try {
-          await bot.sendMessage(CHAT_ID, '🪝 Webhook auto-recreado: Helius volvía a estar sin deliveries. Se ha creado uno nuevo y el bot re-suscrito.');
+          await bot.sendMessage(CHAT_ID, '🪝 Webhook auto-recreado: Helius lo tenía inactivo o con fallos.');
         } catch (e) {}
       }
     } else {
-      log('info', `✅ Monitoreo webhook: OK — failureRate=${failureRate}, último envío=${lastSentAt.toLocaleString('es-MX', {timeZone:'America/Mexico_City'})}`);
+      log('info', `✅ Monitoreo webhook: OK — failureRate=${failureRate}, último envío=${lastSentAt ? lastSentAt.toLocaleString('es-MX', {timeZone:'America/Mexico_City'}) : 'nunca'}`);
     }
   } catch (e) {
     log('error', `Error en monitoreo automático de webhook: ${e.message}`);
@@ -1410,12 +1426,14 @@ async function procesarWebhookHelius(rawBody) {
         mint,
         solAmount: Number(solAmount),
         tokenAmount: Number(tokenAmount),
+        vSolInBondingCurve: eventos.vSolInBondingCurve ? Number(eventos.vSolInBondingCurve) : undefined,
+        vTokensInBondingCurve: eventos.vTokensInBondingCurve ? Number(eventos.vTokensInBondingCurve) : undefined,
         traderPublicKey,
         chain: 'solana',
         txType: direccion
       };
       const horaDeteccion = eventos.timestamp ? eventos.timestamp * 1000 : Date.now();
-      const origen = eventos.source === 'PUMP_FUN' ? 'PumpPortal' : 'OnChain';
+      const origen = (!eventos.source || eventos.source === 'PUMP_FUN') ? 'PumpPortal' : eventos.source;
       if (direccion === 'buy') await handleTrackedBuy(tracked, trade, origen, horaDeteccion);
       else await handleTrackedSell(tracked, trade, origen, horaDeteccion);
       return;
@@ -1610,19 +1628,21 @@ bot.onText(/\/status/, async (msg) => {
 // ---------- NUEVO: /help ----------
 bot.onText(/\/help/, async (msg) => {
   const ayuda = `
-🤖 *Comandos disponibles*:
-/add <alias> <dirección> <montoUSD> [cadena]   – Agrega una wallet a seguir (ej. /add miwallet 5EsYuW... 10 sol)
-/setamount <alias> <nuevoMontoUSD>            – Cambia el monto USD por compra para esa alias
-/remove <alias>                               – Elimina una wallet de seguimiento
-/list                                          – Lista todas las wallets trackeadas
-/diag <alias>                                 – Diagnóstico de webhook y últimas tx de una wallet
-/status                                        – Estado general del bot (modo, precio SOL, balances)
-/positions                                     – Muestra las posiciones abiertas del bot
-/ranking [real|paper]                          – Ranking wallets por PnL (modo actual o forzado)
-/pnl                                           – PnL rápido: realizado + no realizado + total
-/help                                          – Esta ayuda
+🤖 Comandos disponibles:
+/add <alias> <dirección> <montoUSD> [cadena] – Agrega una wallet a seguir
+/setamount <alias> <nuevoMontoUSD> – Cambia el monto USD por compra para esa alias
+/remove <alias> – Elimina una wallet de seguimiento
+/list – Lista todas las wallets trackeadas
+/diag <alias> – Diagnóstico de webhook y últimas tx de una wallet
+/status – Estado general del bot (modo, precio SOL, balances)
+/positions – Muestra las posiciones abiertas del bot
+/ranking [real|paper] – Ranking wallets por PnL
+/pnl – PnL realizado + no realizado + total
+/cleanup – Limpia posiciones de wallets borradas
+/fixwebhook – Fuerza la recreación limpia del webhook en Helius
+/help – Esta ayuda
 `;
-  bot.sendMessage(msg.chat.id, ayuda, { parse_mode: 'Markdown' });
+  bot.sendMessage(msg.chat.id, ayuda);
 });
 // ---------- NUEVO: /positions ----------
 bot.onText(/\/positions/, async (msg) => {
@@ -1638,9 +1658,11 @@ bot.onText(/\/positions/, async (msg) => {
     }
     const lines = rows.map(r => {
       const modoTag = r.modo === 'real' ? '🟢 REAL' : '🟡 PAPER';
-      return `• ${r.symbol} (${r.chain}) – ${r.amount.toFixed(4)} tokens – costo ${r.cost_basis_sol.toFixed(4)} SOL – wallet: ${r.wallet_alias} [${modoTag}]`;
+      const amount = Number(r.amount || 0).toFixed(4);
+      const cost = Number(r.cost_basis_sol || 0).toFixed(4);
+      return `• ${r.symbol} (${r.chain}) – ${amount} tokens – costo ${cost} SOL – wallet: ${r.wallet_alias} [${modoTag}]`;
     });
-    bot.sendMessage(msg.chat.id, `📊 *Posiciones abiertas* (${MODO_ACTUAL.toUpperCase()}):\n${lines.join('\n')}`);
+    bot.sendMessage(msg.chat.id, `📊 Posiciones abiertas (${MODO_ACTUAL.toUpperCase()}):\n${lines.join('\n')}`);
   } catch (e) {
     log('error', `Error en /positions: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
@@ -1655,9 +1677,9 @@ bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
     const { rows } = await pool.query(`
       SELECT
         wallet_alias,
-        COUNT(*) as trades,
-        SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END) as wins,
-        SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END) as losses,
+        COUNT(*)::int as trades,
+        SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END)::int as wins,
+        SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END)::int as losses,
         SUM(profit_sol) as total_profit_sol,
         AVG(profit_sol) as avg_profit_sol,
         MAX(profit_sol) as best_trade,
@@ -1672,14 +1694,17 @@ bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
       return;
     }
     const lines = rows.map((r, i) => {
-      const wr = r.trades > 0 ? ((r.wins / r.trades) * 100).toFixed(1) : '0.0';
-      const emoji = (r.total_profit_sol || 0) >= 0 ? '🟢' : '🔴';
-      const best = r.best_trade !== null ? parseFloat(r.best_trade).toFixed(4) : '0.0000';
-      const worst = r.worst_trade !== null ? parseFloat(r.worst_trade).toFixed(4) : '0.0000';
-      const total = (r.total_profit_sol !== null ? r.total_profit_sol : 0).toFixed(4);
-      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${r.trades} trades, ${wr}% WR, best ${best}, worst ${worst})`;
+      const trades = Number(r.trades || 0);
+      const wins = Number(r.wins || 0);
+      const wr = trades > 0 ? ((wins / trades) * 100).toFixed(1) : '0.0';
+      const totalNum = Number(r.total_profit_sol || 0);
+      const emoji = totalNum >= 0 ? '🟢' : '🔴';
+      const best = r.best_trade !== null && r.best_trade !== undefined ? Number(r.best_trade).toFixed(4) : '0.0000';
+      const worst = r.worst_trade !== null && r.worst_trade !== undefined ? Number(r.worst_trade).toFixed(4) : '0.0000';
+      const total = totalNum.toFixed(4);
+      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${trades} trades, ${wr}% WR, best ${best}, worst ${worst})`;
     });
-    bot.sendMessage(msg.chat.id, `🏆 *Ranking wallets* (${modo.toUpperCase()}):\n${lines.join('\n')}`);
+    bot.sendMessage(msg.chat.id, `🏆 Ranking wallets (${modo.toUpperCase()}):\n${lines.join('\n')}`);
   } catch (e) {
     log('error', `Error en /ranking: ${e.message}`, e.stack);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
@@ -1694,7 +1719,7 @@ bot.onText(/\/pnl/, async (msg) => {
       FROM trade_history
       WHERE modo = $1
     `, [MODO_ACTUAL]);
-    const realizedSol = hist[0]?.realized_sol || 0;
+    const realizedSol = Number(hist[0]?.realized_sol || 0);
 
     const { rows: pos } = await pool.query(`
       SELECT bp.*, tw.address as wallet_address
@@ -1708,14 +1733,14 @@ bot.onText(/\/pnl/, async (msg) => {
       for (const p of pos) {
         const { decimals } = await getTokenInfoHelius(p.token_mint);
         const valor = await estimarValorEnSol(p.token_mint, p.amount, decimals);
-        if (valor !== null) unrealizedSol += valor - p.cost_basis_sol;
+        if (valor !== null) unrealizedSol += valor - (Number(p.cost_basis_sol) || 0);
       }
     }
 
     const totalSol = realizedSol + unrealizedSol;
     const emoji = totalSol >= 0 ? '🟢' : '🔴';
 
-    let txt = `💰 *PnL ${MODO_ACTUAL.toUpperCase()}* ${emoji}\n`;
+    let txt = `💰 PnL ${MODO_ACTUAL.toUpperCase()} ${emoji}\n`;
     txt += `🔒 Realizado: ${realizedSol.toFixed(4)} SOL\n`;
     if (pos.length > 0) {
       txt += `📈 No realizado: ${unrealizedSol.toFixed(4)} SOL (${pos.length} pos abiertas)\n`;
@@ -1734,11 +1759,9 @@ bot.onText(/\/pnl/, async (msg) => {
 bot.onText(/\/cleanup/, async (msg) => {
   try {
     const modo = MODO_ACTUAL;
-    const { rows: tracked } = await pool.query('SELECT alias FROM tracked_wallets');
-    const trackedAliases = tracked.map(r => r.alias);
     const { rowCount } = await pool.query(
-      `DELETE FROM bot_positions WHERE wallet_alias NOT IN ($1) AND modo = $2`,
-      [trackedAliases.length ? `'${trackedAliases.join(',')}'` : "''", modo]
+      `DELETE FROM bot_positions WHERE wallet_alias NOT IN (SELECT alias FROM tracked_wallets) AND modo = $1`,
+      [modo]
     );
     bot.sendMessage(msg.chat.id, `🧹 Cleanup ${modo.toUpperCase()}: ${rowCount} posición(es) de wallets no trackeadas eliminada(s).`);
   } catch (e) {
@@ -1749,9 +1772,9 @@ bot.onText(/\/cleanup/, async (msg) => {
 
 bot.onText(/\/fixwebhook/, async (msg) => {
   try {
-    await pool.query('DELETE FROM global_balance WHERE id = 1');
-    await pool.query('INSERT INTO global_balance (id, helius_webhook_id) VALUES (1, \'a9fbea52-66c7-4fe0-85fb-358486d2b6d9\') ON CONFLICT (id) DO UPDATE SET helius_webhook_id = EXCLUDED.helius_webhook_id');
-    bot.sendMessage(msg.chat.id, '✅ global_balance actualizado con webhook ID existente. Reinicia el bot en Railway para que cargue el nuevo código.');
+    await pool.query('UPDATE global_balance SET helius_webhook_id = NULL WHERE id = 1');
+    await crearOActualizarWebhookHelius();
+    bot.sendMessage(msg.chat.id, '✅ Webhook reconfigurado correctamente con Helius.');
   } catch (e) {
     bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
   }
