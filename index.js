@@ -1,4 +1,4 @@
-// ========= ⚡️M3M3B0T⚡️ REAL TRADING — v2 (refactor completo) =========
+// ========= ⚡️M3M3B0T⚡️ REAL TRADING — v3 (refactor final) =========
 require('dotenv').config();
 
 // ---------- Dependencies ----------
@@ -349,10 +349,12 @@ function estimarFees(costBasisSol, proceedsSol) {
 }
 
 function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoDeFees) {
-  const fees = netoDeFees ? estimarFees(costBasisSol, proceedsSolBruto) : 0;
-  const proceedsNetoSol = proceedsSolBruto - fees;
-  const profitSol = proceedsNetoSol - costBasisSol;
-  const multiplicador = costBasisSol > 0 ? proceedsNetoSol / costBasisSol : 0;
+  const cost = Number.isFinite(costBasisSol) ? costBasisSol : 0;
+  const proceeds = Number.isFinite(proceedsSolBruto) ? proceedsSolBruto : 0;
+  const fees = netoDeFees ? estimarFees(cost, proceeds) : 0;
+  const proceedsNetoSol = proceeds - fees;
+  const profitSol = proceedsNetoSol - cost;
+  const multiplicador = cost > 0 ? proceedsNetoSol / cost : 0;
   const pct = (multiplicador - 1) * 100;
   const profitUsd = solPriceActual ? profitSol * solPriceActual : null;
   return { fees, proceedsNetoSol, profitSol, multiplicador, pct, profitUsd };
@@ -376,6 +378,11 @@ function usdToSolNeto(usd, solPrice) {
 function bondingCurvePriceSol(trade) {
   if (!trade.vSolInBondingCurve || !trade.vTokensInBondingCurve) return null;
   return trade.vSolInBondingCurve / trade.vTokensInBondingCurve;
+}
+
+function numeroSeguroPostgres(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 // ===== FIN BLOQUE 1 =====
@@ -446,7 +453,6 @@ async function getHoldings(address) {
         const amt = parseFloat(info.tokenAmount?.uiAmount || 0);
         const dec = info.tokenAmount?.decimals ?? 0;
         if (amt <= 0) return false;
-        // Excluir NFTs (0 decimales y exactamente 1 unidad)
         if (dec === 0 && amt === 1) return false;
         return true;
       })
@@ -721,6 +727,16 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_alias ON trade_history(wallet_alias)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_modo ON trade_history(modo)`);
 
+    // Sanear posibles NULLs en global_balance
+    await pool.query(
+      `UPDATE global_balance SET initial_usdc = $1 WHERE initial_usdc IS NULL`,
+      [INITIAL_PAPER_BALANCE]
+    );
+    await pool.query(
+      `UPDATE global_balance SET current_usdc = COALESCE(initial_usdc, $1) WHERE current_usdc IS NULL`,
+      [INITIAL_PAPER_BALANCE]
+    );
+
     log('info', 'DB OK');
   } catch (e) {
     log('error', `DB Error: ${e.message}`);
@@ -776,18 +792,38 @@ async function registrarTradeCerrado(walletAlias, symbol, profitSol) {
 
 // ---------- Balance paper ----------
 async function getPaperBalance() {
-  const { rows } = await pool.query('SELECT * FROM global_balance WHERE id=1');
-  return (
-    rows[0] || { initial_usdc: INITIAL_PAPER_BALANCE, current_usdc: INITIAL_PAPER_BALANCE }
-  );
+  try {
+    const { rows } = await pool.query('SELECT * FROM global_balance WHERE id=1');
+    const row = rows[0] || {};
+    return {
+      initial_usdc: Number(row.initial_usdc ?? INITIAL_PAPER_BALANCE),
+      current_usdc: Number(row.current_usdc ?? INITIAL_PAPER_BALANCE)
+    };
+  } catch (e) {
+    log('error', `Error leyendo balance paper: ${e.message}`);
+    return {
+      initial_usdc: INITIAL_PAPER_BALANCE,
+      current_usdc: INITIAL_PAPER_BALANCE
+    };
+  }
 }
 
 async function adjustPaperBalance(deltaUsd) {
-  const { rows } = await pool.query(
-    'UPDATE global_balance SET current_usdc = current_usdc + $1 WHERE id=1 RETURNING current_usdc',
-    [deltaUsd]
-  );
-  return rows[0]?.current_usdc;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE global_balance
+       SET current_usdc = COALESCE(current_usdc, $2) + $1
+       WHERE id=1
+       RETURNING current_usdc`,
+      [deltaUsd, INITIAL_PAPER_BALANCE]
+    );
+    const valor = Number(rows[0]?.current_usdc);
+    if (Number.isFinite(valor)) return valor;
+    return INITIAL_PAPER_BALANCE;
+  } catch (e) {
+    log('error', `Error ajustando balance paper: ${e.message}`);
+    return INITIAL_PAPER_BALANCE;
+  }
 }
 
 // ===== FIN BLOQUE 2 =====
@@ -1763,7 +1799,6 @@ async function reconciliarPosiciones(forzado = false) {
           }
         }
       } else {
-        // PAPER: intentar estimar valor real en lugar de asumir 0
         const { decimals } = await getTokenInfoHelius(pos.token_mint);
         const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
         const proceedsSol = valorEstimado ?? 0;
@@ -2058,11 +2093,12 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       [trade.traderPublicKey, trade.mint]
     );
     const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
+    const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
     if (CHAT_ID) {
       bot.sendMessage(
         CHAT_ID,
-        `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`
+        `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${saldoSeguro.toFixed(2)}`
       );
     }
     chequearRetraso(horaDeteccion, tracked.alias, symbol);
@@ -2089,7 +2125,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
     return;
   }
 
-  // Ya sabemos que hay posición, ahora sí limpiamos seen_tokens
   await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [
     trade.traderPublicKey,
     trade.mint
@@ -2177,8 +2212,9 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
     );
     await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+    const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
-    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`;
+    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
     if (r.profitSol > 0) {
       msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
     }
@@ -2360,7 +2396,7 @@ bot.onText(/\/status/, async (msg) => {
     txt += `⚙️ Modo: ${modo}\n`;
     txt += `💵 Precio SOL: $${solPrice?.toFixed(2) ?? 'N/A'}\n`;
     txt += `💰 SOL en wallet: ${typeof solBal === 'number' ? solBal.toFixed(4) : solBal}\n`;
-    txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc})\n`;
+    txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc.toFixed(2)})\n`;
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
     log('error', `Error en /status: ${e.message}`);
@@ -2564,7 +2600,6 @@ setInterval(() => {
   intervals.push(setInterval(revisarStopLoss, 60_000));
   intervals.push(setInterval(monitoreoAutomaticoWebhook, 600_000));
 
-  // Cada 5 min: si Helius deshabilitó el webhook, reactivarlo automáticamente.
   intervals.push(
     setInterval(() => {
       const apiKey = getHeliusApiKey();
@@ -2579,7 +2614,6 @@ setInterval(() => {
     }, 300_000)
   );
 
-  // Heartbeat cada 5 min
   intervals.push(
     setInterval(() => {
       const marca = new Date().toISOString();
