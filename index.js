@@ -2320,7 +2320,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       'INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4',
       [alias, address, amount, chain]
     );
-    await resyncSubscriptions();
+        // await resyncSubscriptions(); // WS desactivado
     await crearOActualizarWebhookHelius();
 
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
@@ -2377,7 +2377,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
     if (result.rows.length > 0) {
       bot.sendMessage(msg.chat.id, `✅ ${alias} eliminado de tracked_wallets.`);
-      await resyncSubscriptions();
+            // await resyncSubscriptions(); // WS desactivado
       await crearOActualizarWebhookHelius();
     } else {
       bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
@@ -2652,7 +2652,8 @@ setInterval(() => {
   await initDB();
   await initBaselineReal();
 
-  conectarWS();
+   // WS de PumpPortal desactivado — ahora dependemos solo de Helius
+  // conectarWS();
   crearOActualizarWebhookHelius();
   iniciarServidorWebhook();
 
