@@ -536,149 +536,148 @@ function extraerCambiosDeBalance(acc) {
   return resultados;
 }
 
-// ---------- Fallback: extraer cambios de tx completa para una wallet ----------
+// ---------- Extraer cambios de tx completa para una wallet (v2: usa wSOL real) ----------
 function extraerCambiosDeTxParaWallet(tx, walletAddress) {
+  // Estructura por mint: acumulamos el delta de token y el delta de wSOL asociado.
   const porMint = new Map();
-  const sumar = (mint, tokenDelta, solDeltaLamports, decimals = 6) => {
+  const sumarToken = (mint, tokenDelta, decimals = 6) => {
     if (!mint || MINTS_A_IGNORAR.has(mint)) return;
-    const prev = porMint.get(mint) || { tokenDelta: 0, solDeltaLamports: 0, decimals };
+    const prev = porMint.get(mint) || { tokenDelta: 0, decimals };
     prev.tokenDelta += tokenDelta;
-    prev.solDeltaLamports += solDeltaLamports;
     prev.decimals = decimals;
     porMint.set(mint, prev);
   };
 
-  // 1. Native SOL transfers
-  let nativeSolSpent = 0;
-  for (const nt of tx.nativeTransfers || []) {
-    const amount = numeroSeguro(nt.amount);
-    if (nt.fromUserAccount === walletAddress) nativeSolSpent += amount;
-    if (nt.toUserAccount === walletAddress) nativeSolSpent -= amount;
-  }
+  // 1. Movimiento de wSOL de/hacia la wallet (esto es lo que pagó o recibió realmente)
+  //    Buscamos en tokenTransfers y también en accountData.tokenBalanceChanges.
+  let wsolInLamports = 0;  // positivo = recibió wSOL
+  let wsolOutLamports = 0; // positivo = envió wSOL
 
-  // 2. Token transfers (incluye wSOL)
-  const solSpentPorMint = new Map();
-  const solReceivedPorMint = new Map();
+  const wsolAmountToLamports = (amount, decimals) => {
+    const n = numeroSeguro(amount);
+    if (!n) return 0;
+    const dec = decimals ?? 9;
+    // Si el decimals es 9, asumimos que ya viene en "human readable" (wSOL se suele reportar así)
+    // Si el decimals es 0, asumimos lamports. Normalizamos a lamports.
+    if (dec === 9) return Math.round(n * LAMPORTS_PER_SOL);
+    if (dec === 0) return Math.round(n);
+    // Otra escala: convertir a human y luego a lamports.
+    return Math.round((n / Math.pow(10, dec)) * LAMPORTS_PER_SOL);
+  };
 
   for (const tt of tx.tokenTransfers || []) {
-    const amount = numeroSeguro(tt.tokenAmount);
-    if (!amount || !tt.mint) continue;
-    const isWSol = tt.mint === SOL_MINT;
+    if (tt.mint !== SOL_MINT) continue;
+    const amtLamports = wsolAmountToLamports(tt.tokenAmount, tt.decimals ?? 9);
+    if (amtLamports <= 0) continue;
 
-    if (tt.fromUserAccount === walletAddress) {
-      if (isWSol) {
-        solSpentPorMint.set(tt.mint, (solSpentPorMint.get(tt.mint) || 0) + amount);
+    if (tt.fromUserAccount === walletAddress) wsolOutLamports += amtLamports;
+    if (tt.toUserAccount === walletAddress) wsolInLamports += amtLamports;
+  }
+
+  for (const acc of tx.accountData || []) {
+    for (const tbc of acc.tokenBalanceChanges || []) {
+      if (tbc.mint !== SOL_MINT) continue;
+      const owner = tbc.userAccount || tbc.owner || acc.account;
+      if (owner !== walletAddress) continue;
+
+      const decimals = tbc.rawTokenAmount?.decimals ?? 9;
+      const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
+      if (rawAmount === 0) continue;
+
+      // El rawTokenAmount viene como string con decimales. Convertimos a lamports.
+      const rawStr = String(tbc.rawTokenAmount?.tokenAmount ?? '0');
+      let lamports;
+      if (rawStr.includes('.')) {
+        lamports = Math.round(parseFloat(rawStr) * LAMPORTS_PER_SOL);
+      } else {
+        lamports = Math.round(Number(rawStr));
       }
-      sumar(tt.mint, -amount, 0, tt.decimals ?? 6);
-    }
-    if (tt.toUserAccount === walletAddress) {
-      if (isWSol) {
-        solReceivedPorMint.set(tt.mint, (solReceivedPorMint.get(tt.mint) || 0) + amount);
-      }
-      sumar(tt.mint, amount, 0, tt.decimals ?? 6);
+      if (!Number.isFinite(lamports) || lamports === 0) continue;
+
+      if (lamports > 0) wsolInLamports += lamports;
+      else wsolOutLamports += Math.abs(lamports);
     }
   }
 
-  // 3. Account data balance changes
+  const wsolNetoLamports = wsolInLamports - wsolOutLamports;
+  const wsolAbsLamports = wsolInLamports + wsolOutLamports;
+
+  // 2. Acumulamos cambios de tokens (no-SOL, no-USDC)
+  for (const tt of tx.tokenTransfers || []) {
+    if (tt.mint === SOL_MINT || MINTS_A_IGNORAR.has(tt.mint)) continue;
+    const amount = numeroSeguro(tt.tokenAmount);
+    if (!amount) continue;
+    const decimals = tt.decimals ?? 6;
+
+    if (tt.fromUserAccount === walletAddress) sumarToken(tt.mint, -amount, decimals);
+    if (tt.toUserAccount === walletAddress) sumarToken(tt.mint, amount, decimals);
+  }
+
   for (const acc of tx.accountData || []) {
-    if (acc.account === walletAddress) {
-      const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
-      if (nativeDelta < 0) nativeSolSpent += -nativeDelta;
-    }
     for (const tbc of acc.tokenBalanceChanges || []) {
+      if (tbc.mint === SOL_MINT || MINTS_A_IGNORAR.has(tbc.mint)) continue;
       const owner = tbc.userAccount || tbc.owner || acc.account;
       if (owner !== walletAddress) continue;
-      if (MINTS_A_IGNORAR.has(tbc.mint)) continue;
       const decimals = tbc.rawTokenAmount?.decimals ?? 6;
       const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
       const delta = rawAmount / Math.pow(10, decimals);
-      if (delta !== 0) {
-        let solDelta = 0;
-        if (tbc.mint === SOL_MINT) {
-          solDelta = rawAmount;
-          if (solDelta < 0) {
-            solSpentPorMint.set(SOL_MINT, (solSpentPorMint.get(SOL_MINT) || 0) + -solDelta);
-          } else {
-            solReceivedPorMint.set(
-              SOL_MINT,
-              (solReceivedPorMint.get(SOL_MINT) || 0) + solDelta
-            );
-          }
-        }
-        sumar(tbc.mint, delta, solDelta, decimals);
-      }
+      if (delta !== 0) sumarToken(tbc.mint, delta, decimals);
     }
   }
 
-  // 4. Emparejar SOL gastado con tokens recibidos
+  // 3. Emparejar: para cada mint con cambio de token, decidir si es buy o sell
+  //    y calcular el monto en SOL (lamports).
   const cambios = [];
+  const candidatos = [];
 
-  let totalSolSpentLamports = nativeSolSpent;
-  for (const v of solSpentPorMint.values()) totalSolSpentLamports += v;
-  for (const v of solReceivedPorMint.values()) totalSolSpentLamports -= v;
-
-  if (totalSolSpentLamports <= 0) {
-    for (const [mint, info] of porMint.entries()) {
-      if (!info.tokenDelta) continue;
-      if (info.tokenDelta < 0) {
-        const solReceived = solReceivedPorMint.get(mint) || 0;
-        if (solReceived > 0) {
-          cambios.push({
-            mint,
-            tokenAmount: Math.abs(info.tokenDelta),
-            solAmount: solReceived / LAMPORTS_PER_SOL,
-            direction: 'sell',
-            solAmountEstimado: false
-          });
-        }
-      }
-    }
-    return cambios;
-  }
-
-  const candidatosBuy = [];
   for (const [mint, info] of porMint.entries()) {
+    if (!info.tokenDelta || info.tokenDelta === 0) continue;
+
     if (info.tokenDelta > 0) {
-      const solReceived = solReceivedPorMint.get(mint) || 0;
-      if (solReceived === 0) {
-        candidatosBuy.push({ mint, info });
-      }
+      // Recibió token → BUY
+      candidatos.push({ mint, info, direction: 'buy' });
+    } else {
+      // Envió token → SELL
+      candidatos.push({ mint, info, direction: 'sell' });
     }
   }
 
-  let solRestante = totalSolSpentLamports;
-  for (const c of candidatosBuy) {
-    if (solRestante <= 0) break;
-    const asignado = Math.min(solRestante, Math.max(c.info.solDeltaLamports, 0) || 1_000_000);
-    c.info.solDeltaLamports = -asignado;
-    solRestante -= asignado;
-  }
+  if (candidatos.length === 0) return [];
 
-  for (const [mint, info] of porMint.entries()) {
-    if (!info.tokenDelta) continue;
-    const tokenDelta = info.tokenDelta;
-    const solDeltaLamports = info.solDeltaLamports;
+  // Si hay un único candidato, todo el wSOL neto corresponde a él.
+  // Si hay varios, repartimos proporcionalmente al valor absoluto del cambio de token.
+  const totalAbsTokens = candidatos.reduce((acc, c) => acc + Math.abs(c.info.tokenDelta), 0);
 
-    if (tokenDelta > 0 && solDeltaLamports < 0) {
-      cambios.push({
-        mint,
-        tokenAmount: tokenDelta,
-        solAmount: Math.abs(solDeltaLamports / LAMPORTS_PER_SOL),
-        direction: 'buy',
-        solAmountEstimado: false
-      });
-    } else if (tokenDelta < 0) {
-      const solReceived = solReceivedPorMint.get(mint) || 0;
-      if (solReceived > 0) {
-        cambios.push({
-          mint,
-          tokenAmount: Math.abs(tokenDelta),
-          solAmount: solReceived / LAMPORTS_PER_SOL,
-          direction: 'sell',
-          solAmountEstimado: false
-        });
-      }
+  // Determinar el monto en lamports para cada candidato
+  const lamportsParaAsignar = wsolAbsLamports > 0 ? wsolAbsLamports : 0;
+
+  for (const c of candidatos) {
+    let lamportsAsignados = 0;
+
+    if (candidatos.length === 1) {
+      lamportsAsignados = lamportsParaAsignar;
+    } else if (totalAbsTokens > 0) {
+      const proporcion = Math.abs(c.info.tokenDelta) / totalAbsTokens;
+      lamportsAsignados = Math.round(lamportsParaAsignar * proporcion);
     }
+
+    // Si no pudimos determinar nada, usar el fallback de 0.001 SOL
+    // (solo para no romper el flujo; esto indica que el parser no encontró wSOL)
+    if (lamportsAsignados === 0) {
+      lamportsAsignados = 1_000_000; // 0.001 SOL
+      log(
+        'warn',
+        `⚠️ Parser: no se encontró wSOL para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL (tx tenía ${wsolAbsLamports} lamports de wSOL totales)`
+      );
+    }
+
+    cambios.push({
+      mint: c.mint,
+      tokenAmount: Math.abs(c.info.tokenDelta),
+      solAmount: lamportsAsignados / LAMPORTS_PER_SOL,
+      direction: c.direction,
+      solAmountEstimado: lamportsAsignados === 1_000_000 && wsolAbsLamports === 0
+    });
   }
 
   return cambios;
@@ -727,7 +726,6 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_alias ON trade_history(wallet_alias)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_modo ON trade_history(modo)`);
 
-    // Sanear posibles NULLs en global_balance
     await pool.query(
       `UPDATE global_balance SET initial_usdc = $1 WHERE initial_usdc IS NULL`,
       [INITIAL_PAPER_BALANCE]
@@ -1155,6 +1153,33 @@ function iniciarServidorWebhook() {
   );
 }
 
+// ---------- Deduplicación por signature ----------
+const signaturesProcesadas = new Map(); // signature -> timestamp ms
+const DEDUP_TTL_MS = 60 * 60 * 1000; // 1 hora
+
+function limpiarSignaturesViejas() {
+  const ahora = Date.now();
+  for (const [sig, ts] of signaturesProcesadas.entries()) {
+    if (ahora - ts > DEDUP_TTL_MS) signaturesProcesadas.delete(sig);
+  }
+}
+
+function yaProcesadaSignature(sig) {
+  if (!sig) return false;
+  const ts = signaturesProcesadas.get(sig);
+  if (!ts) return false;
+  if (Date.now() - ts > DEDUP_TTL_MS) {
+    signaturesProcesadas.delete(sig);
+    return false;
+  }
+  return true;
+}
+
+function marcarSignatureProcesada(sig) {
+  if (!sig) return;
+  signaturesProcesadas.set(sig, Date.now());
+}
+
 // ---------- Procesar webhook de Helius ----------
 async function procesarWebhookHelius(rawBody) {
   log('info', `📨 Webhook Helius recibido: ${rawBody.length} bytes`);
@@ -1181,6 +1206,15 @@ async function procesarWebhookHelius(rawBody) {
 
     if (esPumpPortal) {
       log('info', '📨 Webhook Helius: objeto estilo PumpPortal detectado, procesando directamente.');
+
+      // Dedup por signature
+      const sig = eventos.signature;
+      if (yaProcesadaSignature(sig)) {
+        log('info', `📨 Signature ${sig.slice(0, 12)}... ya procesada, se omite (dup PumpPortal)`);
+        return;
+      }
+      marcarSignatureProcesada(sig);
+
       const { mint, traderPublicKey, txType, tokenAmount, solAmount } = eventos;
 
       const { rows: buscado } = await pool.query(
@@ -1226,6 +1260,14 @@ async function procesarWebhookHelius(rawBody) {
   const trackedMap = new Map(trackedRows.map((r) => [r.address, r]));
 
   for (const tx of eventos) {
+    // Dedup por signature de la transacción
+    const signature = tx.signature;
+    if (yaProcesadaSignature(signature)) {
+      log('info', `📨 Signature ${signature?.slice(0, 12)}... ya procesada, se omite (dup lote)`);
+      continue;
+    }
+    marcarSignatureProcesada(signature);
+
     const cuentasEnTx = (tx.accountData || []).map((a) => a.account);
     const participantesExtra = [];
 
@@ -1249,6 +1291,21 @@ async function procesarWebhookHelius(rawBody) {
     );
 
     if (trackedRows.length === 0) continue;
+    if (walletsInvolucradas.length === 0) continue;
+
+    // FILTRO: si es un TRANSFER de SYSTEM_PROGRAM sin tokenTransfers, ignorar.
+    // Es solo un movimiento de SOL (fee, transferencia), no un swap.
+    const esTransferSinToken =
+      (tx.type || '').toUpperCase() === 'TRANSFER' &&
+      (tx.source || '').toUpperCase() === 'SYSTEM_PROGRAM' &&
+      (!tx.tokenTransfers || tx.tokenTransfers.length === 0);
+    if (esTransferSinToken) {
+      log(
+        'info',
+        `📨 TX ignorada: TRANSFER de SYSTEM_PROGRAM sin tokenTransfers (probable fee o transferencia simple)`
+      );
+      continue;
+    }
 
     const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
     const cambiosProcesados = new Set();
@@ -1331,6 +1388,9 @@ async function procesarWebhookHelius(rawBody) {
     }
   }
 }
+
+// ---------- Purga periódica de signatures viejas ----------
+setInterval(limpiarSignaturesViejas, 15 * 60 * 1000).unref?.();
 
 // ===== FIN BLOQUE 3 =====
 // ---------- PumpPortal trade ----------
