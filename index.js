@@ -379,11 +379,6 @@ function bondingCurvePriceSol(trade) {
   return trade.vSolInBondingCurve / trade.vTokensInBondingCurve;
 }
 
-function numeroSeguroPostgres(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 // ===== FIN BLOQUE 1 =====
 // ---------- Cache de info de token ----------
 async function getTokenInfoHelius(mint) {
@@ -534,7 +529,7 @@ async function getSolPriceUSD() {
     return cachedSolPrice.value;
   }
 
-  // 4. Si nunca se obtuvo precio, devolver null (el bot deberá decidir)
+  // 4. Si nunca se obtuvo precio, devolver null (el bot decidirá)
   log('error', 'No se pudo obtener precio de SOL de ninguna fuente');
   return null;
 }
@@ -2053,7 +2048,6 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
 }
 
 // ---------- Compra ----------
-// ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) {
@@ -2344,46 +2338,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
   }
 }
 
-    // ---- FIX 2: límite de cordura contra datos corruptos del parser ----
-    const costBasis = Number(position.cost_basis_sol) || 0;
-    if (costBasis > 0 && proceedsSol > costBasis * 100) {
-      log(
-        'warn',
-        `⚠️ proceedsSol absurdo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis (sin ganancia) para no contaminar el balance.`
-      );
-      proceedsSol = costBasis;
-    }
-    if (costBasis > 0 && proceedsSol < 0) {
-      log(
-        'warn',
-        `⚠️ proceedsSol negativo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL. Usando 0.`
-      );
-      proceedsSol = 0;
-    }
-    // ---- FIN FIX 2 ----
-
-    const solPrice = await getSolPriceUSD();
-    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
-    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
-
-    await pool.query(
-      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-      [trade.mint, tracked.alias, MODO_ACTUAL]
-    );
-    await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
-
-    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
-    if (r.profitSol > 0) {
-      msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
-    }
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-
-    chequearRetraso(horaDeteccion, tracked.alias, symbol);
-  }
-}
-
 // ===== FIN BLOQUE 4 =====
 // ---------- Comandos de Telegram ----------
 
@@ -2420,7 +2374,7 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       'INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4',
       [alias, address, amount, chain]
     );
-        // await resyncSubscriptions(); // WS desactivado
+    // await resyncSubscriptions(); // WS desactivado
     await crearOActualizarWebhookHelius();
 
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
@@ -2477,7 +2431,7 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
     if (result.rows.length > 0) {
       bot.sendMessage(msg.chat.id, `✅ ${alias} eliminado de tracked_wallets.`);
-            // await resyncSubscriptions(); // WS desactivado
+      // await resyncSubscriptions(); // WS desactivado
       await crearOActualizarWebhookHelius();
     } else {
       bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
@@ -2752,7 +2706,7 @@ setInterval(() => {
   await initDB();
   await initBaselineReal();
 
-   // WS de PumpPortal desactivado — ahora dependemos solo de Helius
+  // WS de PumpPortal desactivado — ahora dependemos solo de Helius
   // conectarWS();
   crearOActualizarWebhookHelius();
   iniciarServidorWebhook();
