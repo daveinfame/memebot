@@ -2261,6 +2261,24 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
     }
 
+    // ---- FIX 2: límite de cordura contra datos corruptos del parser ----
+    const costBasis = Number(position.cost_basis_sol) || 0;
+    if (costBasis > 0 && proceedsSol > costBasis * 100) {
+      log(
+        'warn',
+        `⚠️ proceedsSol absurdo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis (sin ganancia) para no contaminar el balance.`
+      );
+      proceedsSol = costBasis;
+    }
+    if (costBasis > 0 && proceedsSol < 0) {
+      log(
+        'warn',
+        `⚠️ proceedsSol negativo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL. Usando 0.`
+      );
+      proceedsSol = 0;
+    }
+    // ---- FIN FIX 2 ----
+
     const solPrice = await getSolPriceUSD();
     const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
     const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
