@@ -488,18 +488,55 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// ---------- Precio SOL ----------
+// ---------- Precio SOL (Fix 4: Jupiter + cache + fallback) ----------
+let cachedSolPrice = { value: null, timestamp: 0 };
+const SOL_PRICE_CACHE_MS = 60_000; // 1 minuto
+
 async function getSolPriceUSD() {
-  try {
-    const res = await fetch(
-      'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
-    );
-    const data = await res.json();
-    return data?.solana?.usd ?? null;
-  } catch (e) {
-    log('error', `Error precio SOL: ${e.message}`);
-    return null;
+  const ahora = Date.now();
+
+  // 1. Si hay cache fresco (menos de 1 min), devolverlo
+  if (
+    cachedSolPrice.value !== null &&
+    ahora - cachedSolPrice.timestamp < SOL_PRICE_CACHE_MS
+  ) {
+    return cachedSolPrice.value;
   }
+
+  // 2. Intentar Jupiter Price API (rápida, confiable, la misma que usan Phantom/Solflare)
+  if (process.env.JUPITER_API_KEY) {
+    try {
+      const url = 'https://api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112';
+      const res = await fetch(url, {
+        headers: { 'x-api-key': process.env.JUPITER_API_KEY },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const solData = data?.So11111111111111111111111111111111111111112;
+        const precio = solData?.usdPrice ? parseFloat(solData.usdPrice) : null;
+        if (precio && Number.isFinite(precio) && precio > 0) {
+          cachedSolPrice = { value: precio, timestamp: ahora };
+          return precio;
+        }
+      } else {
+        log('warn', `Jupiter price API respondió ${res.status}`);
+      }
+    } catch (e) {
+      log('warn', `Jupiter price API falló: ${e.message}`);
+    }
+  }
+
+  // 3. Fallback: usar el último precio cacheado aunque sea viejo
+  if (cachedSolPrice.value !== null) {
+    const edadMin = Math.round((ahora - cachedSolPrice.timestamp) / 60000);
+    log('warn', `⚠️ Usando precio cacheado de hace ${edadMin} min: $${cachedSolPrice.value}`);
+    return cachedSolPrice.value;
+  }
+
+  // 4. Si nunca se obtuvo precio, devolver null (el bot deberá decidir)
+  log('error', 'No se pudo obtener precio de SOL de ninguna fuente');
+  return null;
 }
 
 // ---------- Extraer cambios de balance (cuenta directa) ----------
@@ -535,9 +572,8 @@ function extraerCambiosDeBalance(acc) {
   return resultados;
 }
 
-// ---------- Extraer cambios de tx completa para una wallet (v2: usa wSOL real) ----------
+// ---------- Extraer cambios de tx completa para una wallet (Fix 3: lee wSOL Y SOL nativo) ----------
 function extraerCambiosDeTxParaWallet(tx, walletAddress) {
-  // Estructura por mint: acumulamos el delta de token y el delta de wSOL asociado.
   const porMint = new Map();
   const sumarToken = (mint, tokenDelta, decimals = 6) => {
     if (!mint || MINTS_A_IGNORAR.has(mint)) return;
@@ -547,20 +583,16 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     porMint.set(mint, prev);
   };
 
-  // 1. Movimiento de wSOL de/hacia la wallet (esto es lo que pagó o recibió realmente)
-  //    Buscamos en tokenTransfers y también en accountData.tokenBalanceChanges.
-  let wsolInLamports = 0;  // positivo = recibió wSOL
-  let wsolOutLamports = 0; // positivo = envió wSOL
+  // 1. Movimiento de wSOL (para Jupiter, Raydium, Meteora, Orca, PumpSwap)
+  let wsolInLamports = 0;
+  let wsolOutLamports = 0;
 
   const wsolAmountToLamports = (amount, decimals) => {
     const n = numeroSeguro(amount);
     if (!n) return 0;
     const dec = decimals ?? 9;
-    // Si el decimals es 9, asumimos que ya viene en "human readable" (wSOL se suele reportar así)
-    // Si el decimals es 0, asumimos lamports. Normalizamos a lamports.
     if (dec === 9) return Math.round(n * LAMPORTS_PER_SOL);
     if (dec === 0) return Math.round(n);
-    // Otra escala: convertir a human y luego a lamports.
     return Math.round((n / Math.pow(10, dec)) * LAMPORTS_PER_SOL);
   };
 
@@ -568,7 +600,6 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     if (tt.mint !== SOL_MINT) continue;
     const amtLamports = wsolAmountToLamports(tt.tokenAmount, tt.decimals ?? 9);
     if (amtLamports <= 0) continue;
-
     if (tt.fromUserAccount === walletAddress) wsolOutLamports += amtLamports;
     if (tt.toUserAccount === walletAddress) wsolInLamports += amtLamports;
   }
@@ -579,11 +610,6 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       const owner = tbc.userAccount || tbc.owner || acc.account;
       if (owner !== walletAddress) continue;
 
-      const decimals = tbc.rawTokenAmount?.decimals ?? 9;
-      const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
-      if (rawAmount === 0) continue;
-
-      // El rawTokenAmount viene como string con decimales. Convertimos a lamports.
       const rawStr = String(tbc.rawTokenAmount?.tokenAmount ?? '0');
       let lamports;
       if (rawStr.includes('.')) {
@@ -598,16 +624,38 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     }
   }
 
-  const wsolNetoLamports = wsolInLamports - wsolOutLamports;
-  const wsolAbsLamports = wsolInLamports + wsolOutLamports;
+  let wsolAbsLamports = wsolInLamports + wsolOutLamports;
 
-  // 2. Acumulamos cambios de tokens (no-SOL, no-USDC)
+  // 2. Fix 3: Si no hay wSOL, leer SOL NATIVO (para pump.fun bonding curve)
+  let nativeSolInLamports = 0;
+  let nativeSolOutLamports = 0;
+
+  if (wsolAbsLamports === 0) {
+    for (const nt of tx.nativeTransfers || []) {
+      const amount = numeroSeguro(nt.amount);
+      if (amount <= 0) continue;
+      if (nt.fromUserAccount === walletAddress) nativeSolOutLamports += amount;
+      if (nt.toUserAccount === walletAddress) nativeSolInLamports += amount;
+    }
+
+    for (const acc of tx.accountData || []) {
+      if (acc.account !== walletAddress) continue;
+      const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
+      if (nativeDelta < 0) nativeSolOutLamports += Math.abs(nativeDelta);
+      else if (nativeDelta > 0) nativeSolInLamports += nativeDelta;
+    }
+  }
+
+  const solAbsLamports = wsolAbsLamports > 0
+    ? wsolAbsLamports
+    : (nativeSolInLamports + nativeSolOutLamports);
+
+  // 3. Acumulamos cambios de tokens (no-SOL, no-USDC)
   for (const tt of tx.tokenTransfers || []) {
     if (tt.mint === SOL_MINT || MINTS_A_IGNORAR.has(tt.mint)) continue;
     const amount = numeroSeguro(tt.tokenAmount);
     if (!amount) continue;
     const decimals = tt.decimals ?? 6;
-
     if (tt.fromUserAccount === walletAddress) sumarToken(tt.mint, -amount, decimals);
     if (tt.toUserAccount === walletAddress) sumarToken(tt.mint, amount, decimals);
   }
@@ -624,49 +672,36 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     }
   }
 
-  // 3. Emparejar: para cada mint con cambio de token, decidir si es buy o sell
-  //    y calcular el monto en SOL (lamports).
+  // 4. Emparejar
   const cambios = [];
   const candidatos = [];
-
   for (const [mint, info] of porMint.entries()) {
     if (!info.tokenDelta || info.tokenDelta === 0) continue;
-
-    if (info.tokenDelta > 0) {
-      // Recibió token → BUY
-      candidatos.push({ mint, info, direction: 'buy' });
-    } else {
-      // Envió token → SELL
-      candidatos.push({ mint, info, direction: 'sell' });
-    }
+    candidatos.push({
+      mint,
+      info,
+      direction: info.tokenDelta > 0 ? 'buy' : 'sell'
+    });
   }
 
   if (candidatos.length === 0) return [];
 
-  // Si hay un único candidato, todo el wSOL neto corresponde a él.
-  // Si hay varios, repartimos proporcionalmente al valor absoluto del cambio de token.
   const totalAbsTokens = candidatos.reduce((acc, c) => acc + Math.abs(c.info.tokenDelta), 0);
-
-  // Determinar el monto en lamports para cada candidato
-  const lamportsParaAsignar = wsolAbsLamports > 0 ? wsolAbsLamports : 0;
 
   for (const c of candidatos) {
     let lamportsAsignados = 0;
-
     if (candidatos.length === 1) {
-      lamportsAsignados = lamportsParaAsignar;
+      lamportsAsignados = solAbsLamports;
     } else if (totalAbsTokens > 0) {
       const proporcion = Math.abs(c.info.tokenDelta) / totalAbsTokens;
-      lamportsAsignados = Math.round(lamportsParaAsignar * proporcion);
+      lamportsAsignados = Math.round(solAbsLamports * proporcion);
     }
 
-    // Si no pudimos determinar nada, usar el fallback de 0.001 SOL
-    // (solo para no romper el flujo; esto indica que el parser no encontró wSOL)
     if (lamportsAsignados === 0) {
-      lamportsAsignados = 1_000_000; // 0.001 SOL
+      lamportsAsignados = 1_000_000;
       log(
         'warn',
-        `⚠️ Parser: no se encontró wSOL para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL (tx tenía ${wsolAbsLamports} lamports de wSOL totales)`
+        `⚠️ Parser: no se encontró SOL (ni wSOL ni nativo) para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL`
       );
     }
 
@@ -675,7 +710,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       tokenAmount: Math.abs(c.info.tokenDelta),
       solAmount: lamportsAsignados / LAMPORTS_PER_SOL,
       direction: c.direction,
-      solAmountEstimado: lamportsAsignados === 1_000_000 && wsolAbsLamports === 0
+      solAmountEstimado: lamportsAsignados === 1_000_000 && solAbsLamports === 0
     });
   }
 
@@ -2018,6 +2053,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
 }
 
 // ---------- Compra ----------
+// ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) {
@@ -2071,10 +2107,11 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     return;
   }
 
-  const solPrice = await getSolPriceUSD();
+  // Fix 4: si no hay precio, usar fallback en lugar de abortar
+  let solPrice = await getSolPriceUSD();
   if (!solPrice) {
-    log('error', 'No se pudo obtener precio de SOL, se aborta compra');
-    return;
+    log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la compra');
+    solPrice = 150;
   }
 
   const amountSol = usdToSolNeto(tracked.amount, solPrice);
@@ -2260,6 +2297,52 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       const priceAtSell = bondingCurvePriceSol(trade);
       proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
     }
+
+    // ---- FIX 2: límite de cordura contra datos corruptos del parser ----
+    const costBasis = Number(position.cost_basis_sol) || 0;
+    if (costBasis > 0 && proceedsSol > costBasis * 100) {
+      log(
+        'warn',
+        `⚠️ proceedsSol absurdo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis (sin ganancia) para no contaminar el balance.`
+      );
+      proceedsSol = costBasis;
+    }
+    if (costBasis > 0 && proceedsSol < 0) {
+      log(
+        'warn',
+        `⚠️ proceedsSol negativo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL. Usando 0.`
+      );
+      proceedsSol = 0;
+    }
+    // ---- FIN FIX 2 ----
+
+    // Fix 4: si no hay precio, usar fallback en lugar de abortar
+    let solPrice = await getSolPriceUSD();
+    if (!solPrice) {
+      log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la venta');
+      solPrice = 150;
+    }
+
+    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
+    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
+
+    await pool.query(
+      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [trade.mint, tracked.alias, MODO_ACTUAL]
+    );
+    await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
+    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+    const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
+
+    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
+    if (r.profitSol > 0) {
+      msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
+    }
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+
+    chequearRetraso(horaDeteccion, tracked.alias, symbol);
+  }
+}
 
     // ---- FIX 2: límite de cordura contra datos corruptos del parser ----
     const costBasis = Number(position.cost_basis_sol) || 0;
