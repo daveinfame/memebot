@@ -1262,16 +1262,17 @@ function marcarSignatureProcesada(sig) {
   signaturesProcesadas.set(sig, Date.now());
 }
 
-// ---------- Log compacto de TX (solo lo útil para diagnosticar) ----------
+// ---------- Log compacto de TX (v2: solo cuentas con cambios + 1200 chars) ----------
 function logRawTxCompacto(tx) {
   try {
-    const resumen = {
-      signature: tx.signature ? String(tx.signature).slice(0, 20) + '...' : null,
-      description: tx.description || null,
-      type: tx.type || null,
-      source: tx.source || null,
-      feePayer: tx.feePayer || null,
-      accountData: (tx.accountData || []).map((a) => ({
+    // Filtrar SOLO cuentas con cambios reales (balance nativo o de tokens)
+    const cuentasRelevantes = (tx.accountData || [])
+      .filter(
+        (a) =>
+          (a.nativeBalanceChange && a.nativeBalanceChange !== 0) ||
+          (a.tokenBalanceChanges && a.tokenBalanceChanges.length > 0)
+      )
+      .map((a) => ({
         account: a.account,
         nativeBalanceChange: a.nativeBalanceChange,
         tokenBalanceChanges: (a.tokenBalanceChanges || []).map((t) => ({
@@ -1280,23 +1281,41 @@ function logRawTxCompacto(tx) {
           decimals: t.rawTokenAmount?.decimals,
           userAccount: t.userAccount
         }))
-      })),
-      tokenTransfers: (tx.tokenTransfers || []).map((t) => ({
+      }));
+
+    // Solo tokenTransfers y nativeTransfers que tengan movimiento
+    const tokenTransfersFiltrados = (tx.tokenTransfers || [])
+      .filter((t) => t.tokenAmount && Number(t.tokenAmount) > 0)
+      .map((t) => ({
         mint: t.mint,
         from: t.fromUserAccount,
         to: t.toUserAccount,
         amount: t.tokenAmount,
         decimals: t.decimals
-      })),
-      nativeTransfers: (tx.nativeTransfers || []).map((n) => ({
+      }));
+
+    const nativeTransfersFiltrados = (tx.nativeTransfers || [])
+      .filter((n) => n.amount && Number(n.amount) > 0)
+      .map((n) => ({
         from: n.fromUserAccount,
         to: n.toUserAccount,
         amount: n.amount
-      }))
+      }));
+
+    const resumen = {
+      sig: tx.signature ? String(tx.signature).slice(0, 16) + '...' : null,
+      desc: tx.description || null,
+      type: tx.type || null,
+      source: tx.source || null,
+      feePayer: tx.feePayer || null,
+      cuentasRelevantes,
+      tokenTransfers: tokenTransfersFiltrados,
+      nativeTransfers: nativeTransfersFiltrados
     };
+
     const json = JSON.stringify(resumen);
-    const recortado = json.length > 1800 ? json.slice(0, 1800) + '...[cortado]' : json;
-    log('info', `📨 RAW TX compacto (${tx.type || '?'}/${tx.source || '?'}): ${recortado}`);
+    const recortado = json.length > 1200 ? json.slice(0, 1200) + '...[cortado]' : json;
+    log('info', `📨 RAW TX (${tx.type || '?'}/${tx.source || '?'}) [${cuentasRelevantes.length} cuentas]: ${recortado}`);
   } catch (e) {
     log('warn', `No se pudo serializar RAW TX: ${e.message}`);
   }
@@ -1329,7 +1348,6 @@ async function procesarWebhookHelius(rawBody) {
     if (esPumpPortal) {
       log('info', '📨 Webhook Helius: objeto estilo PumpPortal detectado, procesando directamente.');
 
-      // Dedup por signature
       const sig = eventos.signature;
       if (yaProcesadaSignature(sig)) {
         log('info', `📨 Signature ${sig.slice(0, 12)}... ya procesada, se omite (dup PumpPortal)`);
@@ -1382,7 +1400,6 @@ async function procesarWebhookHelius(rawBody) {
   const trackedMap = new Map(trackedRows.map((r) => [r.address, r]));
 
   for (const tx of eventos) {
-    // Dedup por signature de la transacción
     const signature = tx.signature;
     if (yaProcesadaSignature(signature)) {
       log('info', `📨 Signature ${signature?.slice(0, 12)}... ya procesada, se omite (dup lote)`);
@@ -1415,11 +1432,10 @@ async function procesarWebhookHelius(rawBody) {
     if (trackedRows.length === 0) continue;
     if (walletsInvolucradas.length === 0) continue;
 
-    // Log compacto de la TX (solo lo útil para diagnosticar)
+    // Log compacto (filtrado)
     logRawTxCompacto(tx);
 
     // FILTRO: si es un TRANSFER de SYSTEM_PROGRAM sin tokenTransfers, ignorar.
-    // Es solo un movimiento de SOL (fee, transferencia), no un swap.
     const esTransferSinToken =
       (tx.type || '').toUpperCase() === 'TRANSFER' &&
       (tx.source || '').toUpperCase() === 'SYSTEM_PROGRAM' &&
