@@ -1321,6 +1321,7 @@ async function procesarWebhookHelius(rawBody) {
 
     if (trackedRows.length === 0) continue;
     if (walletsInvolucradas.length === 0) continue;
+        log('info', `📨 RAW TX (${tx.type || '?'}/${tx.source || '?'}): ${JSON.stringify(tx).slice(0, 3000)}`);
 
     // FILTRO: si es un TRANSFER de SYSTEM_PROGRAM sin tokenTransfers, ignorar.
     // Es solo un movimiento de SOL (fee, transferencia), no un swap.
