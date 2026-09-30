@@ -380,6 +380,7 @@ function bondingCurvePriceSol(trade) {
 }
 
 // ===== FIN BLOQUE 1 =====
+
 // ---------- Cache de info de token ----------
 async function getTokenInfoHelius(mint) {
   const cached = cacheTokenInfo.get(mint);
@@ -567,7 +568,46 @@ function extraerCambiosDeBalance(acc) {
   return resultados;
 }
 
-// ---------- Extraer cambios de tx completa para una wallet (Fix 3: lee wSOL Y SOL nativo) ----------
+// ---------- Parser de description de Helius (Fix 5: fallback cuando no hay wSOL ni SOL nativo) ----------
+// Helius manda un campo `description` tipo:
+//   BUY:  "<wallet> swapped 0.3 SOL for 12884.28 <MINT>"
+//   SELL: "<wallet> swapped 12884.28 <MINT> for 0.298520232 SOL"
+// Lo usamos como fuente de verdad cuando el parser no encuentra wSOL ni SOL nativo.
+function extraerMontoDeDescription(description, walletAddress) {
+  if (!description || typeof description !== 'string') return null;
+
+  // Normalizamos: quitamos comas de miles si las hay
+  const desc = description.replace(/,/g, '');
+
+  // Caso BUY: "<wallet> swapped <SOL> SOL for <tokens> <MINT>"
+  const regexBuy = /swapped\s+([\d.]+)\s+SOL\s+for\s+([\d.]+)\s+(\S+)/i;
+  // Caso SELL: "<wallet> swapped <tokens> <MINT> for <SOL> SOL"
+  const regexSell = /swapped\s+([\d.]+)\s+(\S+)\s+for\s+([\d.]+)\s+SOL/i;
+
+  const mBuy = desc.match(regexBuy);
+  if (mBuy) {
+    const solAmount = parseFloat(mBuy[1]);
+    const tokenAmount = parseFloat(mBuy[2]);
+    const mint = mBuy[3];
+    if (Number.isFinite(solAmount) && Number.isFinite(tokenAmount) && mint) {
+      return { direction: 'buy', solAmount, tokenAmount, mint };
+    }
+  }
+
+  const mSell = desc.match(regexSell);
+  if (mSell) {
+    const tokenAmount = parseFloat(mSell[1]);
+    const mint = mSell[2];
+    const solAmount = parseFloat(mSell[3]);
+    if (Number.isFinite(solAmount) && Number.isFinite(tokenAmount) && mint) {
+      return { direction: 'sell', solAmount, tokenAmount, mint };
+    }
+  }
+
+  return null;
+}
+
+// ---------- Extraer cambios de tx completa para una wallet (Fix 3 + Fix 5) ----------
 function extraerCambiosDeTxParaWallet(tx, walletAddress) {
   const porMint = new Map();
   const sumarToken = (mint, tokenDelta, decimals = 6) => {
@@ -621,7 +661,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
 
   let wsolAbsLamports = wsolInLamports + wsolOutLamports;
 
-  // 2. Fix 3: Si no hay wSOL, leer SOL NATIVO (para pump.fun bonding curve)
+  // 2. Fix 3: Si no hay wSOL, leer SOL NATIVO (para pump.fun bonding curve y casos raros)
   let nativeSolInLamports = 0;
   let nativeSolOutLamports = 0;
 
@@ -641,7 +681,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     }
   }
 
-  const solAbsLamports = wsolAbsLamports > 0
+  let solAbsLamports = wsolAbsLamports > 0
     ? wsolAbsLamports
     : (nativeSolInLamports + nativeSolOutLamports);
 
@@ -681,6 +721,18 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
 
   if (candidatos.length === 0) return [];
 
+  // Fix 5: si no encontramos SOL por ninguna vía, intentar leer la `description` de Helius
+  if (solAbsLamports === 0 && tx.description) {
+    const parsed = extraerMontoDeDescription(tx.description, walletAddress);
+    if (parsed) {
+      log(
+        'info',
+        `🎯 Parser: usando description de Helius para calcular monto: ${parsed.direction} ${parsed.solAmount} SOL / ${parsed.tokenAmount} tokens (${parsed.mint.slice(0, 6)}...)`
+      );
+      solAbsLamports = Math.round(parsed.solAmount * LAMPORTS_PER_SOL);
+    }
+  }
+
   const totalAbsTokens = candidatos.reduce((acc, c) => acc + Math.abs(c.info.tokenDelta), 0);
 
   for (const c of candidatos) {
@@ -696,7 +748,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       lamportsAsignados = 1_000_000;
       log(
         'warn',
-        `⚠️ Parser: no se encontró SOL (ni wSOL ni nativo) para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL`
+        `⚠️ Parser: no se encontró SOL (ni wSOL, ni nativo, ni description) para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL`
       );
     }
 
@@ -854,6 +906,7 @@ async function adjustPaperBalance(deltaUsd) {
 }
 
 // ===== FIN BLOQUE 2 =====
+
 // ---------- Webhook Helius: crear o actualizar ----------
 async function crearOActualizarWebhookHelius() {
   if (creandoWebhook) {
@@ -1209,6 +1262,46 @@ function marcarSignatureProcesada(sig) {
   signaturesProcesadas.set(sig, Date.now());
 }
 
+// ---------- Log compacto de TX (solo lo útil para diagnosticar) ----------
+function logRawTxCompacto(tx) {
+  try {
+    const resumen = {
+      signature: tx.signature ? String(tx.signature).slice(0, 20) + '...' : null,
+      description: tx.description || null,
+      type: tx.type || null,
+      source: tx.source || null,
+      feePayer: tx.feePayer || null,
+      accountData: (tx.accountData || []).map((a) => ({
+        account: a.account,
+        nativeBalanceChange: a.nativeBalanceChange,
+        tokenBalanceChanges: (a.tokenBalanceChanges || []).map((t) => ({
+          mint: t.mint,
+          tokenAmount: t.rawTokenAmount?.tokenAmount,
+          decimals: t.rawTokenAmount?.decimals,
+          userAccount: t.userAccount
+        }))
+      })),
+      tokenTransfers: (tx.tokenTransfers || []).map((t) => ({
+        mint: t.mint,
+        from: t.fromUserAccount,
+        to: t.toUserAccount,
+        amount: t.tokenAmount,
+        decimals: t.decimals
+      })),
+      nativeTransfers: (tx.nativeTransfers || []).map((n) => ({
+        from: n.fromUserAccount,
+        to: n.toUserAccount,
+        amount: n.amount
+      }))
+    };
+    const json = JSON.stringify(resumen);
+    const recortado = json.length > 1800 ? json.slice(0, 1800) + '...[cortado]' : json;
+    log('info', `📨 RAW TX compacto (${tx.type || '?'}/${tx.source || '?'}): ${recortado}`);
+  } catch (e) {
+    log('warn', `No se pudo serializar RAW TX: ${e.message}`);
+  }
+}
+
 // ---------- Procesar webhook de Helius ----------
 async function procesarWebhookHelius(rawBody) {
   log('info', `📨 Webhook Helius recibido: ${rawBody.length} bytes`);
@@ -1321,7 +1414,9 @@ async function procesarWebhookHelius(rawBody) {
 
     if (trackedRows.length === 0) continue;
     if (walletsInvolucradas.length === 0) continue;
-        log('info', `📨 RAW TX (${tx.type || '?'}/${tx.source || '?'}): ${JSON.stringify(tx).slice(0, 3000)}`);
+
+    // Log compacto de la TX (solo lo útil para diagnosticar)
+    logRawTxCompacto(tx);
 
     // FILTRO: si es un TRANSFER de SYSTEM_PROGRAM sin tokenTransfers, ignorar.
     // Es solo un movimiento de SOL (fee, transferencia), no un swap.
@@ -1423,6 +1518,7 @@ async function procesarWebhookHelius(rawBody) {
 setInterval(limpiarSignaturesViejas, 15 * 60 * 1000).unref?.();
 
 // ===== FIN BLOQUE 3 =====
+
 // ---------- PumpPortal trade ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool: poolName = 'auto' }) {
   if (!walletKeypair) throw new Error('Wallet no cargada: no se puede tradear');
@@ -1521,9 +1617,14 @@ async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT
   return sig;
 }
 
-// ---------- Dispatcher de ejecución ----------
+// ---------- Dispatcher de ejecución (Fix: no intentar PumpPortal si el origen ya es un DEX distinto) ----------
 async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_SLIPPAGE_BPS }) {
-  const esPump = origen === 'PumpPortal' || origen === 'OnChain';
+  // Solo intentamos PumpPortal si el token probablemente está en pump.fun bonding curve
+  // o en PumpSwap. Si el origen ya es un DEX distinto (Raydium, Jupiter, Meteora, Orca),
+  // vamos directo a Jupiter para no perder 1-2 segundos intentando PumpPortal al vicio.
+  const origenesPump = new Set(['PumpPortal', 'PUMP_FUN', 'PUMP_AMM', 'OnChain', 'pump.fun', 'pumpswap']);
+  const esPump = origenesPump.has(origen);
+
   try {
     if (esPump) {
       return await pumpPortalTrade({
@@ -1545,7 +1646,7 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
       );
       return await ejecutarSwapViaJupiter({ action, mint, amount, slippage });
     }
-    if (esPump && origen === 'OnChain') {
+    if (esPump && (origen === 'OnChain' || origen === 'PumpPortal')) {
       log(
         'warn',
         `Ruta PumpPortal falló para compra (${mint.slice(0, 6)}...), intentando Jupiter como respaldo: ${primerError.message}`
@@ -2057,7 +2158,8 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   }
 
   const symbol = await getTokenSymbol(trade.mint);
-  const link = `https://pump.fun/coin/${trade.mint}`;
+  // Link universal (funciona para cualquier DEX: Raydium, Jupiter, Meteora, Orca, PumpSwap, pump.fun)
+  const link = `https://dexscreener.com/solana/${trade.mint}`;
   const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
   const solTxt = trade.solAmountEstimado
     ? 'SOL no reportado por Helius'
@@ -2524,17 +2626,25 @@ bot.onText(/\/help/, async (msg) => {
   if (!esAdmin(msg)) return;
   const ayuda = `
 🤖 Comandos disponibles:
+
+📋 GESTIÓN DE WALLETS:
 /add <alias> <dirección> <montoUSD> [cadena] – Agrega una wallet a seguir
-/setamount <alias> <nuevoMontoUSD> – Cambia el monto USD por compra para esa alias
+/setamount <alias> <nuevoMontoUSD> – Cambia el monto USD por compra
 /remove <alias> – Elimina una wallet de seguimiento
 /list – Lista todas las wallets trackeadas
-/diag <alias> – Diagnóstico de webhook y últimas tx de una wallet
-/status – Estado general del bot (modo, precio SOL, balances)
-/positions – Muestra las posiciones abiertas del bot
-/ranking [real|paper] – Ranking wallets por PnL
+/diag <alias> – Diagnóstico de webhook y últimas tx
+
+📊 ANÁLISIS:
+/ranking [real|paper] – Ranking de wallets activas con recomendación
+/wallets [real|paper] – Resumen rápido de todas las wallets
+/wallet <alias> – Detalle completo de una wallet específica
 /pnl – PnL realizado + no realizado + total
+/positions – Posiciones abiertas del bot
+
+⚙️ SISTEMA:
+/status – Estado general del bot
 /cleanup – Limpia posiciones de wallets borradas
-/fixwebhook – Fuerza la recreación limpia del webhook en Helius
+/fixwebhook – Fuerza la recreación del webhook en Helius
 /help – Esta ayuda
 `;
   bot.sendMessage(msg.chat.id, ayuda);
@@ -2570,48 +2680,291 @@ bot.onText(/\/positions/, async (msg) => {
   }
 });
 
-// /ranking [real|paper]
+// ---------- Funciones auxiliares para /ranking, /wallets, /wallet ----------
+async function obtenerStatsWallets(modo) {
+  // Solo wallets ACTIVAS (las que están en tracked_wallets)
+  const { rows: activas } = await pool.query('SELECT alias FROM tracked_wallets');
+  const aliasesActivos = activas.map((r) => r.alias);
+  if (aliasesActivos.length === 0) return [];
+
+  // Stats de trade_history agrupadas por alias
+  const { rows: hist } = await pool.query(
+    `SELECT
+       wallet_alias,
+       COUNT(*)::int as trades,
+       SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END)::int as wins,
+       SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END)::int as losses,
+       SUM(profit_sol) as total_profit_sol,
+       AVG(profit_sol) as avg_profit_sol,
+       MAX(profit_sol) as best_trade,
+       MIN(profit_sol) as worst_trade,
+       MAX(closed_at) as ultima_actividad
+     FROM trade_history
+     WHERE modo = $1 AND wallet_alias = ANY($2::text[])
+     GROUP BY wallet_alias`,
+    [modo, aliasesActivos]
+  );
+
+  const statsMap = new Map();
+  for (const r of hist) {
+    statsMap.set(r.wallet_alias, r);
+  }
+
+  // Para wallets sin trades, devolvemos stats en cero
+  const resultado = [];
+  for (const alias of aliasesActivos) {
+    const s = statsMap.get(alias) || {
+      wallet_alias: alias,
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      total_profit_sol: 0,
+      avg_profit_sol: 0,
+      best_trade: null,
+      worst_trade: null,
+      ultima_actividad: null
+    };
+    resultado.push(s);
+  }
+
+  return resultado;
+}
+
+function calcularRecomendacion(stats) {
+  const trades = Number(stats.trades) || 0;
+  const total = Number(stats.total_profit_sol) || 0;
+  const wins = Number(stats.wins) || 0;
+  const wr = trades > 0 ? wins / trades : 0;
+
+  // Sin trades → dato insuficiente
+  if (trades === 0) {
+    return { emoji: '⚪', texto: 'SIN DATOS' };
+  }
+
+  // Actividad reciente
+  let horasInactiva = null;
+  if (stats.ultima_actividad) {
+    horasInactiva = (Date.now() - new Date(stats.ultima_actividad).getTime()) / 3600000;
+  }
+
+  // Reglas
+  if (horasInactiva !== null && horasInactiva > 7 * 24) {
+    return { emoji: '💤', texto: 'INACTIVA >7d' };
+  }
+  if (total > 0 && wr >= 0.5) {
+    return { emoji: '✅', texto: 'MANTENER' };
+  }
+  if (total < 0 && wr < 0.4) {
+    return { emoji: '❌', texto: 'REMOVER' };
+  }
+  return { emoji: '⚠️', texto: 'VIGILAR' };
+}
+
+function formatearTiempoRelativo(fecha) {
+  if (!fecha) return 'nunca';
+  const ms = Date.now() - new Date(fecha).getTime();
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return 'ahora';
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
+// /ranking [real|paper] — Rediseñado: solo wallets activas, con recomendación
 bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
     const modoFiltro = match[1]?.toLowerCase();
     const modo = modoFiltro === 'real' ? 'real' : modoFiltro === 'paper' ? 'paper' : MODO_ACTUAL;
 
-    const { rows } = await pool.query(
-      `SELECT
-         wallet_alias,
-         COUNT(*)::int as trades,
-         SUM(CASE WHEN profit_sol > 0 THEN 1 ELSE 0 END)::int as wins,
-         SUM(CASE WHEN profit_sol < 0 THEN 1 ELSE 0 END)::int as losses,
-         SUM(profit_sol) as total_profit_sol,
-         AVG(profit_sol) as avg_profit_sol,
-         MAX(profit_sol) as best_trade,
-         MIN(profit_sol) as worst_trade
-       FROM trade_history
-       WHERE modo = $1
-       GROUP BY wallet_alias
-       ORDER BY total_profit_sol DESC`,
-      [modo]
-    );
-    if (rows.length === 0) {
-      bot.sendMessage(msg.chat.id, `📭 No hay historial en modo ${modo.toUpperCase()}.`);
+    const stats = await obtenerStatsWallets(modo);
+    if (stats.length === 0) {
+      bot.sendMessage(msg.chat.id, `📭 No hay wallets trackeadas en modo ${modo.toUpperCase()}.`);
       return;
     }
 
-    const lines = rows.map((r, i) => {
-      const trades = Number(r.trades || 0);
-      const wins = Number(r.wins || 0);
-      const wr = trades > 0 ? ((wins / trades) * 100).toFixed(1) : '0.0';
-      const totalNum = Number(r.total_profit_sol || 0);
-      const emoji = totalNum >= 0 ? '🟢' : '🔴';
-      const best = r.best_trade !== null && r.best_trade !== undefined ? Number(r.best_trade).toFixed(4) : '0.0000';
-      const worst = r.worst_trade !== null && r.worst_trade !== undefined ? Number(r.worst_trade).toFixed(4) : '0.0000';
-      const total = totalNum.toFixed(4);
-      return `${i + 1}. ${emoji} ${r.wallet_alias}: ${total} SOL (${trades} trades, ${wr}% WR, best ${best}, worst ${worst})`;
+    // Ordenar por PnL total descendente
+    stats.sort((a, b) => Number(b.total_profit_sol || 0) - Number(a.total_profit_sol || 0));
+
+    const solPrice = await getSolPriceUSD();
+    let totalGlobalSol = 0;
+    let totalGlobalTrades = 0;
+    let activasMantener = 0;
+    let activasVigilar = 0;
+    let activasRemover = 0;
+
+    const lineas = stats.map((s, i) => {
+      const total = Number(s.total_profit_sol || 0);
+      const trades = Number(s.trades) || 0;
+      const wins = Number(s.wins) || 0;
+      const wr = trades > 0 ? ((wins / trades) * 100).toFixed(0) : '—';
+      const promedio = trades > 0 ? Number(s.avg_profit_sol || 0) : 0;
+      const ultima = formatearTiempoRelativo(s.ultima_actividad);
+      const reco = calcularRecomendacion(s);
+
+      totalGlobalSol += total;
+      totalGlobalTrades += trades;
+
+      if (reco.texto === 'MANTENER') activasMantener++;
+      else if (reco.texto === 'REMOVER') activasRemover++;
+      else if (reco.texto === 'VIGILAR') activasVigilar++;
+
+      const totalTxt = `${total >= 0 ? '+' : ''}${total.toFixed(4)} SOL`;
+      const usdTxt = solPrice ? ` (${total >= 0 ? '+' : '-'}$${Math.abs(total * solPrice).toFixed(2)})` : '';
+      const promTxt = trades > 0 ? `${promedio >= 0 ? '+' : ''}${promedio.toFixed(4)}/trade` : 'sin trades';
+      const best = s.best_trade !== null ? `+${Number(s.best_trade).toFixed(3)}` : '—';
+      const worst = s.worst_trade !== null ? `${Number(s.worst_trade).toFixed(3)}` : '—';
+
+      return `${reco.emoji} ${i + 1}. ${s.wallet_alias} — ${reco.texto}
+   PnL: ${totalTxt}${usdTxt}
+   Trades: ${trades} · WR ${wr}% · Prom ${promTxt}
+   Mejor: ${best} · Peor: ${worst} · Última: ${ultima}`;
     });
-    bot.sendMessage(msg.chat.id, `🏆 Ranking wallets (${modo.toUpperCase()}):\n${lines.join('\n')}`);
+
+    const emojiGlobal = totalGlobalSol >= 0 ? '🟢' : '🔴';
+    const usdGlobal = solPrice ? ` (~$${(totalGlobalSol * solPrice).toFixed(2)})` : '';
+
+    let header = `🏆 Ranking WALLETS ACTIVAS (${modo.toUpperCase()}) ${emojiGlobal}\n`;
+    header += `PnL total: ${totalGlobalSol >= 0 ? '+' : ''}${totalGlobalSol.toFixed(4)} SOL${usdGlobal}\n`;
+    header += `Trades totales: ${totalGlobalTrades}\n`;
+    header += `✅ ${activasMantener} · ⚠️ ${activasVigilar} · ❌ ${activasRemover}\n`;
+    header += `─────────────────────`;
+
+    bot.sendMessage(msg.chat.id, `${header}\n\n${lineas.join('\n\n')}`);
   } catch (e) {
     log('error', `Error en /ranking: ${e.message}`);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// /wallets [real|paper] — Resumen rápido
+bot.onText(/\/wallets(?:\s+(\S+))?/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const modoFiltro = match[1]?.toLowerCase();
+    const modo = modoFiltro === 'real' ? 'real' : modoFiltro === 'paper' ? 'paper' : MODO_ACTUAL;
+
+    const stats = await obtenerStatsWallets(modo);
+    if (stats.length === 0) {
+      bot.sendMessage(msg.chat.id, `📭 No hay wallets trackeadas en modo ${modo.toUpperCase()}.`);
+      return;
+    }
+
+    stats.sort((a, b) => Number(b.total_profit_sol || 0) - Number(a.total_profit_sol || 0));
+
+    const solPrice = await getSolPriceUSD();
+    let totalSol = 0;
+    let totalTrades = 0;
+    let ganadoras = 0;
+    let perdedoras = 0;
+    let neutras = 0;
+
+    const lineas = stats.map((s) => {
+      const total = Number(s.total_profit_sol || 0);
+      const trades = Number(s.trades) || 0;
+      const wins = Number(s.wins) || 0;
+      const wr = trades > 0 ? ((wins / trades) * 100).toFixed(0) : '—';
+      const ultima = formatearTiempoRelativo(s.ultima_actividad);
+
+      totalSol += total;
+      totalTrades += trades;
+      if (total > 0.001) ganadoras++;
+      else if (total < -0.001) perdedoras++;
+      else neutras++;
+
+      const emoji = total > 0.001 ? '🟢' : total < -0.001 ? '🔴' : '⚪';
+      const totalTxt = `${total >= 0 ? '+' : ''}${total.toFixed(3)} SOL`;
+
+      return `${emoji} ${s.wallet_alias.padEnd(15)} ${totalTxt.padStart(11)} · ${wr.padStart(3)}% WR · ${ultima}`;
+    });
+
+    const emojiGlobal = totalSol >= 0 ? '🟢' : '🔴';
+    const usdGlobal = solPrice ? ` (~$${(totalSol * solPrice).toFixed(2)})` : '';
+
+    let txt = `📋 Wallets activas (${modo.toUpperCase()}) — ${stats.length}\n\n`;
+    txt += lineas.join('\n');
+    txt += `\n\n─────────────────────\n`;
+    txt += `Total: ${emojiGlobal} ${totalSol >= 0 ? '+' : ''}${totalSol.toFixed(4)} SOL${usdGlobal}\n`;
+    txt += `${totalTrades} trades · ${ganadoras} ganadoras · ${perdedoras} perdedoras · ${neutras} neutras`;
+
+    bot.sendMessage(msg.chat.id, txt);
+  } catch (e) {
+    log('error', `Error en /wallets: ${e.message}`);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// /wallet <alias> — Detalle completo
+bot.onText(/\/wallet (\S+)/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const alias = match[1].trim();
+
+    const { rows: tracked } = await pool.query('SELECT * FROM tracked_wallets WHERE alias=$1', [alias]);
+    if (tracked.length === 0) {
+      bot.sendMessage(msg.chat.id, `⚠️ No existe la wallet "${alias}" en tracked_wallets.`);
+      return;
+    }
+
+    const { rows: hist } = await pool.query(
+      `SELECT profit_sol, symbol, closed_at FROM trade_history
+       WHERE wallet_alias=$1 AND modo=$2
+       ORDER BY closed_at DESC`,
+      [alias, MODO_ACTUAL]
+    );
+
+    if (hist.length === 0) {
+      bot.sendMessage(
+        msg.chat.id,
+        `📊 ${alias} — sin trades cerrados en modo ${MODO_ACTUAL.toUpperCase()} todavía.`
+      );
+      return;
+    }
+
+    const trades = hist.length;
+    const wins = hist.filter((r) => Number(r.profit_sol) > 0).length;
+    const losses = hist.filter((r) => Number(r.profit_sol) < 0).length;
+    const totalSol = hist.reduce((acc, r) => acc + Number(r.profit_sol || 0), 0);
+    const promedio = totalSol / trades;
+    const mejor = hist.reduce((max, r) => Math.max(max, Number(r.profit_sol || 0)), -Infinity);
+    const peor = hist.reduce((min, r) => Math.min(min, Number(r.profit_sol || 0)), Infinity);
+    const wr = (wins / trades) * 100;
+    const ultima = formatearTiempoRelativo(hist[0].closed_at);
+
+    const statsFake = {
+      trades,
+      total_profit_sol: totalSol,
+      wins,
+      ultima_actividad: hist[0].closed_at
+    };
+    const reco = calcularRecomendacion(statsFake);
+
+    const solPrice = await getSolPriceUSD();
+    const usdTotal = solPrice ? ` (~${totalSol >= 0 ? '+' : '-'}$${Math.abs(totalSol * solPrice).toFixed(2)})` : '';
+
+    let txt = `📊 ${alias} — Detalle (${MODO_ACTUAL.toUpperCase()})\n\n`;
+    txt += `PnL total: ${totalSol >= 0 ? '+' : ''}${totalSol.toFixed(4)} SOL${usdTotal}\n`;
+    txt += `Trades: ${trades} · ${wins} ganadores, ${losses} perdedores · WR ${wr.toFixed(1)}%\n`;
+    txt += `Promedio: ${promedio >= 0 ? '+' : ''}${promedio.toFixed(4)} SOL/trade\n`;
+    txt += `Mejor trade: +${mejor.toFixed(4)} SOL (${hist.find((r) => Number(r.profit_sol) === mejor)?.symbol || '?'})\n`;
+    txt += `Peor trade: ${peor.toFixed(4)} SOL (${hist.find((r) => Number(r.profit_sol) === peor)?.symbol || '?'})\n`;
+    txt += `Última actividad: hace ${ultima}\n`;
+    txt += `Recomendación: ${reco.emoji} ${reco.texto}\n\n`;
+    txt += `Últimos ${Math.min(5, hist.length)} trades:\n`;
+
+    const ultimos = hist.slice(0, 5);
+    ultimos.forEach((r, i) => {
+      const p = Number(r.profit_sol || 0);
+      const emoji = p > 0 ? '🟢' : p < 0 ? '🔴' : '⚪';
+      const tiempo = formatearTiempoRelativo(r.closed_at);
+      txt += `${i + 1}. ${emoji} ${p >= 0 ? '+' : ''}${p.toFixed(4)} SOL · ${r.symbol || '?'} · hace ${tiempo}\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, txt);
+  } catch (e) {
+    log('error', `Error en /wallet: ${e.message}`);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
   }
 });
