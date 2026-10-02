@@ -351,7 +351,7 @@ function calcularResultado(costBasisSol, proceedsSolBruto, solPriceActual, netoD
   const cost = Number.isFinite(costBasisSol) ? costBasisSol : 0;
   const proceeds = Number.isFinite(proceedsSolBruto) ? proceedsSolBruto : 0;
   const fees = netoDeFees ? estimarFees(cost, proceeds) : 0;
-  const proceedsNetoSol = proceeds - fees;
+  const proceedsNetoSol = Math.max(proceeds - fees, 0);
   const profitSol = proceedsNetoSol - cost;
   const multiplicador = cost > 0 ? proceedsNetoSol / cost : 0;
   const pct = (multiplicador - 1) * 100;
@@ -1633,11 +1633,8 @@ async function ejecutarSwapViaJupiter({ action, mint, amount, slippage = DEFAULT
   return sig;
 }
 
-// ---------- Dispatcher de ejecución (Fix: no intentar PumpPortal si el origen ya es un DEX distinto) ----------
+// ---------- Dispatcher de ejecución ----------
 async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_SLIPPAGE_BPS }) {
-  // Solo intentamos PumpPortal si el token probablemente está en pump.fun bonding curve
-  // o en PumpSwap. Si el origen ya es un DEX distinto (Raydium, Jupiter, Meteora, Orca),
-  // vamos directo a Jupiter para no perder 1-2 segundos intentando PumpPortal al vicio.
   const origenesPump = new Set(['PumpPortal', 'PUMP_FUN', 'PUMP_AMM', 'OnChain', 'pump.fun', 'pumpswap']);
   const esPump = origenesPump.has(origen);
 
@@ -2174,7 +2171,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   }
 
   const symbol = await getTokenSymbol(trade.mint);
-  // Link universal (funciona para cualquier DEX: Raydium, Jupiter, Meteora, Orca, PumpSwap, pump.fun)
   const link = `https://dexscreener.com/solana/${trade.mint}`;
   const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
   const solTxt = trade.solAmountEstimado
@@ -2220,7 +2216,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     return;
   }
 
-  // Fix 4: si no hay precio, usar fallback en lugar de abortar
   let solPrice = await getSolPriceUSD();
   if (!solPrice) {
     log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la compra');
@@ -2334,10 +2329,26 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
     return;
   }
 
-  await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [
-    trade.traderPublicKey,
-    trade.mint
-  ]);
+  // Módulo C: consultar el balance real de la wallet trackeada después de la venta
+  let walletQuedoSinTokens = true;
+  try {
+    const balanceTrasVenta = await getBalanceDeTokenEnWallet(tracked.address, trade.mint);
+    if (balanceTrasVenta !== null && balanceTrasVenta > 0) {
+      walletQuedoSinTokens = false;
+    }
+  } catch (e) {
+    log('warn', `No se pudo verificar balance post-venta de ${tracked.alias} para ${symbol}: ${e.message}. Asumiendo venta total.`);
+  }
+
+  if (walletQuedoSinTokens) {
+    await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [
+      trade.traderPublicKey,
+      trade.mint
+    ]);
+    log('info', `🧹 seen_tokens limpiado para ${tracked.alias} ${symbol} (venta total confirmada)`);
+  } else {
+    log('info', `🔒 seen_tokens conservado para ${tracked.alias} ${symbol} (venta parcial, wallet aún tiene tokens)`);
+  }
 
   const position = posRes.rows[0];
 
@@ -2411,7 +2422,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
     }
 
-    // ---- FIX 2: límite de cordura contra datos corruptos del parser ----
     const costBasis = Number(position.cost_basis_sol) || 0;
     if (costBasis > 0 && proceedsSol > costBasis * 100) {
       log(
@@ -2427,9 +2437,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       );
       proceedsSol = 0;
     }
-    // ---- FIN FIX 2 ----
 
-    // Fix 4: si no hay precio, usar fallback en lugar de abortar
     let solPrice = await getSolPriceUSD();
     if (!solPrice) {
       log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la venta');
@@ -2457,7 +2465,91 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
   }
 }
 
+// ---------- Módulo B: detección automática de ventas manuales (solo modo REAL) ----------
+let ultimaSignatureManualCheck = null;
+
+async function detectarVentasManuales() {
+  if (!LIVE || !connection || !walletKeypair) return;
+
+  try {
+    const apiKey = getHeliusApiKey();
+    if (!apiKey) return;
+
+    const wallet = walletKeypair.publicKey.toBase58();
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${apiKey}&limit=25`
+    );
+    if (!res.ok) return;
+    const txs = await res.json();
+    if (!Array.isArray(txs) || txs.length === 0) return;
+
+    const { rows: posiciones } = await pool.query(
+      `SELECT * FROM bot_positions WHERE modo = 'real'`
+    );
+    if (posiciones.length === 0) return;
+
+    const mintsAbiertos = new Set(posiciones.map((p) => p.token_mint));
+
+    for (const tx of txs) {
+      if (!tx.signature) continue;
+      if (yaProcesadaSignature(tx.signature)) continue;
+      if (ultimaSignatureManualCheck === tx.signature) break;
+
+      const cambios = extraerCambiosDeTxParaWallet(tx, wallet);
+      for (const cambio of cambios) {
+        if (cambio.direction !== 'sell') continue;
+        if (!mintsAbiertos.has(cambio.mint)) continue;
+
+        const pos = posiciones
+          .filter((p) => p.token_mint === cambio.mint)
+          .sort((a, b) => new Date(a.closed_at || 0) - new Date(b.closed_at || 0))[0];
+        if (!pos) continue;
+
+        const { rows: existente } = await pool.query(
+          `SELECT 1 FROM trade_history
+           WHERE wallet_alias=$1 AND symbol=$2 AND modo='real'
+             AND closed_at > NOW() - INTERVAL '15 minutes'`,
+          [pos.wallet_alias, pos.symbol]
+        );
+        if (existente.length > 0) continue;
+
+        const solPrice = await getSolPriceUSD();
+        const proceedsSol = cambio.solAmount;
+        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+
+        await pool.query(
+          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+          [pos.token_mint, pos.wallet_alias, 'real']
+        );
+        await pool.query(
+          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+          [pos.wallet_address, pos.token_mint]
+        );
+        await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+        marcarSignatureProcesada(tx.signature);
+
+        log(
+          'info',
+          `🖐️ Venta MANUAL detectada [${pos.wallet_alias}] ${pos.symbol} · proceeds ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)}`
+        );
+
+        if (CHAT_ID) {
+          bot.sendMessage(
+            CHAT_ID,
+            `🖐️ Venta MANUAL detectada [${pos.wallet_alias}] ${pos.symbol}\nSalí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)}\ntx: ${linkTx(tx.signature)}`
+          );
+        }
+      }
+    }
+
+    if (txs[0]?.signature) ultimaSignatureManualCheck = txs[0].signature;
+  } catch (e) {
+    log('error', `Error detectando ventas manuales: ${e.message}`);
+  }
+}
+
 // ===== FIN BLOQUE 4 =====
+
 // ---------- Comandos de Telegram ----------
 
 // /add <alias> <dirección> <montoUSD> [cadena]
@@ -2493,7 +2585,6 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
       'INSERT INTO tracked_wallets VALUES ($1,$2,$3,$4) ON CONFLICT(alias) DO UPDATE SET address=$2, amount=$3, chain=$4',
       [alias, address, amount, chain]
     );
-    // await resyncSubscriptions(); // WS desactivado
     await crearOActualizarWebhookHelius();
 
     bot.sendMessage(msg.chat.id, `⏳ Snapshot ${alias} en ${getLabel(chain)}...`);
@@ -2550,7 +2641,6 @@ bot.onText(/\/remove (.+)/, async (msg, match) => {
     const result = await pool.query('DELETE FROM tracked_wallets WHERE alias=$1 RETURNING alias', [alias]);
     if (result.rows.length > 0) {
       bot.sendMessage(msg.chat.id, `✅ ${alias} eliminado de tracked_wallets.`);
-      // await resyncSubscriptions(); // WS desactivado
       await crearOActualizarWebhookHelius();
     } else {
       bot.sendMessage(msg.chat.id, `⚠️ No encontré ninguna wallet con el alias "${alias}"`);
@@ -2655,7 +2745,11 @@ bot.onText(/\/help/, async (msg) => {
 /wallets [real|paper] – Resumen rápido de todas las wallets
 /wallet <alias> – Detalle completo de una wallet específica
 /pnl – PnL realizado + no realizado + total
-/positions – Posiciones abiertas del bot
+/positions – Posiciones abiertas del bot (incluye mint para /close)
+
+🔧 CIERRE MANUAL:
+/close <alias> <mint> – Cierra manualmente una posición
+/closeall <alias> – Cierra todas las posiciones de una wallet
 
 ⚙️ SISTEMA:
 /status – Estado general del bot
@@ -2666,7 +2760,7 @@ bot.onText(/\/help/, async (msg) => {
   bot.sendMessage(msg.chat.id, ayuda);
 });
 
-// /positions
+// /positions (ahora incluye mint para facilitar /close)
 bot.onText(/\/positions/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {
@@ -2684,7 +2778,7 @@ bot.onText(/\/positions/, async (msg) => {
       const modoTag = r.modo === 'real' ? '🟢 REAL' : '🟡 PAPER';
       const amount = Number(r.amount || 0).toFixed(4);
       const cost = Number(r.cost_basis_sol || 0).toFixed(4);
-      return `• ${r.symbol} (${r.chain}) – ${amount} tokens – costo ${cost} SOL – wallet: ${r.wallet_alias} [${modoTag}]`;
+      return `• ${r.symbol} (${r.chain}) – ${amount} tokens – costo ${cost} SOL – wallet: ${r.wallet_alias} [${modoTag}]\n  mint: ${r.token_mint}`;
     });
     bot.sendMessage(
       msg.chat.id,
@@ -2696,14 +2790,154 @@ bot.onText(/\/positions/, async (msg) => {
   }
 });
 
+// ---------- Comandos de cierre manual ----------
+
+// /close <alias> <mint>
+bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const alias = match[1].trim();
+    const mint = match[2].trim();
+
+    const posRes = await pool.query(
+      'SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [mint, alias, MODO_ACTUAL]
+    );
+    if (posRes.rows.length === 0) {
+      bot.sendMessage(
+        msg.chat.id,
+        `⚠️ No encontré posición abierta con alias "${alias}" y mint "${mint}" en modo ${MODO_ACTUAL.toUpperCase()}.`
+      );
+      return;
+    }
+
+    const pos = posRes.rows[0];
+    const { decimals } = await getTokenInfoHelius(pos.token_mint);
+    const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+
+    // Buscar la dirección de la wallet para limpiar seen_tokens correctamente
+    const { rows: trackedRows } = await pool.query('SELECT address FROM tracked_wallets WHERE alias=$1', [alias]);
+    const walletAddress = trackedRows[0]?.address || alias;
+
+    if (MODO_ACTUAL === 'paper' && valorEstimado !== null) {
+      const solPrice = await getSolPriceUSD();
+      const r = calcularResultado(pos.cost_basis_sol, valorEstimado, solPrice, true);
+      const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
+
+      await pool.query(
+        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+      );
+      await pool.query(
+        'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+        [walletAddress, pos.token_mint]
+      );
+      await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+      const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+      const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
+
+      bot.sendMessage(
+        msg.chat.id,
+        `🖐️ CIERRE MANUAL [${pos.wallet_alias}] ${pos.symbol}\nSalí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n${formatearResultado(r)}\nSaldo ficticio: $${saldoSeguro.toFixed(2)}`
+      );
+      log('info', `🖐️ Cierre manual (paper) [${pos.wallet_alias}] ${pos.symbol}: ${formatearResultado(r)}`);
+    } else {
+      await pool.query(
+        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+      );
+      await pool.query(
+        'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+        [walletAddress, pos.token_mint]
+      );
+
+      bot.sendMessage(
+        msg.chat.id,
+        `🖐️ Posición cerrada manualmente [${pos.wallet_alias}] ${pos.symbol}.\n\n⚠️ En modo REAL, el PnL se calculará automáticamente cuando el bot detecte la venta on-chain (módulo de detección de ventas manuales). Si ya vendiste, en los próximos 2 minutos debería llegar el mensaje de "🖐️ Venta MANUAL detectada" con el PnL real.`
+      );
+      log('info', `🖐️ Cierre manual (real) [${pos.wallet_alias}] ${pos.symbol}: solo limpia DB, PnL por detector`);
+    }
+  } catch (e) {
+    log('error', `Error en /close: ${e.message}`);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// /closeall <alias>
+bot.onText(/\/closeall (\S+)/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const alias = match[1].trim();
+
+    const posRes = await pool.query(
+      'SELECT * FROM bot_positions WHERE wallet_alias=$1 AND modo=$2',
+      [alias, MODO_ACTUAL]
+    );
+    if (posRes.rows.length === 0) {
+      bot.sendMessage(
+        msg.chat.id,
+        `⚠️ No hay posiciones abiertas para "${alias}" en modo ${MODO_ACTUAL.toUpperCase()}.`
+      );
+      return;
+    }
+
+    const { rows: trackedRows } = await pool.query('SELECT address FROM tracked_wallets WHERE alias=$1', [alias]);
+    const walletAddress = trackedRows[0]?.address || alias;
+
+    const solPrice = await getSolPriceUSD();
+    let cerradas = 0;
+    let pnlTotalSol = 0;
+    let usdTotal = 0;
+    const simbolos = [];
+
+    for (const pos of posRes.rows) {
+      const { decimals } = await getTokenInfoHelius(pos.token_mint);
+      const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+
+      if (MODO_ACTUAL === 'paper' && valorEstimado !== null) {
+        const r = calcularResultado(pos.cost_basis_sol, valorEstimado, solPrice, true);
+        const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
+        await adjustPaperBalance(proceedsUsd);
+        await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+        pnlTotalSol += r.profitSol;
+        usdTotal += proceedsUsd;
+      }
+
+      await pool.query(
+        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+      );
+      await pool.query(
+        'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+        [walletAddress, pos.token_mint]
+      );
+      cerradas++;
+      simbolos.push(pos.symbol);
+    }
+
+    const emoji = pnlTotalSol >= 0 ? '🟢' : '🔴';
+    let txt = `🖐️ ${cerradas} posiciones cerradas manualmente [${alias}]\n`;
+    txt += `Tokens: ${simbolos.join(', ')}\n`;
+    if (MODO_ACTUAL === 'paper') {
+      txt += `PnL total estimado: ${emoji} ${pnlTotalSol >= 0 ? '+' : ''}${pnlTotalSol.toFixed(4)} SOL`;
+      if (solPrice) txt += ` (~$${usdTotal.toFixed(2)})`;
+    } else {
+      txt += `⚠️ Modo REAL: PnL se calculará cuando el detector detecte las ventas on-chain.`;
+    }
+    bot.sendMessage(msg.chat.id, txt);
+    log('info', `🖐️ /closeall ${alias}: ${cerradas} posiciones cerradas`);
+  } catch (e) {
+    log('error', `Error en /closeall: ${e.message}`);
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
 // ---------- Funciones auxiliares para /ranking, /wallets, /wallet ----------
 async function obtenerStatsWallets(modo) {
-  // Solo wallets ACTIVAS (las que están en tracked_wallets)
   const { rows: activas } = await pool.query('SELECT alias FROM tracked_wallets');
   const aliasesActivos = activas.map((r) => r.alias);
   if (aliasesActivos.length === 0) return [];
 
-  // Stats de trade_history agrupadas por alias
   const { rows: hist } = await pool.query(
     `SELECT
        wallet_alias,
@@ -2726,7 +2960,6 @@ async function obtenerStatsWallets(modo) {
     statsMap.set(r.wallet_alias, r);
   }
 
-  // Para wallets sin trades, devolvemos stats en cero
   const resultado = [];
   for (const alias of aliasesActivos) {
     const s = statsMap.get(alias) || {
@@ -2752,18 +2985,15 @@ function calcularRecomendacion(stats) {
   const wins = Number(stats.wins) || 0;
   const wr = trades > 0 ? wins / trades : 0;
 
-  // Sin trades → dato insuficiente
   if (trades === 0) {
     return { emoji: '⚪', texto: 'SIN DATOS' };
   }
 
-  // Actividad reciente
   let horasInactiva = null;
   if (stats.ultima_actividad) {
     horasInactiva = (Date.now() - new Date(stats.ultima_actividad).getTime()) / 3600000;
   }
 
-  // Reglas
   if (horasInactiva !== null && horasInactiva > 7 * 24) {
     return { emoji: '💤', texto: 'INACTIVA >7d' };
   }
@@ -2788,7 +3018,7 @@ function formatearTiempoRelativo(fecha) {
   return `${d}d`;
 }
 
-// /ranking [real|paper] — Rediseñado: solo wallets activas, con recomendación
+// /ranking [real|paper]
 bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
@@ -2801,7 +3031,6 @@ bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
       return;
     }
 
-    // Ordenar por PnL total descendente
     stats.sort((a, b) => Number(b.total_profit_sol || 0) - Number(a.total_profit_sol || 0));
 
     const solPrice = await getSolPriceUSD();
@@ -2855,7 +3084,7 @@ bot.onText(/\/ranking(?:\s+(\S+))?/, async (msg, match) => {
   }
 });
 
-// /wallets [real|paper] — Resumen rápido
+// /wallets [real|paper]
 bot.onText(/\/wallets(?:\s+(\S+))?/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
@@ -2912,7 +3141,7 @@ bot.onText(/\/wallets(?:\s+(\S+))?/, async (msg, match) => {
   }
 });
 
-// /wallet <alias> — Detalle completo
+// /wallet <alias>
 bot.onText(/\/wallet (\S+)/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
@@ -3085,6 +3314,9 @@ setInterval(() => {
   intervals.push(setInterval(revisarStopLoss, 60_000));
   intervals.push(setInterval(monitoreoAutomaticoWebhook, 600_000));
 
+  // Módulo B: detección automática de ventas manuales (solo modo REAL)
+  intervals.push(setInterval(detectarVentasManuales, 120_000));
+
   intervals.push(
     setInterval(() => {
       const apiKey = getHeliusApiKey();
@@ -3119,3 +3351,4 @@ setInterval(() => {
 })();
 
 // ===== FIN BLOQUE 5 =====
+
