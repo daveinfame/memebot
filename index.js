@@ -1315,7 +1315,7 @@ function logRawTxCompacto(tx) {
 
     const json = JSON.stringify(resumen);
     const recortado = json.length > 1200 ? json.slice(0, 1200) + '...[cortado]' : json;
-    log('info', `📨 RAW TX (${tx.type || '?'}/${tx.source || '?'}) [${cuentasRelevantes.length} cuentas]: ${recortado}`);
+    log('debug', `📨 RAW TX (${tx.type || '?'}/${tx.source || '?'}) [${cuentasRelevantes.length} cuentas]: ${recortado}`);
   } catch (e) {
     log('warn', `No se pudo serializar RAW TX: ${e.message}`);
   }
