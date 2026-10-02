@@ -69,7 +69,7 @@ const NOMBRE_BOT = '⚡️M3M3B0T⚡️';
 
 const PUMP_PORTAL_WS = `wss://pumpportal.fun/api/data?api-key=${process.env.PUMPPORTAL_API_KEY}`;
 const PUMP_PORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
-const JUPITER_BASE = 'https://api.jup.ag/swap/v2';
+const JUPITER_BASE = 'https://api.jup.ag/swap/v1';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
