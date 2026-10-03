@@ -1678,11 +1678,12 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
     if (rawAmount <= 0) return null;
 
     const url = `${JUPITER_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=${DEFAULT_SLIPPAGE_BPS}`;
+    log('info', `🔍 Quote URL (stop-loss): ${url}`);
     const res = await fetchJupiterConReintento(url, {
       headers: { 'x-api-key': process.env.JUPITER_API_KEY }
     });
     if (!res.ok) {
-      log('warn', `Jupiter /quote (stop-loss) respondió mal: ${res.status}`);
+      log('warn', `Jupiter /quote (stop-loss) respondió mal: ${res.status} — URL: ${url}`);
       return null;
     }
     const data = await res.json();
