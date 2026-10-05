@@ -1534,7 +1534,6 @@ async function procesarWebhookHelius(rawBody) {
 setInterval(limpiarSignaturesViejas, 15 * 60 * 1000).unref?.();
 
 // ===== FIN BLOQUE 3 =====
-
 // ---------- PumpPortal trade ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool: poolName = 'auto' }) {
   if (!walletKeypair) throw new Error('Wallet no cargada: no se puede tradear');
@@ -1670,11 +1669,35 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   }
 }
 
-// ---------- Valor estimado en SOL (para stop-loss) ----------
+// ---------- Valor estimado en SOL (Fix A: usa saldo real de la wallet) ----------
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
   if (!process.env.JUPITER_API_KEY) return null;
   try {
-    const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
+    // FIX A: consultar el saldo REAL de la wallet del bot antes de cotizar.
+    // El position.amount de la DB puede estar mal, y si mandamos un amount irreal
+    // a Jupiter, responde 400 Bad Request.
+    let cantidadReal = cantidadTokens;
+    if (walletKeypair) {
+      try {
+        const saldoReal = await getBalanceDeTokenEnWallet(
+          walletKeypair.publicKey.toBase58(),
+          mint
+        );
+        if (saldoReal !== null && saldoReal > 0) {
+          if (Math.abs(saldoReal - cantidadTokens) / Math.max(cantidadTokens, 1) > 0.01) {
+            log(
+              'warn',
+              `🔍 estimarValorEnSol: saldo real (${saldoReal}) ≠ position.amount (${cantidadTokens}) para ${mint.slice(0, 6)}... Usando saldo real.`
+            );
+          }
+          cantidadReal = saldoReal;
+        }
+      } catch (e) {
+        log('warn', `No se pudo consultar saldo real para ${mint.slice(0, 6)}...: ${e.message}. Usando position.amount.`);
+      }
+    }
+
+    const rawAmount = Math.floor(cantidadReal * Math.pow(10, decimals));
     if (rawAmount <= 0) return null;
 
     const url = `${JUPITER_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=${DEFAULT_SLIPPAGE_BPS}`;
@@ -2163,7 +2186,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
   }
 }
 
-// ---------- Compra ----------
+// ---------- Compra (con Fix B: actualizar amount con saldo real post-compra) ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) {
@@ -2269,6 +2292,21 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
         [trade.traderPublicKey, trade.mint]
       );
 
+      // FIX B (solo LIVE): consultar saldo REAL post-compra y actualizar amount
+      try {
+        await sleep(4000); // esperar a que la TX se confirme y se vea en RPC
+        const saldoReal = await getBalanceDeTokenEnWallet(walletKeypair.publicKey.toBase58(), trade.mint);
+        if (saldoReal !== null && saldoReal > 0) {
+          await pool.query(
+            'UPDATE bot_positions SET amount=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4',
+            [saldoReal, trade.mint, tracked.alias, MODO_ACTUAL]
+          );
+          log('info', `✅ amount actualizado con saldo real: ${saldoReal} (era ${tokensBought.toFixed(6)})`);
+        }
+      } catch (e) {
+        log('warn', `No se pudo verificar saldo real post-compra (${symbol}): ${e.message}`);
+      }
+
       try {
         const saldoFinal = await getWalletSolBalance();
         if (CHAT_ID) {
@@ -2289,6 +2327,7 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       }
     }
   } else {
+    // PAPER: no hay transacción real, pero podemos guardar el amount calculado
     await pool.query(
       'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]
