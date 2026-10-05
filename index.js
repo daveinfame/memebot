@@ -1534,6 +1534,7 @@ async function procesarWebhookHelius(rawBody) {
 setInterval(limpiarSignaturesViejas, 15 * 60 * 1000).unref?.();
 
 // ===== FIN BLOQUE 3 =====
+
 // ---------- PumpPortal trade ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool: poolName = 'auto' }) {
   if (!walletKeypair) throw new Error('Wallet no cargada: no se puede tradear');
@@ -1669,13 +1670,15 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   }
 }
 
-// ---------- Valor estimado en SOL (Fix A: usa saldo real de la wallet) ----------
+// ---------- Valor estimado en SOL (Fix A + detección de NOT_TRADABLE) ----------
+// Devuelve siempre un objeto: { valorSol: number|null, error: string|null }
+//   - valorSol número + error null     → OK
+//   - valorSol null  + error NOT_TRADABLE → token no tradable en Jupiter
+//   - valorSol null  + error OTHER     → otro error (red, timeout, etc.)
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
-  if (!process.env.JUPITER_API_KEY) return null;
+  if (!process.env.JUPITER_API_KEY) return { valorSol: null, error: 'NO_API_KEY' };
   try {
-    // FIX A: consultar el saldo REAL de la wallet del bot antes de cotizar.
-    // El position.amount de la DB puede estar mal, y si mandamos un amount irreal
-    // a Jupiter, responde 400 Bad Request.
+    // Fix A: consultar el saldo REAL de la wallet del bot antes de cotizar.
     let cantidadReal = cantidadTokens;
     if (walletKeypair) {
       try {
@@ -1698,7 +1701,7 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
     }
 
     const rawAmount = Math.floor(cantidadReal * Math.pow(10, decimals));
-    if (rawAmount <= 0) return null;
+    if (rawAmount <= 0) return { valorSol: null, error: 'ZERO_AMOUNT' };
 
     const url = `${JUPITER_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=${DEFAULT_SLIPPAGE_BPS}`;
     log('info', `🔍 Quote URL (stop-loss): ${url}`);
@@ -1706,15 +1709,28 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
       headers: { 'x-api-key': process.env.JUPITER_API_KEY }
     });
     if (!res.ok) {
+      // Leer el body para detectar TOKEN_NOT_TRADABLE
+      let body = '';
+      try {
+        body = await res.text();
+      } catch (_) {}
+      const esNoTradable = body.includes('TOKEN_NOT_TRADABLE') || body.includes('not tradable');
+      if (esNoTradable) {
+        log(
+          'warn',
+          `⚠️ Token ${mint.slice(0, 6)}... NO TRADABLE en Jupiter (${res.status})`
+        );
+        return { valorSol: null, error: 'NOT_TRADABLE' };
+      }
       log('warn', `Jupiter /quote (stop-loss) respondió mal: ${res.status} — URL: ${url}`);
-      return null;
+      return { valorSol: null, error: 'OTHER' };
     }
     const data = await res.json();
-    if (!data.outAmount) return null;
-    return parseFloat(data.outAmount) / LAMPORTS_PER_SOL;
+    if (!data.outAmount) return { valorSol: null, error: 'NO_OUT_AMOUNT' };
+    return { valorSol: parseFloat(data.outAmount) / LAMPORTS_PER_SOL, error: null };
   } catch (e) {
     log('warn', `No se pudo cotizar valor para stop-loss (${mint.slice(0, 6)}...): ${e.message}`);
-    return null;
+    return { valorSol: null, error: 'OTHER' };
   }
 }
 
@@ -2028,8 +2044,8 @@ async function reconciliarPosiciones(forzado = false) {
         }
       } else {
         const { decimals } = await getTokenInfoHelius(pos.token_mint);
-        const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-        const proceedsSol = valorEstimado ?? 0;
+        const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+        const proceedsSol = resultado.valorSol ?? 0;
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
         const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
@@ -2077,17 +2093,30 @@ async function revisarStopLoss() {
     await mapLimit(posiciones, 5, async (pos) => {
       if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) return;
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
-      const valorActualSol = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-      if (valorActualSol === null) return;
+      const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
 
-      const ratio = valorActualSol / pos.cost_basis_sol;
+      // Caso 1: token NO TRADABLE → dispara cierre especial
+      if (resultado.error === 'NOT_TRADABLE') {
+        log(
+          'info',
+          `🛑 Token NO TRADABLE detectado en SL: ${pos.wallet_alias} ${pos.symbol}`
+        );
+        await ejecutarStopLossNoTradable(pos);
+        return;
+      }
+
+      // Caso 2: otro error → saltar
+      if (resultado.valorSol === null) return;
+
+      // Caso 3: OK → lógica normal del SL
+      const ratio = resultado.valorSol / pos.cost_basis_sol;
       if (ratio > STOP_LOSS_PCT) return;
 
       log(
         'info',
-        `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${valorActualSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`
+        `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${resultado.valorSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`
       );
-      await ejecutarStopLoss(pos, valorActualSol);
+      await ejecutarStopLoss(pos, resultado.valorSol);
     });
   } catch (e) {
     log('error', `Error revisando stop-loss: ${e.message}`);
@@ -2183,6 +2212,122 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
         `🛑 PAPER STOP-LOSS: ${pos.symbol} vía ${pos.wallet_alias} · Salí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`
       );
     }
+  }
+}
+
+// ---------- Stop-loss especial para tokens NO TRADABLES ----------
+// En paper: cierra directo como pérdida total (proceeds 0).
+// En real: intenta vender vía PumpPortal hasta 3 ciclos (3 min). Si los 3 fallan, cierra como pérdida total.
+const intentosNoTradable = new Map(); // key: `${mint}:${alias}` → count
+
+async function ejecutarStopLossNoTradable(pos) {
+  const key = `${pos.token_mint}:${pos.wallet_alias}`;
+  const intentosActuales = intentosNoTradable.get(key) || 0;
+
+  // PAPER: cierra directo como pérdida total
+  if (!LIVE || pos.chain !== 'solana' || !walletKeypair || !connection) {
+    const solPrice = await getSolPriceUSD();
+    const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, true);
+    const proceedsUsd = 0;
+
+    await pool.query(
+      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+    );
+    await pool.query(
+      'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+      [pos.wallet_address, pos.token_mint]
+    );
+    await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+
+    if (CHAT_ID) {
+      bot.sendMessage(
+        CHAT_ID,
+        `🛑 PAPER STOP-LOSS (token no tradable) [${pos.wallet_alias}] ${pos.symbol}\nJupiter no puede cotizar este token. Cerrando como pérdida total.\nSalí con: 0.0000 SOL\n❌ PÉRDIDA: ${Math.abs(r.profitSol).toFixed(4)} SOL (-$${Math.abs(r.profitUsd || 0).toFixed(2)}) · -100% · 0.00x\nSaldo ficticio: $${nuevoSaldo.toFixed(2)}`
+      );
+    }
+    intentosNoTradable.delete(key);
+    return;
+  }
+
+  // REAL: intentar vender vía PumpPortal (hasta 3 ciclos)
+  if (intentosActuales >= 3) {
+    // Se agotaron los intentos. Cerrar como pérdida total.
+    log(
+      'warn',
+      `🛑 [${pos.wallet_alias}] ${pos.symbol}: 3 intentos de venta fallidos (token no tradable). Cerrando como pérdida total.`
+    );
+
+    const solPrice = await getSolPriceUSD();
+    const r = calcularResultado(pos.cost_basis_sol, 0, solPrice, false);
+
+    await pool.query(
+      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+    );
+    await pool.query(
+      'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+      [pos.wallet_address, pos.token_mint]
+    );
+    await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+
+    if (CHAT_ID) {
+      bot.sendMessage(
+        CHAT_ID,
+        `🛑 STOP-LOSS (token no tradable) [${pos.wallet_alias}] ${pos.symbol}\nJupiter y PumpPortal no pueden vender este token.\nCerrando como pérdida total.\n❌ PÉRDIDA: ${Math.abs(r.profitSol).toFixed(4)} SOL (-$${Math.abs(r.profitUsd || 0).toFixed(2)}) · -100%`
+      );
+    }
+    intentosNoTradable.delete(key);
+    return;
+  }
+
+  // Intento de venta vía PumpPortal
+  intentosNoTradable.set(key, intentosActuales + 1);
+  log(
+    'info',
+    `🔄 Intento ${intentosActuales + 1}/3 de vender ${pos.symbol} vía PumpPortal (token no tradable en Jupiter)...`
+  );
+
+  try {
+    const before = await getWalletSolBalance();
+    const sig = await ejecutarTrade({
+      action: 'sell',
+      mint: pos.token_mint,
+      amount: pos.amount,
+      origen: 'OnChain', // fuerza pumpPortalTrade primero
+      slippage: DEFAULT_SLIPPAGE_BPS
+    });
+    await sleep(ESPERA_LECTURA_SALDO_MS);
+    const after = await getWalletSolBalance();
+    const proceedsSol = after - before;
+    const solPrice = await getSolPriceUSD();
+    const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+
+    await pool.query(
+      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+    );
+    await pool.query(
+      'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+      [pos.wallet_address, pos.token_mint]
+    );
+    await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+    intentosNoTradable.delete(key);
+
+    let msg = `🛑 STOP-LOSS (token no tradable) [${pos.wallet_alias}] ${pos.symbol}\nJupiter no cotiza, pero PumpPortal SÍ pudo vender.\nSalí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
+    const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
+    if (rentRecuperado) {
+      msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+    }
+    if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+  } catch (e) {
+    log(
+      'warn',
+      `Intento ${intentosActuales + 1}/3 falló para ${pos.symbol}: ${e.message}`
+    );
+    // No cierra la posición todavía. Se reintentará en el próximo ciclo de SL.
+    // Si llega a 3 intentos, el siguiente ciclo entra al bloque de "3 intentos agotados" y cierra.
   }
 }
 
@@ -2292,9 +2437,9 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
         [trade.traderPublicKey, trade.mint]
       );
 
-      // FIX B (solo LIVE): consultar saldo REAL post-compra y actualizar amount
+      // Fix B (solo LIVE): consultar saldo REAL post-compra y actualizar amount
       try {
-        await sleep(4000); // esperar a que la TX se confirme y se vea en RPC
+        await sleep(4000);
         const saldoReal = await getBalanceDeTokenEnWallet(walletKeypair.publicKey.toBase58(), trade.mint);
         if (saldoReal !== null && saldoReal > 0) {
           await pool.query(
@@ -2327,7 +2472,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       }
     }
   } else {
-    // PAPER: no hay transacción real, pero podemos guardar el amount calculado
     await pool.query(
       'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL]
@@ -2369,7 +2513,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
     return;
   }
 
-  // Módulo C: consultar el balance real de la wallet trackeada después de la venta
   let walletQuedoSinTokens = true;
   try {
     const balanceTrasVenta = await getBalanceDeTokenEnWallet(tracked.address, trade.mint);
@@ -2589,7 +2732,6 @@ async function detectarVentasManuales() {
 }
 
 // ===== FIN BLOQUE 4 =====
-
 // ---------- Comandos de Telegram ----------
 
 // /add <alias> <dirección> <montoUSD> [cadena]
@@ -2800,7 +2942,7 @@ bot.onText(/\/help/, async (msg) => {
   bot.sendMessage(msg.chat.id, ayuda);
 });
 
-// /positions (ahora incluye mint para facilitar /close)
+// /positions (incluye mint para facilitar /close)
 bot.onText(/\/positions/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {
@@ -2853,15 +2995,17 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
 
     const pos = posRes.rows[0];
     const { decimals } = await getTokenInfoHelius(pos.token_mint);
-    const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+    const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+    const valorEstimado = resultado.valorSol;
 
-    // Buscar la dirección de la wallet para limpiar seen_tokens correctamente
     const { rows: trackedRows } = await pool.query('SELECT address FROM tracked_wallets WHERE alias=$1', [alias]);
     const walletAddress = trackedRows[0]?.address || alias;
 
-    if (MODO_ACTUAL === 'paper' && valorEstimado !== null) {
+    if (MODO_ACTUAL === 'paper') {
+      // En paper: cerramos con proceeds estimados (o 0 si no se pudo cotizar / no tradable)
+      const proceedsSol = valorEstimado ?? 0;
       const solPrice = await getSolPriceUSD();
-      const r = calcularResultado(pos.cost_basis_sol, valorEstimado, solPrice, true);
+      const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
       const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
       await pool.query(
@@ -2876,12 +3020,20 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
       const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
       const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
+      let detalleValor = '';
+      if (resultado.error === 'NOT_TRADABLE') {
+        detalleValor = '⚠️ Token no tradable en Jupiter. Cerrado con proceeds 0.';
+      } else if (valorEstimado === null) {
+        detalleValor = '⚠️ No se pudo cotizar el valor actual. Cerrado con proceeds 0.';
+      }
+
       bot.sendMessage(
         msg.chat.id,
-        `🖐️ CIERRE MANUAL [${pos.wallet_alias}] ${pos.symbol}\nSalí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n${formatearResultado(r)}\nSaldo ficticio: $${saldoSeguro.toFixed(2)}`
+        `🖐️ CIERRE MANUAL [${pos.wallet_alias}] ${pos.symbol}\n${detalleValor}\nSalí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n${formatearResultado(r)}\nSaldo ficticio: $${saldoSeguro.toFixed(2)}`
       );
       log('info', `🖐️ Cierre manual (paper) [${pos.wallet_alias}] ${pos.symbol}: ${formatearResultado(r)}`);
     } else {
+      // En real: solo limpia DB (el detector calcula el PnL)
       await pool.query(
         'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
         [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
@@ -2932,10 +3084,12 @@ bot.onText(/\/closeall (\S+)/, async (msg, match) => {
 
     for (const pos of posRes.rows) {
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
-      const valorEstimado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+      const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
+      const valorEstimado = resultado.valorSol;
 
-      if (MODO_ACTUAL === 'paper' && valorEstimado !== null) {
-        const r = calcularResultado(pos.cost_basis_sol, valorEstimado, solPrice, true);
+      if (MODO_ACTUAL === 'paper') {
+        const proceedsSol = valorEstimado ?? 0;
+        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
         const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
         await adjustPaperBalance(proceedsUsd);
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
@@ -3254,7 +3408,7 @@ bot.onText(/\/wallet (\S+)/, async (msg, match) => {
   }
 });
 
-// /pnl
+// /pnl (maneja el objeto { valorSol, error })
 bot.onText(/\/pnl/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {
@@ -3273,11 +3427,21 @@ bot.onText(/\/pnl/, async (msg) => {
     );
 
     let unrealizedSol = 0;
+    let posicionesNoTradables = 0;
+
     if (pos.length > 0) {
       for (const p of pos) {
         const { decimals } = await getTokenInfoHelius(p.token_mint);
-        const valor = await estimarValorEnSol(p.token_mint, p.amount, decimals);
-        if (valor !== null) unrealizedSol += valor - (Number(p.cost_basis_sol) || 0);
+        const resultado = await estimarValorEnSol(p.token_mint, p.amount, decimals);
+
+        if (resultado.error === 'NOT_TRADABLE') {
+          // Token no tradable → cuenta como 0 (pérdida unrealized total)
+          unrealizedSol += 0 - (Number(p.cost_basis_sol) || 0);
+          posicionesNoTradables++;
+        } else if (resultado.valorSol !== null) {
+          unrealizedSol += resultado.valorSol - (Number(p.cost_basis_sol) || 0);
+        }
+        // Si error OTHER, se omite (no se puede calcular)
       }
     }
 
@@ -3288,6 +3452,9 @@ bot.onText(/\/pnl/, async (msg) => {
     txt += `🔒 Realizado: ${realizedSol.toFixed(4)} SOL\n`;
     if (pos.length > 0) {
       txt += `📈 No realizado: ${unrealizedSol.toFixed(4)} SOL (${pos.length} pos abiertas)\n`;
+      if (posicionesNoTradables > 0) {
+        txt += `⚠️ ${posicionesNoTradables} posiciones con tokens no tradables (contadas como pérdida total)\n`;
+      }
     }
     txt += `🧮 Total: ${totalSol.toFixed(4)} SOL`;
     const solPrice = await getSolPriceUSD();
@@ -3353,8 +3520,6 @@ setInterval(() => {
   intervals.push(setInterval(reconciliarPosiciones, 60_000));
   intervals.push(setInterval(revisarStopLoss, 60_000));
   intervals.push(setInterval(monitoreoAutomaticoWebhook, 600_000));
-
-  // Módulo B: detección automática de ventas manuales (solo modo REAL)
   intervals.push(setInterval(detectarVentasManuales, 120_000));
 
   intervals.push(
@@ -3391,4 +3556,3 @@ setInterval(() => {
 })();
 
 // ===== FIN BLOQUE 5 =====
-
