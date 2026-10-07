@@ -1534,6 +1534,7 @@ async function procesarWebhookHelius(rawBody) {
 setInterval(limpiarSignaturesViejas, 15 * 60 * 1000).unref?.();
 
 // ===== FIN BLOQUE 3 =====
+
 // ---------- PumpPortal trade ----------
 async function pumpPortalTrade({ action, mint, amount, denominatedInSol, slippage = 10, priorityFee = 0.0005, pool: poolName = 'auto' }) {
   if (!walletKeypair) throw new Error('Wallet no cargada: no se puede tradear');
@@ -1669,37 +1670,56 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   }
 }
 
-// ---------- Valor estimado en SOL (con detección de NOT_TRADABLE) ----------
-// Devuelve siempre: { valorSol: number|null, error: string|null }
-async function estimarValorEnSol(mint, cantidadTokens, decimals) {
+// ---------- Cotización vía DexScreener ----------
+// Devuelve: { valorSol: number|null, error: string|null }
+// Consulta DexScreener, elige el pair con más liquidez, y calcula el valor en SOL.
+async function cotizarViaDexScreener(mint, cantidadTokens) {
+  try {
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      return { valorSol: null, error: 'DEXSCREENER_HTTP_' + res.status };
+    }
+    const data = await res.json();
+    if (!data || !Array.isArray(data.pairs) || data.pairs.length === 0) {
+      return { valorSol: null, error: 'NO_PAIRS' };
+    }
+    // Elegir el pair con más liquidez en USD
+    const pair = data.pairs
+      .filter((p) => p.liquidity && typeof p.liquidity.usd === 'number')
+      .sort((a, b) => (b.liquidity.usd || 0) - (a.liquidity.usd || 0))[0]
+      || data.pairs[0];
+
+    const priceNativeStr = pair?.priceNative;
+    if (!priceNativeStr) {
+      return { valorSol: null, error: 'NO_PRICE_NATIVE' };
+    }
+    const precioNative = parseFloat(priceNativeStr);
+    if (!Number.isFinite(precioNative) || precioNative <= 0) {
+      return { valorSol: null, error: 'INVALID_PRICE' };
+    }
+    const valorSol = cantidadTokens * precioNative;
+    log(
+      'info',
+      `📊 DexScreener: precio ${precioNative.toExponential(4)} SOL/token · posición ${cantidadTokens.toFixed(4)} tokens → ${valorSol.toFixed(6)} SOL (dex: ${pair.dexId}, mcap: $${pair.marketCap || 'n/d'})`
+    );
+    return { valorSol, error: null };
+  } catch (e) {
+    return { valorSol: null, error: 'DEXSCREENER_ERROR: ' + e.message };
+  }
+}
+
+// ---------- Cotización vía Jupiter ----------
+// Devuelve: { valorSol: number|null, error: string|null }
+//   - error NOT_TRADABLE → token no tradable en Jupiter
+//   - error OTHER → otro error
+async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
   if (!process.env.JUPITER_API_KEY) return { valorSol: null, error: 'NO_API_KEY' };
   try {
-    let cantidadReal = cantidadTokens;
-    if (walletKeypair) {
-      try {
-        const saldoReal = await getBalanceDeTokenEnWallet(
-          walletKeypair.publicKey.toBase58(),
-          mint
-        );
-        if (saldoReal !== null && saldoReal > 0) {
-          if (Math.abs(saldoReal - cantidadTokens) / Math.max(cantidadTokens, 1) > 0.01) {
-            log(
-              'warn',
-              `🔍 estimarValorEnSol: saldo real (${saldoReal}) ≠ position.amount (${cantidadTokens}) para ${mint.slice(0, 6)}... Usando saldo real.`
-            );
-          }
-          cantidadReal = saldoReal;
-        }
-      } catch (e) {
-        log('warn', `No se pudo consultar saldo real para ${mint.slice(0, 6)}...: ${e.message}. Usando position.amount.`);
-      }
-    }
-
-    const rawAmount = Math.floor(cantidadReal * Math.pow(10, decimals));
+    const rawAmount = Math.floor(cantidadTokens * Math.pow(10, decimals));
     if (rawAmount <= 0) return { valorSol: null, error: 'ZERO_AMOUNT' };
 
     const url = `${JUPITER_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${rawAmount}&slippageBps=${DEFAULT_SLIPPAGE_BPS}`;
-    log('info', `🔍 Quote URL (stop-loss): ${url}`);
     const res = await fetchJupiterConReintento(url, {
       headers: { 'x-api-key': process.env.JUPITER_API_KEY }
     });
@@ -1710,22 +1730,55 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
       } catch (_) {}
       const esNoTradable = body.includes('TOKEN_NOT_TRADABLE') || body.includes('not tradable');
       if (esNoTradable) {
-        log(
-          'warn',
-          `⚠️ Token ${mint.slice(0, 6)}... NO TRADABLE en Jupiter (${res.status})`
-        );
         return { valorSol: null, error: 'NOT_TRADABLE' };
       }
-      log('warn', `Jupiter /quote (stop-loss) respondió mal: ${res.status} — URL: ${url}`);
-      return { valorSol: null, error: 'OTHER' };
+      return { valorSol: null, error: 'JUPITER_HTTP_' + res.status };
     }
     const data = await res.json();
     if (!data.outAmount) return { valorSol: null, error: 'NO_OUT_AMOUNT' };
     return { valorSol: parseFloat(data.outAmount) / LAMPORTS_PER_SOL, error: null };
   } catch (e) {
-    log('warn', `No se pudo cotizar valor para stop-loss (${mint.slice(0, 6)}...): ${e.message}`);
-    return { valorSol: null, error: 'OTHER' };
+    return { valorSol: null, error: 'JUPITER_ERROR: ' + e.message };
   }
+}
+
+// ---------- Valor estimado en SOL (DexScreener → Jupiter) ----------
+// Devuelve siempre: { valorSol: number|null, error: string|null }
+async function estimarValorEnSol(mint, cantidadTokens, decimals) {
+  // 1. Consultar el saldo REAL de la wallet del bot
+  let cantidadReal = cantidadTokens;
+  if (walletKeypair) {
+    try {
+      const saldoReal = await getBalanceDeTokenEnWallet(
+        walletKeypair.publicKey.toBase58(),
+        mint
+      );
+      if (saldoReal !== null && saldoReal > 0) {
+        if (Math.abs(saldoReal - cantidadTokens) / Math.max(cantidadTokens, 1) > 0.01) {
+          log(
+            'warn',
+            `🔍 estimarValorEnSol: saldo real (${saldoReal}) ≠ position.amount (${cantidadTokens}) para ${mint.slice(0, 6)}... Usando saldo real.`
+          );
+        }
+        cantidadReal = saldoReal;
+      }
+    } catch (e) {
+      log('warn', `No se pudo consultar saldo real para ${mint.slice(0, 6)}...: ${e.message}. Usando position.amount.`);
+    }
+  }
+
+  if (cantidadReal <= 0) return { valorSol: null, error: 'ZERO_AMOUNT' };
+
+  // 2. DexScreener (fuente primaria)
+  const dexs = await cotizarViaDexScreener(mint, cantidadReal);
+  if (dexs.valorSol !== null) {
+    return dexs;
+  }
+
+  // 3. Jupiter (fallback)
+  log('info', `⚠️ DexScreener falló (${dexs.error}), intentando Jupiter para ${mint.slice(0, 6)}...`);
+  const jup = await cotizarViaJupiter(mint, cantidadReal, decimals);
+  return jup;
 }
 
 // ---------- Swap de ganancia a USDC ----------
@@ -2089,13 +2142,11 @@ async function revisarStopLoss() {
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
       const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
 
-      // Caso 1: token NO TRADABLE en Jupiter
+      // Caso 1: token sin precio (DexScreener falló, Jupiter dijo NOT_TRADABLE)
       if (resultado.error === 'NOT_TRADABLE') {
         if (LIVE) {
-          // REAL: intentar vender vía PumpPortal → Jupiter. Si todo falla, reintentar en el próximo ciclo.
           await ejecutarStopLossNoTradable(pos);
         } else {
-          // PAPER: no cerrar. Esperar a que la wallet venda.
           log(
             'info',
             `📌 [PAPER] Token ${pos.symbol} no tradable en Jupiter (${pos.token_mint.slice(0, 6)}...). NO cerramos. Esperando venta de la wallet.`
@@ -2104,8 +2155,11 @@ async function revisarStopLoss() {
         return;
       }
 
-      // Caso 2: otro error → saltar
-      if (resultado.valorSol === null) return;
+      // Caso 2: sin precio de ninguna fuente → saltar
+      if (resultado.valorSol === null) {
+        log('warn', `Sin precio para ${pos.symbol} (${resultado.error}). Saltando en este ciclo.`);
+        return;
+      }
 
       // Caso 3: OK → lógica normal del SL
       const ratio = resultado.valorSol / pos.cost_basis_sol;
@@ -2113,7 +2167,7 @@ async function revisarStopLoss() {
 
       log(
         'info',
-        `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${resultado.valorSol.toFixed(4)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`
+        `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${resultado.valorSol.toFixed(6)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`
       );
       await ejecutarStopLoss(pos, resultado.valorSol);
     });
@@ -2215,8 +2269,6 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
 }
 
 // ---------- Stop-loss especial para tokens NO TRADABLES (solo REAL) ----------
-// Intenta vender vía PumpPortal → Jupiter (1 intento cada uno).
-// Si todo falla, NO cierra la posición. Reintenta en el próximo ciclo de SL.
 async function ejecutarStopLossNoTradable(pos) {
   if (!LIVE || pos.chain !== 'solana' || !walletKeypair || !connection) return;
 
@@ -2231,7 +2283,7 @@ async function ejecutarStopLossNoTradable(pos) {
       action: 'sell',
       mint: pos.token_mint,
       amount: pos.amount,
-      origen: 'OnChain', // → PumpPortal primero, luego Jupiter
+      origen: 'OnChain',
       slippage: DEFAULT_SLIPPAGE_BPS
     });
     await sleep(ESPERA_LECTURA_SALDO_MS);
@@ -2259,16 +2311,14 @@ async function ejecutarStopLossNoTradable(pos) {
 
     log('info', `✅ Venta de token no tradable exitosa para ${pos.symbol}`);
   } catch (e) {
-    // Todas las vías fallaron en este ciclo. NO cerramos. Reintentamos en el próximo ciclo.
     log(
       'warn',
       `🔄 Venta de ${pos.symbol} falló en este ciclo (${e.message}). Se reintentará en el próximo.`
     );
-    // No mandamos mensaje por Telegram (sería ruido).
   }
 }
 
-// ---------- Compra (con Fix B: actualizar amount con saldo real post-compra) ----------
+// ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) {
@@ -2374,7 +2424,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
         [trade.traderPublicKey, trade.mint]
       );
 
-      // Fix B (solo LIVE): consultar saldo REAL post-compra y actualizar amount
       try {
         await sleep(4000);
         const saldoReal = await getBalanceDeTokenEnWallet(walletKeypair.publicKey.toBase58(), trade.mint);
@@ -2533,20 +2582,35 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       }
     }
   } else {
+    // PAPER: prioridad para calcular proceeds:
+    //   1. estimarValorEnSol (DexScreener → Jupiter) → precio real actual
+    //   2. trade de la wallet trackeada (si el monto no es el fallback de 0.001)
+    //   3. cost_basis_sol (PnL = 0)
+    const { decimals } = await getTokenInfoHelius(trade.mint);
+    const resultado = await estimarValorEnSol(trade.mint, position.amount, decimals);
+
     let proceedsSol;
-    if (trade.tokenAmount && trade.solAmount > 0) {
+    let fuente;
+
+    if (resultado.valorSol !== null) {
+      proceedsSol = resultado.valorSol;
+      fuente = 'DexScreener/Jupiter';
+    } else if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
       const precioPorToken = trade.solAmount / trade.tokenAmount;
       proceedsSol = position.amount * precioPorToken;
+      fuente = 'trade de la wallet';
     } else {
-      const priceAtSell = bondingCurvePriceSol(trade);
-      proceedsSol = priceAtSell ? position.amount * priceAtSell : position.cost_basis_sol;
+      proceedsSol = position.cost_basis_sol;
+      fuente = 'cost_basis (fallback, PnL = 0)';
     }
+
+    log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
 
     const costBasis = Number(position.cost_basis_sol) || 0;
     if (costBasis > 0 && proceedsSol > costBasis * 100) {
       log(
         'warn',
-        `⚠️ proceedsSol absurdo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis (sin ganancia) para no contaminar el balance.`
+        `⚠️ proceedsSol absurdo detectado para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis (sin ganancia).`
       );
       proceedsSol = costBasis;
     }
