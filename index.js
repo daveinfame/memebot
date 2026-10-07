@@ -1671,8 +1671,6 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
 }
 
 // ---------- Cotización vía DexScreener ----------
-// Devuelve: { valorSol: number|null, error: string|null }
-// Consulta DexScreener, elige el pair con más liquidez, y calcula el valor en SOL.
 async function cotizarViaDexScreener(mint, cantidadTokens) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
@@ -1684,7 +1682,6 @@ async function cotizarViaDexScreener(mint, cantidadTokens) {
     if (!data || !Array.isArray(data.pairs) || data.pairs.length === 0) {
       return { valorSol: null, error: 'NO_PAIRS' };
     }
-    // Elegir el pair con más liquidez en USD
     const pair = data.pairs
       .filter((p) => p.liquidity && typeof p.liquidity.usd === 'number')
       .sort((a, b) => (b.liquidity.usd || 0) - (a.liquidity.usd || 0))[0]
@@ -1710,9 +1707,6 @@ async function cotizarViaDexScreener(mint, cantidadTokens) {
 }
 
 // ---------- Cotización vía Jupiter ----------
-// Devuelve: { valorSol: number|null, error: string|null }
-//   - error NOT_TRADABLE → token no tradable en Jupiter
-//   - error OTHER → otro error
 async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
   if (!process.env.JUPITER_API_KEY) return { valorSol: null, error: 'NO_API_KEY' };
   try {
@@ -1743,9 +1737,7 @@ async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
 }
 
 // ---------- Valor estimado en SOL (DexScreener → Jupiter) ----------
-// Devuelve siempre: { valorSol: number|null, error: string|null }
 async function estimarValorEnSol(mint, cantidadTokens, decimals) {
-  // 1. Consultar el saldo REAL de la wallet del bot
   let cantidadReal = cantidadTokens;
   if (walletKeypair) {
     try {
@@ -1769,16 +1761,24 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals) {
 
   if (cantidadReal <= 0) return { valorSol: null, error: 'ZERO_AMOUNT' };
 
-  // 2. DexScreener (fuente primaria)
   const dexs = await cotizarViaDexScreener(mint, cantidadReal);
   if (dexs.valorSol !== null) {
     return dexs;
   }
 
-  // 3. Jupiter (fallback)
   log('info', `⚠️ DexScreener falló (${dexs.error}), intentando Jupiter para ${mint.slice(0, 6)}...`);
   const jup = await cotizarViaJupiter(mint, cantidadReal, decimals);
   return jup;
+}
+
+// ---------- Obtener precio unitario (por 1 token) vía DexScreener ----------
+// Devuelve: { precioSol: number|null, error: string|null }
+async function obtenerPrecioUnitarioDexScreener(mint) {
+  const resultado = await cotizarViaDexScreener(mint, 1);
+  if (resultado.valorSol !== null && resultado.valorSol > 0) {
+    return { precioSol: resultado.valorSol, error: null };
+  }
+  return { precioSol: null, error: resultado.error };
 }
 
 // ---------- Swap de ganancia a USDC ----------
@@ -1955,6 +1955,60 @@ function resyncSubscriptions() {
       }
     })
     .catch((e) => log('error', `Error resincronizando suscripciones: ${e.message}`));
+}
+
+// ---------- Recálculo retroactivo de amounts (al arrancar) ----------
+// Recorre todas las posiciones abiertas, consulta DexScreener, y recalcula
+// el amount real basado en el cost_basis_sol y el precio actual.
+// Esto arregla amounts inflados por parseos incorrectos previos.
+async function recalcularAmountsAlArrancar() {
+  try {
+    const { rows: posiciones } = await pool.query(
+      'SELECT * FROM bot_positions WHERE modo = $1',
+      [MODO_ACTUAL]
+    );
+    if (posiciones.length === 0) {
+      log('info', '🔧 Recálculo retroactivo: no hay posiciones abiertas');
+      return;
+    }
+
+    log('info', `🔧 Recálculo retroactivo: revisando ${posiciones.length} posiciones...`);
+    let corregidas = 0;
+
+    for (const pos of posiciones) {
+      try {
+        const precio = await obtenerPrecioUnitarioDexScreener(pos.token_mint);
+        if (precio.precioSol === null || precio.precioSol <= 0) {
+          log('warn', `  - ${pos.symbol}: sin precio (${precio.error}), se mantiene amount actual`);
+          continue;
+        }
+
+        // amount correcto = cost_basis_sol / precio unitario actual
+        // (asumiendo que el cost_basis_sol es correcto y el amount está mal)
+        const amountCorrecto = pos.cost_basis_sol / precio.precioSol;
+
+        // Solo corregir si la diferencia es >50%
+        const ratio = pos.amount / amountCorrecto;
+        if (ratio > 1.5 || ratio < 0.67) {
+          await pool.query(
+            'UPDATE bot_positions SET amount=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4',
+            [amountCorrecto, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+          );
+          log(
+            'info',
+            `  ✅ ${pos.symbol}: amount corregido de ${pos.amount.toFixed(4)} → ${amountCorrecto.toFixed(4)} (ratio era ${ratio.toFixed(2)}x)`
+          );
+          corregidas++;
+        }
+      } catch (e) {
+        log('warn', `  - ${pos.symbol}: error al recalcular (${e.message})`);
+      }
+    }
+
+    log('info', `🔧 Recálculo retroactivo completo: ${corregidas} de ${posiciones.length} posiciones corregidas`);
+  } catch (e) {
+    log('error', `Error en recálculo retroactivo: ${e.message}`);
+  }
 }
 
 // ---------- Reconciliación de posiciones ----------
@@ -2142,7 +2196,6 @@ async function revisarStopLoss() {
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
       const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
 
-      // Caso 1: token sin precio (DexScreener falló, Jupiter dijo NOT_TRADABLE)
       if (resultado.error === 'NOT_TRADABLE') {
         if (LIVE) {
           await ejecutarStopLossNoTradable(pos);
@@ -2155,13 +2208,11 @@ async function revisarStopLoss() {
         return;
       }
 
-      // Caso 2: sin precio de ninguna fuente → saltar
       if (resultado.valorSol === null) {
         log('warn', `Sin precio para ${pos.symbol} (${resultado.error}). Saltando en este ciclo.`);
         return;
       }
 
-      // Caso 3: OK → lógica normal del SL
       const ratio = resultado.valorSol / pos.cost_basis_sol;
       if (ratio > STOP_LOSS_PCT) return;
 
@@ -2318,7 +2369,7 @@ async function ejecutarStopLossNoTradable(pos) {
   }
 }
 
-// ---------- Compra ----------
+// ---------- Compra (con Fix C: tokensBought con DexScreener) ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
   if (solPaid < DUST_MIN_SOL) {
@@ -2380,14 +2431,34 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
   const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
+  // FIX C: calcular tokensBought con DexScreener (precio unitario actual)
   let tokensBought = 0;
-  if (trade.tokenAmount && trade.solAmount > 0) {
-    const factorEscala = amountSol / trade.solAmount;
-    tokensBought = trade.tokenAmount * factorEscala;
-  } else {
-    const priceAtBuy = bondingCurvePriceSol(trade);
-    tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
+  let fuentePrecio = 'ninguna';
+
+  try {
+    const precio = await obtenerPrecioUnitarioDexScreener(trade.mint);
+    if (precio.precioSol !== null && precio.precioSol > 0) {
+      tokensBought = amountSol / precio.precioSol;
+      fuentePrecio = 'DexScreener';
+    }
+  } catch (e) {
+    log('warn', `No se pudo obtener precio de DexScreener para ${symbol}: ${e.message}`);
   }
+
+  // Fallback: usar el método antiguo si DexScreener no dio precio
+  if (tokensBought === 0) {
+    if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
+      const factorEscala = amountSol / trade.solAmount;
+      tokensBought = trade.tokenAmount * factorEscala;
+      fuentePrecio = 'trade de la wallet (fallback)';
+    } else {
+      const priceAtBuy = bondingCurvePriceSol(trade);
+      tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
+      fuentePrecio = priceAtBuy ? 'bonding curve (fallback)' : 'ninguna (0 tokens)';
+    }
+  }
+
+  log('info', `💰 ${symbol}: ${amountSol.toFixed(6)} SOL / precio ${fuentePrecio} → ${tokensBought.toFixed(4)} tokens`);
 
   if (LIVE && walletKeypair && connection) {
     const saldoActual = await getWalletSolBalance();
@@ -2424,6 +2495,7 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
         [trade.traderPublicKey, trade.mint]
       );
 
+      // Fix B (solo LIVE): consultar saldo REAL post-compra y actualizar amount
       try {
         await sleep(4000);
         const saldoReal = await getBalanceDeTokenEnWallet(walletKeypair.publicKey.toBase58(), trade.mint);
@@ -2582,10 +2654,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       }
     }
   } else {
-    // PAPER: prioridad para calcular proceeds:
-    //   1. estimarValorEnSol (DexScreener → Jupiter) → precio real actual
-    //   2. trade de la wallet trackeada (si el monto no es el fallback de 0.001)
-    //   3. cost_basis_sol (PnL = 0)
     const { decimals } = await getTokenInfoHelius(trade.mint);
     const resultado = await estimarValorEnSol(trade.mint, position.amount, decimals);
 
@@ -2733,6 +2801,7 @@ async function detectarVentasManuales() {
 }
 
 // ===== FIN BLOQUE 4 =====
+
 // ---------- Comandos de Telegram ----------
 
 // /add <alias> <dirección> <montoUSD> [cadena]
@@ -3508,7 +3577,7 @@ setInterval(() => {
 (async () => {
   await initDB();
   await initBaselineReal();
-
+  await recalcularAmountsAlArrancar();
   // WS de PumpPortal desactivado — ahora dependemos solo de Helius
   // conectarWS();
   crearOActualizarWebhookHelius();
