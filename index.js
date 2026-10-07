@@ -1957,60 +1957,6 @@ function resyncSubscriptions() {
     .catch((e) => log('error', `Error resincronizando suscripciones: ${e.message}`));
 }
 
-// ---------- Recálculo retroactivo de amounts (al arrancar) ----------
-// Recorre todas las posiciones abiertas, consulta DexScreener, y recalcula
-// el amount real basado en el cost_basis_sol y el precio actual.
-// Esto arregla amounts inflados por parseos incorrectos previos.
-async function recalcularAmountsAlArrancar() {
-  try {
-    const { rows: posiciones } = await pool.query(
-      'SELECT * FROM bot_positions WHERE modo = $1',
-      [MODO_ACTUAL]
-    );
-    if (posiciones.length === 0) {
-      log('info', '🔧 Recálculo retroactivo: no hay posiciones abiertas');
-      return;
-    }
-
-    log('info', `🔧 Recálculo retroactivo: revisando ${posiciones.length} posiciones...`);
-    let corregidas = 0;
-
-    for (const pos of posiciones) {
-      try {
-        const precio = await obtenerPrecioUnitarioDexScreener(pos.token_mint);
-        if (precio.precioSol === null || precio.precioSol <= 0) {
-          log('warn', `  - ${pos.symbol}: sin precio (${precio.error}), se mantiene amount actual`);
-          continue;
-        }
-
-        // amount correcto = cost_basis_sol / precio unitario actual
-        // (asumiendo que el cost_basis_sol es correcto y el amount está mal)
-        const amountCorrecto = pos.cost_basis_sol / precio.precioSol;
-
-        // Solo corregir si la diferencia es >50%
-        const ratio = pos.amount / amountCorrecto;
-        if (ratio > 1.5 || ratio < 0.67) {
-          await pool.query(
-            'UPDATE bot_positions SET amount=$1 WHERE token_mint=$2 AND wallet_alias=$3 AND modo=$4',
-            [amountCorrecto, pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-          );
-          log(
-            'info',
-            `  ✅ ${pos.symbol}: amount corregido de ${pos.amount.toFixed(4)} → ${amountCorrecto.toFixed(4)} (ratio era ${ratio.toFixed(2)}x)`
-          );
-          corregidas++;
-        }
-      } catch (e) {
-        log('warn', `  - ${pos.symbol}: error al recalcular (${e.message})`);
-      }
-    }
-
-    log('info', `🔧 Recálculo retroactivo completo: ${corregidas} de ${posiciones.length} posiciones corregidas`);
-  } catch (e) {
-    log('error', `Error en recálculo retroactivo: ${e.message}`);
-  }
-}
-
 // ---------- Reconciliación de posiciones ----------
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
@@ -3577,7 +3523,7 @@ setInterval(() => {
 (async () => {
   await initDB();
   await initBaselineReal();
-  await recalcularAmountsAlArrancar();
+  
   // WS de PumpPortal desactivado — ahora dependemos solo de Helius
   // conectarWS();
   crearOActualizarWebhookHelius();
