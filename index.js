@@ -378,7 +378,44 @@ function bondingCurvePriceSol(trade) {
   if (!trade.vSolInBondingCurve || !trade.vTokensInBondingCurve) return null;
   return trade.vSolInBondingCurve / trade.vTokensInBondingCurve;
 }
+// ---------- Lock anti-race-condition para ventas ----------
+// Evita que 2 ventas del mismo mint+alias se procesen simultáneamente.
+const ventasEnProceso = new Set();
 
+// ---------- Normalización de `source` de Helius al `dexId` de DexScreener ----------
+// Helius manda el `source` en formato UPPER_SNAKE (ej. 'PUMP_FUN', 'RAYDIUM').
+// DexScreener usa un `dexId` en minúsculas (ej. 'pumpfun', 'raydium').
+// Esta función mapea uno al otro. Devuelve null si no se puede mapear.
+function normalizarDexIdParaDexScreener(origen) {
+  if (!origen || typeof origen !== 'string') return null;
+  const o = origen.toUpperCase();
+
+  // Mapeo explícito
+  const mapa = {
+    'PUMP_FUN': 'pumpfun',
+    'PUMPPORTAL': 'pumpfun',
+    'PUMP_AMM': 'pumpswap',
+    'PUMPSWAP': 'pumpswap',
+    'RAYDIUM': 'raydium',
+    'RAYDIUM_LAUNCHLAB': 'raydium',
+    'METEORA': 'meteora',
+    'JUPITER': 'jupiter',
+    'ORCA': 'orca',
+    'LIFINITY': 'lifinity',
+    'PHOENIX': 'phoenix',
+    'OPENBOOK': 'openbook'
+  };
+
+  if (mapa[o]) return mapa[o];
+
+  // Si ya viene en formato DexScreener (ej. 'pumpfun', 'meteora'), devolverlo directo
+  const lower = origen.toLowerCase();
+  const dexIdsValidos = ['pumpfun', 'pumpswap', 'raydium', 'meteora', 'jupiter', 'orca', 'lifinity', 'phoenix', 'openbook'];
+  if (dexIdsValidos.includes(lower)) return lower;
+
+  // No se pudo mapear (ej. SOLANA_PROGRAM_LIBRARY, SYSTEM_PROGRAM, OnChain)
+  return null;
+}
 // ===== FIN BLOQUE 1 =====
 
 // ---------- Cache de info de token ----------
@@ -902,7 +939,6 @@ async function adjustPaperBalance(deltaUsd) {
 }
 
 // ===== FIN BLOQUE 2 =====
-
 // ---------- Webhook Helius: crear o actualizar ----------
 async function crearOActualizarWebhookHelius() {
   if (creandoWebhook) {
@@ -1232,8 +1268,8 @@ function iniciarServidorWebhook() {
 }
 
 // ---------- Deduplicación por signature ----------
-const signaturesProcesadas = new Map(); // signature -> timestamp ms
-const DEDUP_TTL_MS = 60 * 60 * 1000; // 1 hora
+const signaturesProcesadas = new Map();
+const DEDUP_TTL_MS = 60 * 60 * 1000;
 
 function limpiarSignaturesViejas() {
   const ahora = Date.now();
@@ -1258,10 +1294,9 @@ function marcarSignatureProcesada(sig) {
   signaturesProcesadas.set(sig, Date.now());
 }
 
-// ---------- Log compacto de TX (v2: solo cuentas con cambios + 1200 chars) ----------
+// ---------- Log compacto de TX ----------
 function logRawTxCompacto(tx) {
   try {
-    // Filtrar SOLO cuentas con cambios reales (balance nativo o de tokens)
     const cuentasRelevantes = (tx.accountData || [])
       .filter(
         (a) =>
@@ -1279,7 +1314,6 @@ function logRawTxCompacto(tx) {
         }))
       }));
 
-    // Solo tokenTransfers y nativeTransfers que tengan movimiento
     const tokenTransfersFiltrados = (tx.tokenTransfers || [])
       .filter((t) => t.tokenAmount && Number(t.tokenAmount) > 0)
       .map((t) => ({
@@ -1378,8 +1412,9 @@ async function procesarWebhookHelius(rawBody) {
         txType: direccion
       };
       const horaDeteccion = eventos.timestamp ? eventos.timestamp * 1000 : Date.now();
-      const origen =
+      const origenRaw =
         !eventos.source || eventos.source === 'PUMP_FUN' ? 'PumpPortal' : eventos.source;
+      const origen = normalizarDexIdParaDexScreener(origenRaw) || origenRaw;
 
       if (direccion === 'buy') await handleTrackedBuy(tracked, trade, origen, horaDeteccion);
       else await handleTrackedSell(tracked, trade, origen, horaDeteccion);
@@ -1428,10 +1463,8 @@ async function procesarWebhookHelius(rawBody) {
     if (trackedRows.length === 0) continue;
     if (walletsInvolucradas.length === 0) continue;
 
-    // Log compacto (filtrado)
     logRawTxCompacto(tx);
 
-    // FILTRO: si es un TRANSFER de SYSTEM_PROGRAM sin tokenTransfers, ignorar.
     const esTransferSinToken =
       (tx.type || '').toUpperCase() === 'TRANSFER' &&
       (tx.source || '').toUpperCase() === 'SYSTEM_PROGRAM' &&
@@ -1446,6 +1479,9 @@ async function procesarWebhookHelius(rawBody) {
 
     const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
     const cambiosProcesados = new Set();
+
+    // Normalizar el source de Helius al dexId de DexScreener
+    const origenNormalizado = normalizarDexIdParaDexScreener(tx.source);
 
     // 1. accountData directo
     for (const acc of tx.accountData || []) {
@@ -1476,7 +1512,7 @@ async function procesarWebhookHelius(rawBody) {
           traderPublicKey: tracked.address,
           txType: cambio.direction
         };
-        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
+        const origen = origenNormalizado || (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
 
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
@@ -1517,7 +1553,7 @@ async function procesarWebhookHelius(rawBody) {
           traderPublicKey: tracked.address,
           txType: cambio.direction
         };
-        const origen = tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain';
+        const origen = origenNormalizado || (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
 
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
@@ -1667,11 +1703,6 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
 }
 
 // ---------- Cotización vía DexScreener (con validaciones estrictas) ----------
-// Devuelve: { valorSol, precioSolUnitario, dexId, error }
-//   - valorSol: valor total de la posición en SOL (número) o null
-//   - precioSolUnitario: precio por token en SOL (número) o null
-//   - dexId: 'pumpfun' | 'meteora' | 'raydium' | 'pumpswap' | ... o null
-//   - error: string si no se pudo cotizar
 async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
@@ -1684,24 +1715,16 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'NO_PAIRS' };
     }
 
-    // Filtrar pairs válidos
     const pairsValidos = data.pairs.filter((p) => {
-      // Precio
       const price = parseFloat(p.priceNative);
       if (!Number.isFinite(price) || price <= 0) return false;
 
-      // Liquidez
       const liq = p.liquidity?.usd;
       if (!liq || liq < 5000) return false;
 
-      // Mcap coherente
       const mcap = p.marketCap || p.fdv;
       if (!mcap || mcap < 10000 || mcap > 500000000) return false;
 
-      // Validación de supply implícito: mcap / (priceNative × solPrice)
-      // Si el supply implícito es absurdo, el par es sospechoso.
-      // Nota: no tenemos el precio del SOL aquí, así que usamos una heurística:
-      // si priceNative > 1 SOL/token, es absurdo para memecoin (salvo rarísimas excepciones).
       if (price > 1) return false;
 
       return true;
@@ -1712,7 +1735,6 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'NO_VALID_PAIRS' };
     }
 
-    // Si hay dexIdPreferido, filtrar por él
     let candidatos = pairsValidos;
     if (dexIdPreferido) {
       const filtrados = pairsValidos.filter(
@@ -1728,7 +1750,6 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       }
     }
 
-    // Elegir el pair con más liquidez entre los candidatos
     const pair = candidatos.sort((a, b) => (b.liquidity.usd || 0) - (a.liquidity.usd || 0))[0];
 
     const precioNative = parseFloat(pair.priceNative);
@@ -1783,7 +1804,6 @@ async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
 
 // ---------- Valor estimado en SOL (DexScreener → Jupiter, con validaciones) ----------
 async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null) {
-  // 1. Consultar saldo real de la wallet del bot (si aplica)
   let cantidadReal = cantidadTokens;
   if (walletKeypair) {
     try {
@@ -1807,19 +1827,17 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
 
   if (cantidadReal <= 0) return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'ZERO_AMOUNT' };
 
-  // 2. DexScreener (fuente primaria)
   const dexs = await cotizarViaDexScreener(mint, cantidadReal, dexIdPreferido);
   if (dexs.valorSol !== null) {
     return dexs;
   }
 
-  // 3. Jupiter (fallback)
   log('info', `⚠️ DexScreener falló (${dexs.error}), intentando Jupiter para ${mint.slice(0, 6)}...`);
   const jup = await cotizarViaJupiter(mint, cantidadReal, decimals);
   return jup;
 }
 
-// ---------- Obtener precio unitario (por 1 token) + dexId vía DexScreener ----------
+// ---------- Obtener precio unitario + dexId vía DexScreener ----------
 async function obtenerPrecioUnitarioDexScreener(mint, dexIdPreferido = null) {
   const resultado = await cotizarViaDexScreener(mint, 1, dexIdPreferido);
   if (resultado.valorSol !== null && resultado.valorSol > 0) {
@@ -2090,10 +2108,7 @@ async function reconciliarPosiciones(forzado = false) {
             'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
             [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
           );
-          await pool.query(
-            'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-            [pos.wallet_address, pos.token_mint]
-          );
+          // NO borramos seen_tokens (Opción A: si hay SL/reconciliación, nos olvidamos del token)
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
           let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2117,10 +2132,7 @@ async function reconciliarPosiciones(forzado = false) {
               'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
               [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
             );
-            await pool.query(
-              'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-              [pos.wallet_address, pos.token_mint]
-            );
+            // NO borramos seen_tokens
             if (CHAT_ID) {
               bot.sendMessage(
                 CHAT_ID,
@@ -2148,10 +2160,7 @@ async function reconciliarPosiciones(forzado = false) {
           'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
           [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
         );
-        await pool.query(
-          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-          [pos.wallet_address, pos.token_mint]
-        );
+        // NO borramos seen_tokens
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
 
@@ -2241,10 +2250,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
         'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
         [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
       );
-      await pool.query(
-        'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-        [pos.wallet_address, pos.token_mint]
-      );
+      // NO borramos seen_tokens (Opción A: si hay SL, nos olvidamos del token)
       await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
       let msg = `🛑 STOP-LOSS ejecutado [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2268,10 +2274,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
           'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
           [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
         );
-        await pool.query(
-          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-          [pos.wallet_address, pos.token_mint]
-        );
+        // NO borramos seen_tokens
         if (CHAT_ID) {
           bot.sendMessage(
             CHAT_ID,
@@ -2296,10 +2299,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
       'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
       [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
     );
-    await pool.query(
-      'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-      [pos.wallet_address, pos.token_mint]
-    );
+    // NO borramos seen_tokens
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
 
@@ -2340,10 +2340,7 @@ async function ejecutarStopLossNoTradable(pos) {
       'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
       [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
     );
-    await pool.query(
-      'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-      [pos.wallet_address, pos.token_mint]
-    );
+    // NO borramos seen_tokens
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
     let msg = `🛑 STOP-LOSS (token no tradable en Jupiter) [${pos.wallet_alias}] ${pos.symbol}\nVendido vía PumpPortal/Jupiter.\nSalí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2426,20 +2423,21 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
   // Calcular tokensBought con precio unitario de DexScreener
   let tokensBought = 0;
-  let origenDex = null;
   let precioCompraNative = null;
   let fuentePrecio = 'ninguna';
 
+  // El `origen` YA viene normalizado desde procesarWebhookHelius.
+  // Si es un dexId válido (pumpfun, pumpswap, meteora, raydium, jupiter, orca, ...), lo usamos.
+  // Si no (ej. 'OnChain', 'SOLANA_PROGRAM_LIBRARY'), queda como string pero no filtraremos al cotizar.
+  const origenDex = origen && origen !== 'OnChain' && origen !== 'SOLANA_PROGRAM_LIBRARY' ? origen : null;
+
   try {
-    const precio = await obtenerPrecioUnitarioDexScreener(trade.mint);
+    const precio = await obtenerPrecioUnitarioDexScreener(trade.mint, origenDex);
     if (precio.precioSol !== null && precio.precioSol > 0) {
-      // Validar que el precio unitario esté en un rango razonable para memecoin
-      // Rango: 1e-15 a 1e-2 SOL/token
       if (precio.precioSol >= 1e-15 && precio.precioSol <= 1e-2) {
         tokensBought = amountSol / precio.precioSol;
-        origenDex = precio.dexId;
         precioCompraNative = precio.precioSol;
-        fuentePrecio = `DexScreener (${origenDex})`;
+        fuentePrecio = `DexScreener (${precio.dexId || origenDex || 'n/d'})`;
       } else {
         log(
           'warn',
@@ -2469,7 +2467,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     `💰 ${symbol}: ${amountSol.toFixed(6)} SOL / ${fuentePrecio} → ${tokensBought.toFixed(6)} tokens`
   );
 
-  // Si no hay tokens que comprar, no crear posición
   if (!tokensBought || tokensBought <= 0) {
     log('warn', `⚠️ ${symbol}: tokensBought = 0. NO se crea posición.`);
     if (CHAT_ID) {
@@ -2481,7 +2478,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     return;
   }
 
-  // Advertir si el origen es OnChain (porque Helius no dio un DEX claro)
   if (!origenDex && origen === 'OnChain') {
     log('warn', `⚠️ ${symbol}: no se pudo determinar el DEX de origen. Se usará el de más liquidez al cotizar.`);
   }
@@ -2521,7 +2517,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
         [trade.traderPublicKey, trade.mint]
       );
 
-      // Fix: consultar saldo REAL post-compra y actualizar amount
       try {
         await sleep(4000);
         const saldoReal = await getBalanceDeTokenEnWallet(walletKeypair.publicKey.toBase58(), trade.mint);
@@ -2579,171 +2574,182 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
 // ---------- Venta ----------
 async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
-  const symbol = await getTokenSymbol(trade.mint);
-  const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
-
-  const posRes = await pool.query(
-    'SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-    [trade.mint, tracked.alias, MODO_ACTUAL]
-  );
-
-  if (posRes.rows.length === 0) {
-    if (CHAT_ID) {
-      bot.sendMessage(
-        CHAT_ID,
-        `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`
-      );
-    }
+  // LOCK anti-race-condition: evita procesar 2 ventas del mismo mint+alias a la vez
+  const lockKey = `${trade.mint}:${tracked.alias}`;
+  if (ventasEnProceso.has(lockKey)) {
+    log('warn', `⏸️ Venta duplicada ignorada para ${trade.mint.slice(0, 6)}... vía ${tracked.alias}`);
     return;
   }
+  ventasEnProceso.add(lockKey);
 
-  let walletQuedoSinTokens = true;
   try {
-    const balanceTrasVenta = await getBalanceDeTokenEnWallet(tracked.address, trade.mint);
-    if (balanceTrasVenta !== null && balanceTrasVenta > 0) {
-      walletQuedoSinTokens = false;
+    const symbol = await getTokenSymbol(trade.mint);
+    const etiquetaOrigen = origen !== 'PumpPortal' ? ` 🌐${origen}` : '';
+
+    const posRes = await pool.query(
+      'SELECT * FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+      [trade.mint, tracked.alias, MODO_ACTUAL]
+    );
+
+    if (posRes.rows.length === 0) {
+      if (CHAT_ID) {
+        bot.sendMessage(
+          CHAT_ID,
+          `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} vendió ${symbol} (no tenías posición vía esta wallet, nada que copiar)`
+        );
+      }
+      return;
     }
-  } catch (e) {
-    log('warn', `No se pudo verificar balance post-venta de ${tracked.alias} para ${symbol}: ${e.message}. Asumiendo venta total.`);
-  }
 
-  if (walletQuedoSinTokens) {
-    await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [
-      trade.traderPublicKey,
-      trade.mint
-    ]);
-    log('info', `🧹 seen_tokens limpiado para ${tracked.alias} ${symbol} (venta total confirmada)`);
-  } else {
-    log('info', `🔒 seen_tokens conservado para ${tracked.alias} ${symbol} (venta parcial, wallet aún tiene tokens)`);
-  }
-
-  const position = posRes.rows[0];
-
-  if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
+    let walletQuedoSinTokens = true;
     try {
-      const before = await getWalletSolBalance();
-      const sig = await ejecutarTrade({
-        action: 'sell',
-        mint: trade.mint,
-        amount: position.amount,
-        origen,
-        slippage: DEFAULT_SLIPPAGE_BPS
-      });
-      await sleep(ESPERA_LECTURA_SALDO_MS);
-      const after = await getWalletSolBalance();
-      const proceedsSol = after - before;
-      const solPrice = await getSolPriceUSD();
-      const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
+      const balanceTrasVenta = await getBalanceDeTokenEnWallet(tracked.address, trade.mint);
+      if (balanceTrasVenta !== null && balanceTrasVenta > 0) {
+        walletQuedoSinTokens = false;
+      }
+    } catch (e) {
+      log('warn', `No se pudo verificar balance post-venta de ${tracked.alias} para ${symbol}: ${e.message}. Asumiendo venta total.`);
+    }
+
+    if (walletQuedoSinTokens) {
+      await pool.query('DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2', [
+        trade.traderPublicKey,
+        trade.mint
+      ]);
+      log('info', `🧹 seen_tokens limpiado para ${tracked.alias} ${symbol} (venta total confirmada)`);
+    } else {
+      log('info', `🔒 seen_tokens conservado para ${tracked.alias} ${symbol} (venta parcial, wallet aún tiene tokens)`);
+    }
+
+    const position = posRes.rows[0];
+
+    if (LIVE && tracked.chain === 'solana' && walletKeypair && connection) {
+      try {
+        const before = await getWalletSolBalance();
+        const sig = await ejecutarTrade({
+          action: 'sell',
+          mint: trade.mint,
+          amount: position.amount,
+          origen,
+          slippage: DEFAULT_SLIPPAGE_BPS
+        });
+        await sleep(ESPERA_LECTURA_SALDO_MS);
+        const after = await getWalletSolBalance();
+        const proceedsSol = after - before;
+        const solPrice = await getSolPriceUSD();
+        const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
+
+        await pool.query(
+          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+          [trade.mint, tracked.alias, MODO_ACTUAL]
+        );
+        await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
+
+        let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
+        if (r.profitSol > 0) {
+          const usdcSig = await swapProfitToUsdc(r.profitSol);
+          msg += usdcSig
+            ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}`
+            : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+        }
+        const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
+        if (rentRecuperado) {
+          msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+        }
+        const saldoFinal = await getWalletSolBalance();
+        msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
+        if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
+
+        chequearRetraso(horaDeteccion, tracked.alias, symbol);
+      } catch (e) {
+        log('error', `Error vendiendo real: ${e.message}`);
+        if (esSellZeroAmount(e)) {
+          await pool.query(
+            'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+            [trade.mint, tracked.alias, MODO_ACTUAL]
+          );
+          if (CHAT_ID) {
+            bot.sendMessage(
+              CHAT_ID,
+              `🧹 [${tracked.alias}] ${symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`
+            );
+          }
+        } else {
+          if (CHAT_ID) {
+            bot.sendMessage(
+              CHAT_ID,
+              `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}\n(la posición sigue abierta, se reintentará con la próxima reconciliación)`
+            );
+          }
+        }
+      }
+    } else {
+      const { decimals } = await getTokenInfoHelius(trade.mint);
+      const resultado = await estimarValorEnSol(trade.mint, position.amount, decimals, position.origen_dex);
+
+      let proceedsSol;
+      let fuente;
+
+      if (resultado.valorSol !== null) {
+        proceedsSol = resultado.valorSol;
+        fuente = `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})`;
+      } else if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
+        const precioPorToken = trade.solAmount / trade.tokenAmount;
+        proceedsSol = position.amount * precioPorToken;
+        fuente = 'trade de la wallet';
+      } else {
+        proceedsSol = position.cost_basis_sol;
+        fuente = 'cost_basis (fallback, PnL = 0)';
+      }
+
+      log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
+
+      const costBasis = Number(position.cost_basis_sol) || 0;
+      if (costBasis > 0 && proceedsSol > costBasis * 50) {
+        log(
+          'warn',
+          `⚠️ proceedsSol sospechoso para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL (ratio ${(proceedsSol/costBasis).toFixed(2)}x). Usando cost_basis.`
+        );
+        proceedsSol = costBasis;
+      }
+      if (costBasis > 0 && proceedsSol < costBasis * 0.001) {
+        log(
+          'warn',
+          `⚠️ proceedsSol sospechosamente bajo para ${symbol}: ${proceedsSol.toFixed(6)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis.`
+        );
+        proceedsSol = costBasis;
+      }
+      if (costBasis > 0 && proceedsSol < 0) {
+        proceedsSol = 0;
+      }
+
+      let solPrice = await getSolPriceUSD();
+      if (!solPrice) {
+        log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la venta');
+        solPrice = 150;
+      }
+
+      const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
+      const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
 
       await pool.query(
         'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
         [trade.mint, tracked.alias, MODO_ACTUAL]
       );
       await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
+      const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+      const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
-      let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
+      let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
       if (r.profitSol > 0) {
-        const usdcSig = await swapProfitToUsdc(r.profitSol);
-        msg += usdcSig
-          ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}`
-          : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+        msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
       }
-      const rentRecuperado = await cerrarCuentaDelToken(trade.mint);
-      if (rentRecuperado) {
-        msg += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
-      }
-      const saldoFinal = await getWalletSolBalance();
-      msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
 
       chequearRetraso(horaDeteccion, tracked.alias, symbol);
-    } catch (e) {
-      log('error', `Error vendiendo real: ${e.message}`);
-      if (esSellZeroAmount(e)) {
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [trade.mint, tracked.alias, MODO_ACTUAL]
-        );
-        if (CHAT_ID) {
-          bot.sendMessage(
-            CHAT_ID,
-            `🧹 [${tracked.alias}] ${symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`
-          );
-        }
-      } else {
-        if (CHAT_ID) {
-          bot.sendMessage(
-            CHAT_ID,
-            `❌ Error al vender ${symbol}: ${mensajeAmigableError(e)}\n(la posición sigue abierta, se reintentará con la próxima reconciliación)`
-          );
-        }
-      }
     }
-  } else {
-    const { decimals } = await getTokenInfoHelius(trade.mint);
-    const resultado = await estimarValorEnSol(trade.mint, position.amount, decimals, position.origen_dex);
-
-    let proceedsSol;
-    let fuente;
-
-    if (resultado.valorSol !== null) {
-      proceedsSol = resultado.valorSol;
-      fuente = `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})`;
-    } else if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
-      const precioPorToken = trade.solAmount / trade.tokenAmount;
-      proceedsSol = position.amount * precioPorToken;
-      fuente = 'trade de la wallet';
-    } else {
-      proceedsSol = position.cost_basis_sol;
-      fuente = 'cost_basis (fallback, PnL = 0)';
-    }
-
-    log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
-
-    // Validar coherencia con cost_basis
-    const costBasis = Number(position.cost_basis_sol) || 0;
-    if (costBasis > 0 && proceedsSol > costBasis * 50) {
-      log(
-        'warn',
-        `⚠️ proceedsSol sospechoso para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL (ratio ${(proceedsSol/costBasis).toFixed(2)}x). Usando cost_basis.`
-      );
-      proceedsSol = costBasis;
-    }
-    if (costBasis > 0 && proceedsSol < costBasis * 0.001) {
-      log(
-        'warn',
-        `⚠️ proceedsSol sospechosamente bajo para ${symbol}: ${proceedsSol.toFixed(6)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis.`
-      );
-      proceedsSol = costBasis;
-    }
-    if (costBasis > 0 && proceedsSol < 0) {
-      proceedsSol = 0;
-    }
-
-    let solPrice = await getSolPriceUSD();
-    if (!solPrice) {
-      log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la venta');
-      solPrice = 150;
-    }
-
-    const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
-    const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
-
-    await pool.query(
-      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-      [trade.mint, tracked.alias, MODO_ACTUAL]
-    );
-    await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
-    const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
-    const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
-
-    let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
-    if (r.profitSol > 0) {
-      msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
-    }
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
-
-    chequearRetraso(horaDeteccion, tracked.alias, symbol);
+  } finally {
+    ventasEnProceso.delete(lockKey);
   }
 }
 
