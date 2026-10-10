@@ -521,7 +521,7 @@ async function getWalletSolBalance() {
   return lamports / LAMPORTS_PER_SOL;
 }
 
-// ---------- Precio SOL (Jupiter + cache + fallback) ----------
+// ---------- Precio SOL ----------
 let cachedSolPrice = { value: null, timestamp: 0 };
 const SOL_PRICE_CACHE_MS = 60_000;
 
@@ -786,17 +786,12 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
 // ---------- DB ----------
 async function initDB() {
   try {
-    // --- tracked_wallets ---
     await pool.query(
       `CREATE TABLE IF NOT EXISTS tracked_wallets (alias TEXT PRIMARY KEY, address TEXT, amount REAL, chain TEXT)`
     );
-
-    // --- seen_tokens ---
     await pool.query(
       `CREATE TABLE IF NOT EXISTS seen_tokens (wallet_address TEXT, token_mint TEXT, PRIMARY KEY (wallet_address, token_mint))`
     );
-
-    // --- bot_positions (con origen_dex y precio_compra_native) ---
     await pool.query(
       `CREATE TABLE IF NOT EXISTS bot_positions (token_mint TEXT, symbol TEXT, chain TEXT, amount REAL)`
     );
@@ -804,11 +799,11 @@ async function initDB() {
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS wallet_alias TEXT`);
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS ceros_seguidos INT DEFAULT 0`);
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper'`);
-    // NUEVAS COLUMNAS:
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS origen_dex TEXT`);
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS precio_compra_native REAL`);
+    // NUEVA COLUMNA: pair_address (para futuro uso)
+    await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pair_address TEXT`);
 
-    // --- global_balance ---
     await pool.query(
       `CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL)`
     );
@@ -818,8 +813,6 @@ async function initDB() {
       `INSERT INTO global_balance (id, initial_usdc, current_usdc) VALUES (1, $1, $2) ON CONFLICT (id) DO NOTHING`,
       [INITIAL_PAPER_BALANCE, INITIAL_PAPER_BALANCE]
     );
-
-    // --- trade_history ---
     await pool.query(
       `CREATE TABLE IF NOT EXISTS trade_history (
         id SERIAL PRIMARY KEY,
@@ -831,7 +824,6 @@ async function initDB() {
     );
     await pool.query(`ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper'`);
 
-    // --- índices ---
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_positions_mint_alias ON bot_positions(token_mint, wallet_alias)`
     );
@@ -839,7 +831,6 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_alias ON trade_history(wallet_alias)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_history_modo ON trade_history(modo)`);
 
-    // --- saneamiento de balance paper ---
     await pool.query(
       `UPDATE global_balance SET initial_usdc = $1 WHERE initial_usdc IS NULL`,
       [INITIAL_PAPER_BALANCE]
@@ -1702,20 +1693,25 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   }
 }
 
-// ---------- Cotización vía DexScreener (con validaciones estrictas) ----------
-async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null) {
+// ---------- Cotización vía DexScreener (con validaciones estrictas + validación 30x) ----------
+// Devuelve: { valorSol, precioSolUnitario, dexId, pairAddress, error }
+// Parámetros:
+//   - dexIdPreferido: si se pasa, intenta usar un par de ese DEX. Si no hay, cae al de más liquidez.
+//   - precioCompraNative: si se pasa, descarta pares cuyo precioNative esté > 30x o < 0.03x del precio de compra.
+async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null, precioCompraNative = null) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) {
-      return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'DEXSCREENER_HTTP_' + res.status };
+      return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'DEXSCREENER_HTTP_' + res.status };
     }
     const data = await res.json();
     if (!data || !Array.isArray(data.pairs) || data.pairs.length === 0) {
-      return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'NO_PAIRS' };
+      return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'NO_PAIRS' };
     }
 
-    const pairsValidos = data.pairs.filter((p) => {
+    // Filtro base: liquidez, mcap, precio
+    let pairsValidos = data.pairs.filter((p) => {
       const price = parseFloat(p.priceNative);
       if (!Number.isFinite(price) || price <= 0) return false;
 
@@ -1730,11 +1726,31 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       return true;
     });
 
-    if (pairsValidos.length === 0) {
-      log('warn', `DexScreener: ningún pair válido para ${mint.slice(0, 6)}... (todos con poca liquidez o mcap absurdo)`);
-      return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'NO_VALID_PAIRS' };
+    // Validación 30x contra el precio de compra
+    if (precioCompraNative && precioCompraNative > 0) {
+      const MAX_RATIO = 30;
+      const MIN_RATIO = 0.03;
+      const antes = pairsValidos.length;
+      pairsValidos = pairsValidos.filter((p) => {
+        const price = parseFloat(p.priceNative);
+        const ratio = price / precioCompraNative;
+        if (ratio > MAX_RATIO || ratio < MIN_RATIO) return false;
+        return true;
+      });
+      if (pairsValidos.length < antes) {
+        log(
+          'info',
+          `🔒 DexScreener: ${antes - pairsValidos.length} par(es) descartado(s) por estar fuera del rango [0.03x, 30x] del precio de compra (${precioCompraNative.toExponential(4)} SOL/token)`
+        );
+      }
     }
 
+    if (pairsValidos.length === 0) {
+      log('warn', `DexScreener: ningún par válido para ${mint.slice(0, 6)}... (liquidez, mcap, precio o rango 30x)`);
+      return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'NO_VALID_PAIRS' };
+    }
+
+    // Filtro por dexIdPreferido (si aplica)
     let candidatos = pairsValidos;
     if (dexIdPreferido) {
       const filtrados = pairsValidos.filter(
@@ -1745,7 +1761,7 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       } else {
         log(
           'warn',
-          `DexScreener: no hay pair de ${dexIdPreferido} para ${mint.slice(0, 6)}..., usando el de más liquidez`
+          `DexScreener: no hay par de ${dexIdPreferido} para ${mint.slice(0, 6)}..., usando el de más liquidez`
         );
       }
     }
@@ -1764,10 +1780,11 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       valorSol,
       precioSolUnitario: precioNative,
       dexId: pair.dexId || null,
+      pairAddress: pair.pairAddress || null,
       error: null
     };
   } catch (e) {
-    return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'DEXSCREENER_ERROR: ' + e.message };
+    return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'DEXSCREENER_ERROR: ' + e.message };
   }
 }
 
@@ -1803,7 +1820,7 @@ async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
 }
 
 // ---------- Valor estimado en SOL (DexScreener → Jupiter, con validaciones) ----------
-async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null) {
+async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null, precioCompraNative = null) {
   let cantidadReal = cantidadTokens;
   if (walletKeypair) {
     try {
@@ -1825,9 +1842,9 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
     }
   }
 
-  if (cantidadReal <= 0) return { valorSol: null, precioSolUnitario: null, dexId: null, error: 'ZERO_AMOUNT' };
+  if (cantidadReal <= 0) return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'ZERO_AMOUNT' };
 
-  const dexs = await cotizarViaDexScreener(mint, cantidadReal, dexIdPreferido);
+  const dexs = await cotizarViaDexScreener(mint, cantidadReal, dexIdPreferido, precioCompraNative);
   if (dexs.valorSol !== null) {
     return dexs;
   }
@@ -1837,13 +1854,18 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
   return jup;
 }
 
-// ---------- Obtener precio unitario + dexId vía DexScreener ----------
+// ---------- Obtener precio unitario + dexId + pairAddress vía DexScreener ----------
 async function obtenerPrecioUnitarioDexScreener(mint, dexIdPreferido = null) {
-  const resultado = await cotizarViaDexScreener(mint, 1, dexIdPreferido);
+  const resultado = await cotizarViaDexScreener(mint, 1, dexIdPreferido, null);
   if (resultado.valorSol !== null && resultado.valorSol > 0) {
-    return { precioSol: resultado.valorSol, dexId: resultado.dexId, error: null };
+    return {
+      precioSol: resultado.valorSol,
+      dexId: resultado.dexId,
+      pairAddress: resultado.pairAddress,
+      error: null
+    };
   }
-  return { precioSol: null, dexId: null, error: resultado.error };
+  return { precioSol: null, dexId: null, pairAddress: null, error: resultado.error };
 }
 
 // ---------- Swap de ganancia a USDC ----------
@@ -2108,7 +2130,6 @@ async function reconciliarPosiciones(forzado = false) {
             'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
             [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
           );
-          // NO borramos seen_tokens (Opción A: si hay SL/reconciliación, nos olvidamos del token)
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
           let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2132,7 +2153,6 @@ async function reconciliarPosiciones(forzado = false) {
               'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
               [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
             );
-            // NO borramos seen_tokens
             if (CHAT_ID) {
               bot.sendMessage(
                 CHAT_ID,
@@ -2150,7 +2170,13 @@ async function reconciliarPosiciones(forzado = false) {
         }
       } else {
         const { decimals } = await getTokenInfoHelius(pos.token_mint);
-        const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals, pos.origen_dex);
+        const resultado = await estimarValorEnSol(
+          pos.token_mint,
+          pos.amount,
+          decimals,
+          pos.origen_dex,
+          pos.precio_compra_native
+        );
         const proceedsSol = resultado.valorSol ?? 0;
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
@@ -2160,7 +2186,6 @@ async function reconciliarPosiciones(forzado = false) {
           'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
           [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
         );
-        // NO borramos seen_tokens
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
 
@@ -2196,7 +2221,13 @@ async function revisarStopLoss() {
     await mapLimit(posiciones, 5, async (pos) => {
       if (!pos.cost_basis_sol || pos.cost_basis_sol <= 0 || !pos.amount || pos.amount <= 0) return;
       const { decimals } = await getTokenInfoHelius(pos.token_mint);
-      const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals, pos.origen_dex);
+      const resultado = await estimarValorEnSol(
+        pos.token_mint,
+        pos.amount,
+        decimals,
+        pos.origen_dex,
+        pos.precio_compra_native
+      );
 
       if (resultado.error === 'NOT_TRADABLE') {
         if (LIVE) {
@@ -2250,7 +2281,6 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
         'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
         [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
       );
-      // NO borramos seen_tokens (Opción A: si hay SL, nos olvidamos del token)
       await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
       let msg = `🛑 STOP-LOSS ejecutado [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2274,7 +2304,6 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
           'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
           [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
         );
-        // NO borramos seen_tokens
         if (CHAT_ID) {
           bot.sendMessage(
             CHAT_ID,
@@ -2299,7 +2328,6 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
       'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
       [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
     );
-    // NO borramos seen_tokens
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
 
@@ -2340,7 +2368,6 @@ async function ejecutarStopLossNoTradable(pos) {
       'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
       [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
     );
-    // NO borramos seen_tokens
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
 
     let msg = `🛑 STOP-LOSS (token no tradable en Jupiter) [${pos.wallet_alias}] ${pos.symbol}\nVendido vía PumpPortal/Jupiter.\nSalí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
@@ -2421,15 +2448,15 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
   const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
-  // Calcular tokensBought con precio unitario de DexScreener
+  // El `origen` ya viene normalizado desde procesarWebhookHelius.
+  // Si es un dexId válido de DexScreener, lo usamos como filtro.
+  const dexIdsDexScreener = ['pumpfun', 'pumpswap', 'raydium', 'meteora', 'jupiter', 'orca', 'lifinity', 'phoenix', 'openbook'];
+  const origenDex = origen && dexIdsDexScreener.includes(origen.toLowerCase()) ? origen.toLowerCase() : null;
+
   let tokensBought = 0;
   let precioCompraNative = null;
+  let pairAddress = null;
   let fuentePrecio = 'ninguna';
-
-  // El `origen` YA viene normalizado desde procesarWebhookHelius.
-  // Si es un dexId válido (pumpfun, pumpswap, meteora, raydium, jupiter, orca, ...), lo usamos.
-  // Si no (ej. 'OnChain', 'SOLANA_PROGRAM_LIBRARY'), queda como string pero no filtraremos al cotizar.
-  const origenDex = origen && origen !== 'OnChain' && origen !== 'SOLANA_PROGRAM_LIBRARY' ? origen : null;
 
   try {
     const precio = await obtenerPrecioUnitarioDexScreener(trade.mint, origenDex);
@@ -2437,6 +2464,7 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       if (precio.precioSol >= 1e-15 && precio.precioSol <= 1e-2) {
         tokensBought = amountSol / precio.precioSol;
         precioCompraNative = precio.precioSol;
+        pairAddress = precio.pairAddress;
         fuentePrecio = `DexScreener (${precio.dexId || origenDex || 'n/d'})`;
       } else {
         log(
@@ -2478,10 +2506,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     return;
   }
 
-  if (!origenDex && origen === 'OnChain') {
-    log('warn', `⚠️ ${symbol}: no se pudo determinar el DEX de origen. Se usará el de más liquidez al cotizar.`);
-  }
-
   if (LIVE && walletKeypair && connection) {
     const saldoActual = await getWalletSolBalance();
     const totalNecesario = amountSol + OVERHEAD_RED_SOL;
@@ -2509,8 +2533,8 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       });
 
       await pool.query(
-        'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo,origen_dex,precio_compra_native) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
-        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL, origenDex, precioCompraNative]
+        'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo,origen_dex,precio_compra_native,pair_address) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+        [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL, origenDex, precioCompraNative, pairAddress]
       );
       await pool.query(
         'INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING',
@@ -2552,8 +2576,8 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     }
   } else {
     await pool.query(
-      'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo,origen_dex,precio_compra_native) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
-      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL, origenDex, precioCompraNative]
+      'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo,origen_dex,precio_compra_native,pair_address) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+      [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL, origenDex, precioCompraNative, pairAddress]
     );
     await pool.query(
       'INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING',
@@ -2574,7 +2598,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
 // ---------- Venta ----------
 async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
-  // LOCK anti-race-condition: evita procesar 2 ventas del mismo mint+alias a la vez
   const lockKey = `${trade.mint}:${tracked.alias}`;
   if (ventasEnProceso.has(lockKey)) {
     log('warn', `⏸️ Venta duplicada ignorada para ${trade.mint.slice(0, 6)}... vía ${tracked.alias}`);
@@ -2685,7 +2708,13 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       }
     } else {
       const { decimals } = await getTokenInfoHelius(trade.mint);
-      const resultado = await estimarValorEnSol(trade.mint, position.amount, decimals, position.origen_dex);
+      const resultado = await estimarValorEnSol(
+        trade.mint,
+        position.amount,
+        decimals,
+        position.origen_dex,
+        position.precio_compra_native
+      );
 
       let proceedsSol;
       let fuente;
