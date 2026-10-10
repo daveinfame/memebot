@@ -1695,9 +1695,6 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
 
 // ---------- Cotización vía DexScreener (con validaciones estrictas + validación 30x) ----------
 // Devuelve: { valorSol, precioSolUnitario, dexId, pairAddress, error }
-// Parámetros:
-//   - dexIdPreferido: si se pasa, intenta usar un par de ese DEX. Si no hay, cae al de más liquidez.
-//   - precioCompraNative: si se pasa, descarta pares cuyo precioNative esté > 30x o < 0.03x del precio de compra.
 async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null, precioCompraNative = null) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
@@ -2386,6 +2383,32 @@ async function ejecutarStopLossNoTradable(pos) {
   }
 }
 
+// ---------- Calcular proceeds desde el trade real de la wallet ----------
+// Devuelve { proceedsSol, precioUnitario, fuente } o null si no es confiable.
+// Reglas:
+//   - trade.tokenAmount > 0 y trade.solAmount > 0
+//   - trade.solAmountEstimado !== true (el parser no inventó el monto)
+//   - trade.solAmount > 0.005 (evita dust/ruido)
+function calcularProceedsDesdeTradeReal(trade, position) {
+  if (!trade || !position) return null;
+  if (trade.solAmountEstimado === true) return null;
+  if (!trade.tokenAmount || trade.tokenAmount <= 0) return null;
+  if (!trade.solAmount || trade.solAmount <= 0) return null;
+  if (trade.solAmount <= 0.005) return null;
+
+  const precioUnitario = trade.solAmount / trade.tokenAmount;
+  if (!Number.isFinite(precioUnitario) || precioUnitario <= 0) return null;
+
+  const proceedsSol = position.amount * precioUnitario;
+  if (!Number.isFinite(proceedsSol) || proceedsSol <= 0) return null;
+
+  return {
+    proceedsSol,
+    precioUnitario,
+    fuente: 'trade real de la wallet'
+  };
+}
+
 // ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
@@ -2449,7 +2472,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
   // El `origen` ya viene normalizado desde procesarWebhookHelius.
-  // Si es un dexId válido de DexScreener, lo usamos como filtro.
   const dexIdsDexScreener = ['pumpfun', 'pumpswap', 'raydium', 'meteora', 'jupiter', 'orca', 'lifinity', 'phoenix', 'openbook'];
   const origenDex = origen && dexIdsDexScreener.includes(origen.toLowerCase()) ? origen.toLowerCase() : null;
 
@@ -2658,7 +2680,24 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         });
         await sleep(ESPERA_LECTURA_SALDO_MS);
         const after = await getWalletSolBalance();
-        const proceedsSol = after - before;
+        const proceedsSolOnChain = after - before;
+
+        // ===== Validación cruzada con el trade real de la wallet =====
+        // Si el trade real es confiable y el on-chain se desvía >30%, usamos el trade real.
+        // Protege contra: RPC con lag, race con otra tx, saldo mal leído.
+        let proceedsSol = proceedsSolOnChain;
+        const desdeTrade = calcularProceedsDesdeTradeReal(trade, position);
+        if (desdeTrade && proceedsSolOnChain > 0) {
+          const ratio = proceedsSolOnChain / desdeTrade.proceedsSol;
+          if (ratio > 1.3 || ratio < 0.7) {
+            log(
+              'warn',
+              `⚠️ REAL: proceeds on-chain (${proceedsSolOnChain.toFixed(6)} SOL) se desvía ${(ratio * 100).toFixed(0)}% del trade real (${desdeTrade.proceedsSol.toFixed(6)} SOL). Usando trade real.`
+            );
+            proceedsSol = desdeTrade.proceedsSol;
+          }
+        }
+
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
 
@@ -2707,37 +2746,43 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         }
       }
     } else {
-      const { decimals } = await getTokenInfoHelius(trade.mint);
-      const resultado = await estimarValorEnSol(
-        trade.mint,
-        position.amount,
-        decimals,
-        position.origen_dex,
-        position.precio_compra_native
-      );
-
+      // ===== PAPER: prioridad al trade real de la wallet =====
       let proceedsSol;
       let fuente;
 
-      if (resultado.valorSol !== null) {
-        proceedsSol = resultado.valorSol;
-        fuente = `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})`;
-      } else if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
-        const precioPorToken = trade.solAmount / trade.tokenAmount;
-        proceedsSol = position.amount * precioPorToken;
-        fuente = 'trade de la wallet';
+      // 1. Trade real de la wallet (fuente primaria, sin sobreestimación)
+      const desdeTrade = calcularProceedsDesdeTradeReal(trade, position);
+      if (desdeTrade) {
+        proceedsSol = desdeTrade.proceedsSol;
+        fuente = `${desdeTrade.fuente} (${desdeTrade.precioUnitario.toExponential(4)} SOL/token)`;
       } else {
-        proceedsSol = position.cost_basis_sol;
-        fuente = 'cost_basis (fallback, PnL = 0)';
+        // 2. DexScreener/Jupiter (fallback)
+        const { decimals } = await getTokenInfoHelius(trade.mint);
+        const resultado = await estimarValorEnSol(
+          trade.mint,
+          position.amount,
+          decimals,
+          position.origen_dex,
+          position.precio_compra_native
+        );
+
+        if (resultado.valorSol !== null) {
+          proceedsSol = resultado.valorSol;
+          fuente = `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})`;
+        } else {
+          proceedsSol = position.cost_basis_sol;
+          fuente = 'cost_basis (fallback, PnL = 0)';
+        }
       }
 
       log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
 
+      // ===== Validaciones de sanidad (red de seguridad) =====
       const costBasis = Number(position.cost_basis_sol) || 0;
       if (costBasis > 0 && proceedsSol > costBasis * 50) {
         log(
           'warn',
-          `⚠️ proceedsSol sospechoso para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL (ratio ${(proceedsSol/costBasis).toFixed(2)}x). Usando cost_basis.`
+          `⚠️ proceedsSol sospechoso para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL (ratio ${(proceedsSol / costBasis).toFixed(2)}x). Usando cost_basis.`
         );
         proceedsSol = costBasis;
       }
