@@ -960,7 +960,10 @@ function limpiarCacheParsedEvents() {
   }
 }
 
-// Busca recursivamente en instructions el summary.parsedData de tipo swap
+// Busca en parsed.instructions el summary.parsedData de tipo swap.
+// IMPORTANTE: Helius APLANA las inner instructions en el mismo array
+// "instructions" (con innerInstructionIndex distinto), NO las anida.
+// Por eso solo hay que recorrer instructions[] y buscar el swap.
 function buscarSwapParsedData(parsed) {
   if (!parsed) return null;
 
@@ -969,14 +972,6 @@ function buscarSwapParsedData(parsed) {
     const pd = ins?.summary?.parsedData;
     if (pd && pd.type === 'swap' && pd.in_amount && pd.actual_out_amount) {
       return pd;
-    }
-    if (ins?.innerInstructions && Array.isArray(ins.innerInstructions)) {
-      for (const inner of ins.innerInstructions) {
-        const pdInner = inner?.summary?.parsedData;
-        if (pdInner && pdInner.type === 'swap' && pdInner.in_amount && pdInner.actual_out_amount) {
-          return pdInner;
-        }
-      }
     }
   }
   return null;
