@@ -986,6 +986,33 @@ async function getDecimalsDelMint(mint) {
   }
 }
 
+// Extrae el objeto de transacción de la respuesta de Parsed Events.
+// La API puede devolver varias formas distintas:
+//   - [tx1, tx2, ...]                      (array directo)
+//   - { value: [tx1, tx2, ...] }           (envuelto en value)
+//   - { value: tx }                        (value como objeto)
+//   - { signature, parserStatus, parsed }  (un solo objeto directo)
+function extraerTxDeRespuestaParsedEvents(data) {
+  if (!data) return null;
+
+  if (Array.isArray(data)) {
+    return data[0] || null;
+  }
+  if (Array.isArray(data.value)) {
+    return data.value[0] || null;
+  }
+  if (data.value && typeof data.value === 'object' && data.value.signature) {
+    return data.value;
+  }
+  if (data.signature && data.parserStatus) {
+    return data;
+  }
+  if (data.value && typeof data.value === 'object' && data.value.parserStatus) {
+    return data.value;
+  }
+  return null;
+}
+
 // Parsea una transacción vía Helius Parsed Events API.
 // Devuelve { direction, mint, solAmount, tokenAmount, protocol } o null si falla.
 async function parsearTransaccionViaHeliusAPI(signature) {
@@ -998,7 +1025,7 @@ async function parsearTransaccionViaHeliusAPI(signature) {
 
   const apiKey = getHeliusApiKey();
   if (!apiKey) {
-    log('warn', `🔍 Parsed Events: no apiKey disponible`);
+    log('debug', `🔍 Parsed Events: no apiKey disponible`);
     return null;
   }
 
@@ -1022,16 +1049,23 @@ async function parsearTransaccionViaHeliusAPI(signature) {
     }
 
     const data = await res.json();
-    const tx = data?.value?.[0];
-    if (!tx || tx.parserStatus !== 'OK') {
-      log('warn', `🔍 Parsed Events: tx inválida o parserStatus != OK (status: ${tx?.parserStatus}, value.length: ${data?.value?.length})`);
+    const tx = extraerTxDeRespuestaParsedEvents(data);
+
+    if (!tx) {
+      log('debug', `🔍 Parsed Events: no se pudo extraer tx de la respuesta (keys: ${data ? Object.keys(data).join(',') : 'null'})`);
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    if (tx.parserStatus !== 'OK') {
+      log('debug', `🔍 Parsed Events: parserStatus != OK (status: ${tx.parserStatus})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
 
     const parsedData = buscarSwapParsedData(tx.parsed);
     if (!parsedData) {
-      log('warn', `🔍 Parsed Events: buscarSwapParsedData devolvió null (instructions.length: ${tx.parsed?.instructions?.length})`);
+      log('debug', `🔍 Parsed Events: buscarSwapParsedData devolvió null (instructions.length: ${tx.parsed?.instructions?.length})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
@@ -1039,7 +1073,7 @@ async function parsearTransaccionViaHeliusAPI(signature) {
     const { in_amount, actual_out_amount, input_mint, output_mint } = parsedData;
 
     if (!in_amount || !actual_out_amount || !input_mint || !output_mint) {
-      log('warn', `🔍 Parsed Events: campos faltantes en parsedData (in_amount: ${in_amount}, actual_out_amount: ${actual_out_amount})`);
+      log('debug', `🔍 Parsed Events: campos faltantes en parsedData (in_amount: ${in_amount}, actual_out_amount: ${actual_out_amount})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
@@ -1062,11 +1096,11 @@ async function parsearTransaccionViaHeliusAPI(signature) {
       tokenAmountRaw = Number(in_amount);
       tokenDecimals = await getDecimalsDelMint(mint);
     } else if (output_mint === USDC_MINT_LOCAL || input_mint === USDC_MINT_LOCAL) {
-      log('debug', `🔍 Parsed Events: swap con USDC, ignorado (${input_mint.slice(0, 6)} -> ${output_mint.slice(0, 6)})`);
+      log('debug', `🔍 Parsed Events: swap con USDC, ignorado`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     } else {
-      log('debug', `🔍 Parsed Events: par no-SOL/USDC, ignorado (${input_mint.slice(0, 6)} -> ${output_mint.slice(0, 6)})`);
+      log('debug', `🔍 Parsed Events: par no-SOL/USDC, ignorado`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
