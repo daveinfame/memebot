@@ -801,7 +801,6 @@ async function initDB() {
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS modo TEXT DEFAULT 'paper'`);
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS origen_dex TEXT`);
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS precio_compra_native REAL`);
-    // NUEVA COLUMNA: pair_address (para futuro uso)
     await pool.query(`ALTER TABLE bot_positions ADD COLUMN IF NOT EXISTS pair_address TEXT`);
 
     await pool.query(
@@ -929,7 +928,201 @@ async function adjustPaperBalance(deltaUsd) {
   }
 }
 
+// ===== Parsed Events API (Helius) — fuente confiable de swaps =====
+
+// Cola con rate limit para Parsed Events API (2 req/s en plan Free)
+const parsedEventsTimestamps = [];
+const PARSED_EVENTS_MAX_RPS = 2;
+const parsedEventsCache = new Map();
+const PARSED_EVENTS_CACHE_MS = 60 * 60 * 1000;
+
+async function esperarTurnoParsedEvents() {
+  while (true) {
+    const ahora = Date.now();
+    while (parsedEventsTimestamps.length > 0 && ahora - parsedEventsTimestamps[0] > 1000) {
+      parsedEventsTimestamps.shift();
+    }
+    if (parsedEventsTimestamps.length < PARSED_EVENTS_MAX_RPS) {
+      parsedEventsTimestamps.push(ahora);
+      return;
+    }
+    const espera = 1000 - (ahora - parsedEventsTimestamps[0]) + 10;
+    await sleep(espera);
+  }
+}
+
+function limpiarCacheParsedEvents() {
+  const ahora = Date.now();
+  for (const [sig, entry] of parsedEventsCache.entries()) {
+    if (ahora - entry.timestamp > PARSED_EVENTS_CACHE_MS) {
+      parsedEventsCache.delete(sig);
+    }
+  }
+}
+
+// Busca recursivamente en instructions el summary.parsedData de tipo swap
+function buscarSwapParsedData(parsed) {
+  if (!parsed) return null;
+
+  const instructions = parsed.instructions || [];
+  for (const ins of instructions) {
+    const pd = ins?.summary?.parsedData;
+    if (pd && pd.type === 'swap' && pd.in_amount && pd.actual_out_amount) {
+      return pd;
+    }
+    if (ins?.innerInstructions && Array.isArray(ins.innerInstructions)) {
+      for (const inner of ins.innerInstructions) {
+        const pdInner = inner?.summary?.parsedData;
+        if (pdInner && pdInner.type === 'swap' && pdInner.in_amount && pdInner.actual_out_amount) {
+          return pdInner;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function getDecimalsDelMint(mint) {
+  try {
+    const info = await getTokenInfoHelius(mint);
+    return info.decimals ?? 6;
+  } catch {
+    return 6;
+  }
+}
+
+// Parsea una transacción vía Helius Parsed Events API.
+// Devuelve { direction, mint, solAmount, tokenAmount, protocol } o null si falla.
+async function parsearTransaccionViaHeliusAPI(signature) {
+  if (!signature || typeof signature !== 'string') return null;
+
+  const cacheado = parsedEventsCache.get(signature);
+  if (cacheado && Date.now() - cacheado.timestamp < PARSED_EVENTS_CACHE_MS) {
+    return cacheado.value;
+  }
+
+  const apiKey = getHeliusApiKey();
+  if (!apiKey) return null;
+
+  await esperarTurnoParsedEvents();
+
+  try {
+    const res = await fetch(
+      `https://mainnet.helius-rpc.com/v1/parsed-events/transactions?api-key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions: [signature] }),
+        signal: AbortSignal.timeout(8000)
+      }
+    );
+
+    if (!res.ok) {
+      log('warn', `Parsed Events API: HTTP ${res.status} para ${signature.slice(0, 12)}...`);
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const data = await res.json();
+    const tx = data?.value?.[0];
+    if (!tx || tx.parserStatus !== 'OK') {
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const parsedData = buscarSwapParsedData(tx.parsed);
+    if (!parsedData) {
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const { in_amount, actual_out_amount, input_mint, output_mint } = parsedData;
+
+    if (!in_amount || !actual_out_amount || !input_mint || !output_mint) {
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const SOL_MINT_LOCAL = 'So11111111111111111111111111111111111111112';
+    const USDC_MINT_LOCAL = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+    let direction, mint, solAmountLamports, tokenAmountRaw, tokenDecimals;
+
+    if (input_mint === SOL_MINT_LOCAL) {
+      direction = 'buy';
+      mint = output_mint;
+      solAmountLamports = Number(in_amount);
+      tokenAmountRaw = Number(actual_out_amount);
+      tokenDecimals = await getDecimalsDelMint(mint);
+    } else if (output_mint === SOL_MINT_LOCAL) {
+      direction = 'sell';
+      mint = input_mint;
+      solAmountLamports = Number(actual_out_amount);
+      tokenAmountRaw = Number(in_amount);
+      tokenDecimals = await getDecimalsDelMint(mint);
+    } else if (output_mint === USDC_MINT_LOCAL || input_mint === USDC_MINT_LOCAL) {
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    } else {
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const solAmount = solAmountLamports / LAMPORTS_PER_SOL;
+    const tokenAmount = tokenAmountRaw / Math.pow(10, tokenDecimals);
+
+    const resultado = {
+      direction,
+      mint,
+      solAmount,
+      tokenAmount,
+      protocol: parsedData.protocol || null
+    };
+
+    log(
+      'debug',
+      `🎯 Parsed Events: ${direction} ${mint.slice(0, 6)}... · ${solAmount.toFixed(6)} SOL · ${tokenAmount.toFixed(4)} tokens (protocol: ${resultado.protocol})`
+    );
+
+    parsedEventsCache.set(signature, { value: resultado, timestamp: Date.now() });
+    return resultado;
+  } catch (e) {
+    log('warn', `Parsed Events API error para ${signature.slice(0, 12)}...: ${e.message}`);
+    parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+    return null;
+  }
+}
+
+// Encuentra qué wallet trackeada es la dueña del swap según el parsed data
+function encontrarWalletTrackeadaDelSwap(tx, parsed, trackedMap) {
+  const feePayer = tx.feePayer;
+  if (feePayer && trackedMap.has(feePayer)) return feePayer;
+
+  for (const tt of tx.tokenTransfers || []) {
+    if (parsed.direction === 'buy' && tt.toUserAccount && trackedMap.has(tt.toUserAccount)) {
+      return tt.toUserAccount;
+    }
+    if (parsed.direction === 'sell' && tt.fromUserAccount && trackedMap.has(tt.fromUserAccount)) {
+      return tt.fromUserAccount;
+    }
+  }
+
+  for (const acc of tx.accountData || []) {
+    if (trackedMap.has(acc.account)) return acc.account;
+  }
+
+  for (const nt of tx.nativeTransfers || []) {
+    if (nt.fromUserAccount && trackedMap.has(nt.fromUserAccount)) return nt.fromUserAccount;
+    if (nt.toUserAccount && trackedMap.has(nt.toUserAccount)) return nt.toUserAccount;
+  }
+
+  return null;
+}
+
+setInterval(limpiarCacheParsedEvents, 15 * 60 * 1000).unref?.();
+
 // ===== FIN BLOQUE 2 =====
+
 // ---------- Webhook Helius: crear o actualizar ----------
 async function crearOActualizarWebhookHelius() {
   if (creandoWebhook) {
@@ -1471,10 +1664,43 @@ async function procesarWebhookHelius(rawBody) {
     const horaDeteccion = tx.timestamp ? tx.timestamp * 1000 : Date.now();
     const cambiosProcesados = new Set();
 
-    // Normalizar el source de Helius al dexId de DexScreener
     const origenNormalizado = normalizarDexIdParaDexScreener(tx.source);
 
-    // 1. accountData directo
+    // ===== PRIORIDAD: Parsed Events API de Helius =====
+    const parsed = await parsearTransaccionViaHeliusAPI(tx.signature);
+
+    if (parsed) {
+      const ownerWallet = encontrarWalletTrackeadaDelSwap(tx, parsed, trackedMap);
+      if (ownerWallet) {
+        const tracked = trackedMap.get(ownerWallet);
+        log(
+          'info',
+          `🌐 Actividad detectada (Parsed Events): ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... · ${parsed.solAmount.toFixed(4)} SOL · ${parsed.tokenAmount.toFixed(4)} tokens (protocol: ${parsed.protocol})`
+        );
+
+        const tradeCompatible = {
+          mint: parsed.mint,
+          solAmount: parsed.solAmount,
+          tokenAmount: parsed.tokenAmount,
+          solAmountEstimado: false,
+          traderPublicKey: tracked.address,
+          txType: parsed.direction
+        };
+        const origen =
+          parsed.protocol ||
+          origenNormalizado ||
+          (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
+
+        if (parsed.direction === 'buy') {
+          await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
+        } else {
+          await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
+        }
+        continue;
+      }
+    }
+
+    // ===== FALLBACK: parser casero =====
     for (const acc of tx.accountData || []) {
       const tracked = trackedMap.get(acc.account);
       if (!tracked) continue;
@@ -1510,7 +1736,6 @@ async function procesarWebhookHelius(rawBody) {
       }
     }
 
-    // 2. Fallback global
     for (const tracked of trackedRows) {
       if (!cuentasDetectadas.includes(tracked.address)) continue;
 
