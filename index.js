@@ -997,7 +997,10 @@ async function parsearTransaccionViaHeliusAPI(signature) {
   }
 
   const apiKey = getHeliusApiKey();
-  if (!apiKey) return null;
+  if (!apiKey) {
+    log('warn', `🔍 Parsed Events: no apiKey disponible`);
+    return null;
+  }
 
   await esperarTurnoParsedEvents();
 
@@ -1021,12 +1024,14 @@ async function parsearTransaccionViaHeliusAPI(signature) {
     const data = await res.json();
     const tx = data?.value?.[0];
     if (!tx || tx.parserStatus !== 'OK') {
+      log('warn', `🔍 Parsed Events: tx inválida o parserStatus != OK (status: ${tx?.parserStatus}, value.length: ${data?.value?.length})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
 
     const parsedData = buscarSwapParsedData(tx.parsed);
     if (!parsedData) {
+      log('warn', `🔍 Parsed Events: buscarSwapParsedData devolvió null (instructions.length: ${tx.parsed?.instructions?.length})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
@@ -1034,6 +1039,7 @@ async function parsearTransaccionViaHeliusAPI(signature) {
     const { in_amount, actual_out_amount, input_mint, output_mint } = parsedData;
 
     if (!in_amount || !actual_out_amount || !input_mint || !output_mint) {
+      log('warn', `🔍 Parsed Events: campos faltantes en parsedData (in_amount: ${in_amount}, actual_out_amount: ${actual_out_amount})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
@@ -1056,9 +1062,11 @@ async function parsearTransaccionViaHeliusAPI(signature) {
       tokenAmountRaw = Number(in_amount);
       tokenDecimals = await getDecimalsDelMint(mint);
     } else if (output_mint === USDC_MINT_LOCAL || input_mint === USDC_MINT_LOCAL) {
+      log('debug', `🔍 Parsed Events: swap con USDC, ignorado (${input_mint.slice(0, 6)} -> ${output_mint.slice(0, 6)})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     } else {
+      log('debug', `🔍 Parsed Events: par no-SOL/USDC, ignorado (${input_mint.slice(0, 6)} -> ${output_mint.slice(0, 6)})`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
