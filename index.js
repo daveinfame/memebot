@@ -3372,8 +3372,8 @@ bot.onText(/\/help/, async (msg) => {
 /positions – Posiciones abiertas del bot (incluye mint para /close)
 
 🔧 CIERRE MANUAL:
-/close <alias> <mint> – Cierra manualmente una posición
-/closeall <alias> – Cierra todas las posiciones de una wallet
+/close <alias> <mint> – Cierra manualmente una posición (el bot vende)
+/closeall <alias> – Cierra todas las posiciones de una wallet (el bot vende)
 
 ⚙️ SISTEMA:
 /status – Estado general del bot
@@ -3414,9 +3414,57 @@ bot.onText(/\/positions/, async (msg) => {
   }
 });
 
-// ---------- Comandos de cierre manual ----------
+// ---------- Cierre manual (PAPER y REAL) ----------
 
-// /close <alias> <mint>
+// Calcula proceeds para cierre manual en PAPER.
+// Prioridad:
+//   1. DexScreener con filtro 30x (usando precio_compra_native)
+//   2. Jupiter (si DexScreener falla)
+//   3. cost_basis (PnL = 0) si todo falla
+async function calcularProceedsParaCierreManual(pos) {
+  const costBasis = Number(pos.cost_basis_sol) || 0;
+
+  // 1. DexScreener con validaciones
+  try {
+    const { decimals } = await getTokenInfoHelius(pos.token_mint);
+    const resultado = await estimarValorEnSol(
+      pos.token_mint,
+      pos.amount,
+      decimals,
+      pos.origen_dex,
+      pos.precio_compra_native
+    );
+
+    if (resultado.error === 'NOT_TRADABLE') {
+      log('warn', `🔍 Cierre manual PAPER ${pos.symbol}: token no tradable en Jupiter. Usando cost_basis.`);
+      return { proceedsSol: costBasis, fuente: 'cost_basis (no tradable)' };
+    }
+
+    if (resultado.valorSol !== null && resultado.valorSol > 0) {
+      let proceeds = resultado.valorSol;
+
+      // Validaciones 50x / 0.001x
+      if (costBasis > 0 && proceeds > costBasis * 50) {
+        log('warn', `⚠️ Cierre manual PAPER ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL sospechosamente alto vs cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
+        proceeds = costBasis;
+      }
+      if (costBasis > 0 && proceeds < costBasis * 0.001) {
+        log('warn', `⚠️ Cierre manual PAPER ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL sospechosamente bajo vs cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
+        proceeds = costBasis;
+      }
+
+      return { proceedsSol: proceeds, fuente: `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})` };
+    }
+  } catch (e) {
+    log('warn', `🔍 Cierre manual PAPER ${pos.symbol}: error en estimarValorEnSol: ${e.message}`);
+  }
+
+  // 2. Fallback: cost_basis
+  log('warn', `🔍 Cierre manual PAPER ${pos.symbol}: sin cotización, usando cost_basis (PnL = 0).`);
+  return { proceedsSol: costBasis, fuente: 'cost_basis (fallback)' };
+}
+
+// /close <alias> <mint> — cierra 100%, sin confirmación
 bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
@@ -3436,16 +3484,23 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
     }
 
     const pos = posRes.rows[0];
-    const { decimals } = await getTokenInfoHelius(pos.token_mint);
-    const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-    const valorEstimado = resultado.valorSol;
 
-    const { rows: trackedRows } = await pool.query('SELECT address FROM tracked_wallets WHERE alias=$1', [alias]);
-    const walletAddress = trackedRows[0]?.address || alias;
-
+    // ============ PAPER ============
     if (MODO_ACTUAL === 'paper') {
-      const proceedsSol = valorEstimado ?? 0;
-      const solPrice = await getSolPriceUSD();
+      const { rows: trackedRows } = await pool.query(
+        'SELECT address FROM tracked_wallets WHERE alias=$1',
+        [alias]
+      );
+      const walletAddress = trackedRows[0]?.address || alias;
+
+      const { proceedsSol, fuente } = await calcularProceedsParaCierreManual(pos);
+
+      let solPrice = await getSolPriceUSD();
+      if (!solPrice) {
+        log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar el cierre');
+        solPrice = 150;
+      }
+
       const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
       const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
@@ -3461,33 +3516,114 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
       const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
       const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
-      let detalleValor = '';
-      if (resultado.error === 'NOT_TRADABLE') {
-        detalleValor = '⚠️ Token no tradable en Jupiter. Cerrado con proceeds 0.';
-      } else if (valorEstimado === null) {
-        detalleValor = '⚠️ No se pudo cotizar el valor actual. Cerrado con proceeds 0.';
-      }
-
       bot.sendMessage(
         msg.chat.id,
-        `🖐️ CIERRE MANUAL [${pos.wallet_alias}] ${pos.symbol}\n${detalleValor}\nSalí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n${formatearResultado(r)}\nSaldo ficticio: $${saldoSeguro.toFixed(2)}`
+        `🖐️ CIERRE MANUAL PAPER [${pos.wallet_alias}] ${pos.symbol}\n` +
+        `Fuente: ${fuente}\n` +
+        `Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n` +
+        `${formatearResultado(r)}\n` +
+        `Saldo ficticio: $${saldoSeguro.toFixed(2)}`
       );
-      log('info', `🖐️ Cierre manual (paper) [${pos.wallet_alias}] ${pos.symbol}: ${formatearResultado(r)}`);
-    } else {
+      log('info', `🖐️ Cierre manual PAPER [${pos.wallet_alias}] ${pos.symbol}: ${formatearResultado(r)} (fuente: ${fuente})`);
+      return;
+    }
+
+    // ============ REAL ============
+    if (!LIVE || !walletKeypair || !connection) {
+      bot.sendMessage(msg.chat.id, '❌ No se puede vender: wallet o conexión RPC no disponibles.');
+      return;
+    }
+
+    bot.sendMessage(msg.chat.id, `⏳ Cerrando posición REAL [${alias}] ${pos.symbol}...`);
+
+    try {
+      const before = await getWalletSolBalance();
+      const sig = await ejecutarTrade({
+        action: 'sell',
+        mint: pos.token_mint,
+        amount: pos.amount,
+        origen: 'OnChain',
+        slippage: DEFAULT_SLIPPAGE_BPS
+      });
+      await sleep(ESPERA_LECTURA_SALDO_MS);
+      const after = await getWalletSolBalance();
+      const proceedsSolOnChain = after - before;
+
+      // Validación cruzada con trade real (si existiera reciente, no en cierre manual)
+      // En cierre manual no hay trade reciente de la wallet, así que usamos on-chain puro.
+      let proceedsSol = proceedsSolOnChain;
+      if (proceedsSol < 0) {
+        log('warn', `⚠️ Cierre manual REAL ${pos.symbol}: proceeds negativos (${proceedsSol}). Usando 0.`);
+        proceedsSol = 0;
+      }
+
+      const solPrice = await getSolPriceUSD();
+      const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+
+      // 1. Borrar posición
       await pool.query(
         'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
         [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
       );
       await pool.query(
         'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-        [walletAddress, pos.token_mint]
+        [pos.wallet_address || alias, pos.token_mint]
       );
 
-      bot.sendMessage(
-        msg.chat.id,
-        `🖐️ Posición cerrada manualmente [${pos.wallet_alias}] ${pos.symbol}.\n\n⚠️ En modo REAL, el PnL se calculará automáticamente cuando el bot detecte la venta on-chain (módulo de detección de ventas manuales). Si ya vendiste, en los próximos 2 minutos debería llegar el mensaje de "🖐️ Venta MANUAL detectada" con el PnL real.`
-      );
-      log('info', `🖐️ Cierre manual (real) [${pos.wallet_alias}] ${pos.symbol}: solo limpia DB, PnL por detector`);
+      // 2. Registrar el trade
+      await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+
+      // 3. Marcar la signature como procesada para que detectarVentasManuales no la procese de nuevo
+      marcarSignatureProcesada(sig);
+
+      // 4. Mensaje
+      let mensaje =
+        `🖐️ CIERRE MANUAL REAL [${pos.wallet_alias}] ${pos.symbol}\n` +
+        `Salí con: ${proceedsSol.toFixed(4)} SOL\n` +
+        `${formatearResultado(r)}\n` +
+        `tx: ${linkTx(sig)}`;
+
+      if (r.profitSol > 0) {
+        const usdcSig = await swapProfitToUsdc(r.profitSol);
+        mensaje += usdcSig
+          ? `\n💵 Ganancia convertida a USDC · tx: ${linkTx(usdcSig)}`
+          : `\n⚠️ No se pudo convertir la ganancia a USDC`;
+      }
+
+      const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
+      if (rentRecuperado) {
+        mensaje += `\n♻️ Cuenta cerrada, recuperado: ${rentRecuperado.toFixed(5)} SOL de rent`;
+      }
+
+      const saldoFinal = await getWalletSolBalance();
+      mensaje += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
+
+      bot.sendMessage(msg.chat.id, mensaje);
+      log('info', `🖐️ Cierre manual REAL [${pos.wallet_alias}] ${pos.symbol}: ${formatearResultado(r)}`);
+    } catch (e) {
+      log('error', `Error en /close REAL: ${e.message}`);
+      if (esSellZeroAmount(e)) {
+        // Posición fantasma
+        await pool.query(
+          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+        );
+        await pool.query(
+          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+          [pos.wallet_address || alias, pos.token_mint]
+        );
+        bot.sendMessage(
+          msg.chat.id,
+          `🧹 [${pos.wallet_alias}] ${pos.symbol}: posición fantasma eliminada — la compra original nunca se ejecutó de verdad. No se cuenta como pérdida.`
+        );
+      } else {
+        // A: dejar la posición abierta, avisar, se reintenta en reconciliación
+        bot.sendMessage(
+          msg.chat.id,
+          `❌ No se pudo cerrar [${pos.wallet_alias}] ${pos.symbol}: ${mensajeAmigableError(e)}\n` +
+          `La posición sigue abierta. Se reintentará en el próximo ciclo de reconciliación, o puedes volver a mandar /close.`
+        );
+      }
     }
   } catch (e) {
     log('error', `Error en /close: ${e.message}`);
@@ -3495,7 +3631,7 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
   }
 });
 
-// /closeall <alias>
+// /closeall <alias> — cierra todas las posiciones de una wallet, sin confirmación
 bot.onText(/\/closeall (\S+)/, async (msg, match) => {
   if (!esAdmin(msg)) return;
   try {
@@ -3516,50 +3652,145 @@ bot.onText(/\/closeall (\S+)/, async (msg, match) => {
     const { rows: trackedRows } = await pool.query('SELECT address FROM tracked_wallets WHERE alias=$1', [alias]);
     const walletAddress = trackedRows[0]?.address || alias;
 
-    const solPrice = await getSolPriceUSD();
+    bot.sendMessage(
+      msg.chat.id,
+      `⏳ Cerrando ${posRes.rows.length} posiciones [${alias}] en modo ${MODO_ACTUAL.toUpperCase()}...`
+    );
+
+    // ============ PAPER ============
+    if (MODO_ACTUAL === 'paper') {
+      let solPrice = await getSolPriceUSD();
+      if (!solPrice) solPrice = 150;
+
+      let cerradas = 0;
+      let pnlTotalSol = 0;
+      let usdTotal = 0;
+      const simbolos = [];
+
+      for (const pos of posRes.rows) {
+        const { proceedsSol, fuente } = await calcularProceedsParaCierreManual(pos);
+        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
+        const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
+
+        await adjustPaperBalance(proceedsUsd);
+        await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+        await pool.query(
+          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+        );
+        await pool.query(
+          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+          [walletAddress, pos.token_mint]
+        );
+
+        pnlTotalSol += r.profitSol;
+        usdTotal += proceedsUsd;
+        cerradas++;
+        simbolos.push(`${pos.symbol} (${formatearResultado(r)})`);
+        log('info', `🖐️ /closeall PAPER ${pos.symbol}: ${formatearResultado(r)} (fuente: ${fuente})`);
+      }
+
+      const emoji = pnlTotalSol >= 0 ? '🟢' : '🔴';
+      let txt = `🖐️ ${cerradas} posiciones cerradas manualmente [${alias}] (PAPER)\n`;
+      txt += `Tokens: ${simbolos.join(', ')}\n`;
+      txt += `PnL total estimado: ${emoji} ${pnlTotalSol >= 0 ? '+' : ''}${pnlTotalSol.toFixed(4)} SOL (~$${usdTotal.toFixed(2)})`;
+      bot.sendMessage(msg.chat.id, txt);
+      log('info', `🖐️ /closeall PAPER ${alias}: ${cerradas} posiciones cerradas, PnL: ${pnlTotalSol.toFixed(4)} SOL`);
+      return;
+    }
+
+    // ============ REAL ============
+    if (!LIVE || !walletKeypair || !connection) {
+      bot.sendMessage(msg.chat.id, '❌ No se puede vender: wallet o conexión RPC no disponibles.');
+      return;
+    }
+
     let cerradas = 0;
     let pnlTotalSol = 0;
     let usdTotal = 0;
     const simbolos = [];
+    const errores = [];
 
     for (const pos of posRes.rows) {
-      const { decimals } = await getTokenInfoHelius(pos.token_mint);
-      const resultado = await estimarValorEnSol(pos.token_mint, pos.amount, decimals);
-      const valorEstimado = resultado.valorSol;
+      try {
+        const before = await getWalletSolBalance();
+        const sig = await ejecutarTrade({
+          action: 'sell',
+          mint: pos.token_mint,
+          amount: pos.amount,
+          origen: 'OnChain',
+          slippage: DEFAULT_SLIPPAGE_BPS
+        });
+        await sleep(ESPERA_LECTURA_SALDO_MS);
+        const after = await getWalletSolBalance();
+        let proceedsSol = after - before;
+        if (proceedsSol < 0) proceedsSol = 0;
 
-      if (MODO_ACTUAL === 'paper') {
-        const proceedsSol = valorEstimado ?? 0;
-        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
-        const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
-        await adjustPaperBalance(proceedsUsd);
+        const solPrice = await getSolPriceUSD();
+        const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
+
+        await pool.query(
+          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+        );
+        await pool.query(
+          'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+          [walletAddress, pos.token_mint]
+        );
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-        pnlTotalSol += r.profitSol;
-        usdTotal += proceedsUsd;
-      }
+        marcarSignatureProcesada(sig);
 
-      await pool.query(
-        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-      );
-      await pool.query(
-        'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
-        [walletAddress, pos.token_mint]
-      );
-      cerradas++;
-      simbolos.push(pos.symbol);
+        // Convertir ganancia a USDC si aplica
+        if (r.profitSol > 0) {
+          try {
+            await swapProfitToUsdc(r.profitSol);
+          } catch (_) {}
+        }
+
+        // Cerrar cuenta
+        try {
+          await cerrarCuentaDelToken(pos.token_mint);
+        } catch (_) {}
+
+        pnlTotalSol += r.profitSol;
+        if (solPrice) usdTotal += r.proceedsNetoSol * solPrice;
+        cerradas++;
+        simbolos.push(`${pos.symbol} (${formatearResultado(r)})`);
+        log('info', `🖐️ /closeall REAL ${pos.symbol}: ${formatearResultado(r)} · tx: ${sig}`);
+      } catch (e) {
+        log('error', `Error cerrando ${pos.symbol} en /closeall: ${e.message}`);
+        if (esSellZeroAmount(e)) {
+          await pool.query(
+            'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
+            [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
+          );
+          await pool.query(
+            'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
+            [walletAddress, pos.token_mint]
+          );
+          simbolos.push(`${pos.symbol} (fantasma eliminada)`);
+          cerradas++;
+        } else {
+          errores.push(`${pos.symbol}: ${mensajeAmigableError(e)}`);
+        }
+      }
     }
 
     const emoji = pnlTotalSol >= 0 ? '🟢' : '🔴';
-    let txt = `🖐️ ${cerradas} posiciones cerradas manualmente [${alias}]\n`;
+    let txt = `🖐️ ${cerradas} posiciones cerradas manualmente [${alias}] (REAL)\n`;
     txt += `Tokens: ${simbolos.join(', ')}\n`;
-    if (MODO_ACTUAL === 'paper') {
-      txt += `PnL total estimado: ${emoji} ${pnlTotalSol >= 0 ? '+' : ''}${pnlTotalSol.toFixed(4)} SOL`;
-      if (solPrice) txt += ` (~$${usdTotal.toFixed(2)})`;
-    } else {
-      txt += `⚠️ Modo REAL: PnL se calculará cuando el detector detecte las ventas on-chain.`;
+    if (usdTotal > 0 || cerradas > 0) {
+      txt += `PnL total: ${emoji} ${pnlTotalSol >= 0 ? '+' : ''}${pnlTotalSol.toFixed(4)} SOL`;
+      if (usdTotal !== 0) txt += ` (~$${usdTotal.toFixed(2)})`;
     }
+    if (errores.length > 0) {
+      txt += `\n\n⚠️ Errores en ${errores.length}:\n${errores.join('\n')}`;
+    }
+    const saldoFinal = await getWalletSolBalance();
+    txt += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
+
     bot.sendMessage(msg.chat.id, txt);
-    log('info', `🖐️ /closeall ${alias}: ${cerradas} posiciones cerradas`);
+    log('info', `🖐️ /closeall REAL ${alias}: ${cerradas} cerradas, PnL: ${pnlTotalSol.toFixed(4)} SOL, errores: ${errores.length}`);
   } catch (e) {
     log('error', `Error en /closeall: ${e.message}`);
     bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
@@ -3848,7 +4079,7 @@ bot.onText(/\/wallet (\S+)/, async (msg, match) => {
   }
 });
 
-// /pnl (maneja el objeto { valorSol, error })
+// /pnl
 bot.onText(/\/pnl/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {
@@ -3872,7 +4103,13 @@ bot.onText(/\/pnl/, async (msg) => {
     if (pos.length > 0) {
       for (const p of pos) {
         const { decimals } = await getTokenInfoHelius(p.token_mint);
-        const resultado = await estimarValorEnSol(p.token_mint, p.amount, decimals);
+        const resultado = await estimarValorEnSol(
+          p.token_mint,
+          p.amount,
+          decimals,
+          p.origen_dex,
+          p.precio_compra_native
+        );
 
         if (resultado.error === 'NOT_TRADABLE') {
           unrealizedSol += 0 - (Number(p.cost_basis_sol) || 0);
@@ -3950,7 +4187,7 @@ setInterval(() => {
   await initDB();
   await initBaselineReal();
   
-  // WS de PumpPortal desactivado — ahora dependemos solo de Helius
+  // WS de PumpPortal desactivado — dependemos solo de Helius
   // conectarWS();
   crearOActualizarWebhookHelius();
   iniciarServidorWebhook();
@@ -3993,4 +4230,4 @@ setInterval(() => {
   process.on('SIGTERM', shutdown);
 })();
 
-// ===== FIN  BLOQUE 5 =====
+// ===== FIN BLOQUE 5 =====
