@@ -1955,9 +1955,9 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   }
 }
 
-// ---------- Cotización vía DexScreener (con validaciones estrictas + validación 30x) ----------
+// ---------- Cotización vía DexScreener (con validaciones estrictas + validación 3x) ----------
 // Devuelve: { valorSol, precioSolUnitario, dexId, pairAddress, error }
-async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null, precioCompraNative = null) {
+async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null, precioCompraNative = null, maxRatio = 30) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -1969,7 +1969,7 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'NO_PAIRS' };
     }
 
-    // Filtro base: liquidez, mcap, precio
+    // Filtro base
     let pairsValidos = data.pairs.filter((p) => {
       const price = parseFloat(p.priceNative);
       if (!Number.isFinite(price) || price <= 0) return false;
@@ -1985,10 +1985,10 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       return true;
     });
 
-    // Validación 30x contra el precio de compra
+    // Validación contra el precio de compra (ratio configurable)
     if (precioCompraNative && precioCompraNative > 0) {
-      const MAX_RATIO = 30;
-      const MIN_RATIO = 0.03;
+      const MAX_RATIO = maxRatio;
+      const MIN_RATIO = 1 / maxRatio;
       const antes = pairsValidos.length;
       pairsValidos = pairsValidos.filter((p) => {
         const price = parseFloat(p.priceNative);
@@ -1999,17 +1999,17 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       if (pairsValidos.length < antes) {
         log(
           'info',
-          `🔒 DexScreener: ${antes - pairsValidos.length} par(es) descartado(s) por estar fuera del rango [0.03x, 30x] del precio de compra (${precioCompraNative.toExponential(4)} SOL/token)`
+          `🔒 DexScreener: ${antes - pairsValidos.length} par(es) descartado(s) por estar fuera del rango [${(1/maxRatio).toFixed(2)}x, ${maxRatio}x] del precio de compra (${precioCompraNative.toExponential(4)} SOL/token)`
         );
       }
     }
 
     if (pairsValidos.length === 0) {
-      log('warn', `DexScreener: ningún par válido para ${mint.slice(0, 6)}... (liquidez, mcap, precio o rango 30x)`);
+      log('warn', `DexScreener: ningún par válido para ${mint.slice(0, 6)}... (liquidez, mcap, precio o rango)`);
       return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'NO_VALID_PAIRS' };
     }
 
-    // Filtro por dexIdPreferido (si aplica)
+    // Filtro por dexIdPreferido
     let candidatos = pairsValidos;
     if (dexIdPreferido) {
       const filtrados = pairsValidos.filter(
@@ -2078,8 +2078,8 @@ async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
   }
 }
 
-// ---------- Valor estimado en SOL (DexScreener → Jupiter, con validaciones) ----------
-async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null, precioCompraNative = null) {
+// ---------- Valor estimado en SOL ----------
+async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null, precioCompraNative = null, maxRatio = 30) {
   let cantidadReal = cantidadTokens;
   if (walletKeypair) {
     try {
@@ -2103,7 +2103,7 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
 
   if (cantidadReal <= 0) return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'ZERO_AMOUNT' };
 
-  const dexs = await cotizarViaDexScreener(mint, cantidadReal, dexIdPreferido, precioCompraNative);
+  const dexs = await cotizarViaDexScreener(mint, cantidadReal, dexIdPreferido, precioCompraNative, maxRatio);
   if (dexs.valorSol !== null) {
     return dexs;
   }
@@ -2115,7 +2115,7 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
 
 // ---------- Obtener precio unitario + dexId + pairAddress vía DexScreener ----------
 async function obtenerPrecioUnitarioDexScreener(mint, dexIdPreferido = null) {
-  const resultado = await cotizarViaDexScreener(mint, 1, dexIdPreferido, null);
+  const resultado = await cotizarViaDexScreener(mint, 1, dexIdPreferido, null, 30);
   if (resultado.valorSol !== null && resultado.valorSol > 0) {
     return {
       precioSol: resultado.valorSol,
@@ -2303,6 +2303,74 @@ function resyncSubscriptions() {
     .catch((e) => log('error', `Error resincronizando suscripciones: ${e.message}`));
 }
 
+// ---------- Buscar último trade real de una wallet para un mint (para reconciliación) ----------
+async function buscarUltimoTradeReal(walletAlias, mint, minutosAtras = 30) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT th.profit_sol, th.closed_at
+       FROM trade_history th
+       WHERE th.wallet_alias = $1 AND th.modo = $2
+       ORDER BY th.closed_at DESC
+       LIMIT 50`,
+      [walletAlias, MODO_ACTUAL]
+    );
+    // No tenemos el mint en trade_history, así que no podemos filtrar por mint.
+    // Retornamos null siempre. Esta función queda como placeholder para futuro.
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------- Calcular proceeds para reconciliación ----------
+// Prioridad:
+//   1. Trade real reciente de la wallet (si existe)
+//   2. DexScreener con filtro 3x (contra precio_compra_native)
+//   3. cost_basis (PnL = 0)
+async function calcularProceedsParaReconciliacion(pos) {
+  const costBasis = Number(pos.cost_basis_sol) || 0;
+
+  // 1. DexScreener con filtro 3x
+  try {
+    const { decimals } = await getTokenInfoHelius(pos.token_mint);
+    const resultado = await estimarValorEnSol(
+      pos.token_mint,
+      pos.amount,
+      decimals,
+      pos.origen_dex,
+      pos.precio_compra_native,
+      3  // ← filtro 3x en reconciliación (más estricto)
+    );
+
+    if (resultado.error === 'NOT_TRADABLE') {
+      log('warn', `🔍 Reconciliación ${pos.symbol}: token no tradable. Usando cost_basis.`);
+      return { proceedsSol: costBasis, fuente: 'cost_basis (no tradable)' };
+    }
+
+    if (resultado.valorSol !== null && resultado.valorSol > 0) {
+      let proceeds = resultado.valorSol;
+
+      // Validaciones 3x / 0.33x
+      if (costBasis > 0 && proceeds > costBasis * 3) {
+        log('warn', `⚠️ Reconciliación ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL > 3x cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
+        proceeds = costBasis;
+      }
+      if (costBasis > 0 && proceeds < costBasis * 0.33) {
+        log('warn', `⚠️ Reconciliación ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL < 0.33x cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
+        proceeds = costBasis;
+      }
+
+      return { proceedsSol: proceeds, fuente: `DexScreener (dex: ${resultado.dexId || 'n/d'})` };
+    }
+  } catch (e) {
+    log('warn', `🔍 Reconciliación ${pos.symbol}: error en estimarValorEnSol: ${e.message}`);
+  }
+
+  // 2. Fallback: cost_basis
+  log('warn', `🔍 Reconciliación ${pos.symbol}: sin cotización válida, usando cost_basis (PnL = 0).`);
+  return { proceedsSol: costBasis, fuente: 'cost_basis (fallback)' };
+}
+
 // ---------- Reconciliación de posiciones ----------
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
@@ -2369,6 +2437,7 @@ async function reconciliarPosiciones(forzado = false) {
         `🔄 Reconciliación [${MODO_ACTUAL.toUpperCase()}]: ${pos.wallet_alias} ya no tiene ${pos.symbol} - cerrando posición`
       );
 
+      // ============ REAL ============
       if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
         try {
           const before = await getWalletSolBalance();
@@ -2381,7 +2450,9 @@ async function reconciliarPosiciones(forzado = false) {
           });
           await sleep(ESPERA_LECTURA_SALDO_MS);
           const after = await getWalletSolBalance();
-          const proceedsSol = after - before;
+          let proceedsSol = after - before;
+          if (proceedsSol < 0) proceedsSol = 0;
+
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
@@ -2390,6 +2461,7 @@ async function reconciliarPosiciones(forzado = false) {
             [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
           );
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+          marcarSignatureProcesada(sig);
 
           let msg = `🔄⚠️ Venta atrasada detectada y ejecutada [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
           if (r.profitSol > 0) {
@@ -2428,15 +2500,8 @@ async function reconciliarPosiciones(forzado = false) {
           }
         }
       } else {
-        const { decimals } = await getTokenInfoHelius(pos.token_mint);
-        const resultado = await estimarValorEnSol(
-          pos.token_mint,
-          pos.amount,
-          decimals,
-          pos.origen_dex,
-          pos.precio_compra_native
-        );
-        const proceedsSol = resultado.valorSol ?? 0;
+        // ============ PAPER ============
+        const { proceedsSol, fuente } = await calcularProceedsParaReconciliacion(pos);
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
         const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
@@ -2447,11 +2512,16 @@ async function reconciliarPosiciones(forzado = false) {
         );
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
+        const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
         if (CHAT_ID) {
           bot.sendMessage(
             CHAT_ID,
-            `🔄⚠️ PAPER: venta atrasada [${pos.wallet_alias}] ${pos.symbol} · Estimado: ${r.proceedsNetoSol.toFixed(4)} SOL · ${formatearResultado(r)} · Saldo: $${nuevoSaldo.toFixed(2)}`
+            `🔄⚠️ PAPER: venta atrasada [${pos.wallet_alias}] ${pos.symbol}\n` +
+            `Fuente: ${fuente}\n` +
+            `Estimado: ${r.proceedsNetoSol.toFixed(4)} SOL\n` +
+            `${formatearResultado(r)}\n` +
+            `Saldo: $${saldoSeguro.toFixed(2)}`
           );
         }
       }
@@ -2485,7 +2555,8 @@ async function revisarStopLoss() {
         pos.amount,
         decimals,
         pos.origen_dex,
-        pos.precio_compra_native
+        pos.precio_compra_native,
+        30
       );
 
       if (resultado.error === 'NOT_TRADABLE') {
@@ -2541,6 +2612,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
         [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
       );
       await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+      marcarSignatureProcesada(sig);
 
       let msg = `🛑 STOP-LOSS ejecutado [${pos.wallet_alias}] ${pos.symbol} · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
       if (r.profitSol > 0) {
@@ -2599,7 +2671,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
   }
 }
 
-// ---------- Stop-loss especial para tokens NO TRADABLES (solo REAL) ----------
+// ---------- Stop-loss especial para tokens NO TRADABLES ----------
 async function ejecutarStopLossNoTradable(pos) {
   if (!LIVE || pos.chain !== 'solana' || !walletKeypair || !connection) return;
 
@@ -2628,6 +2700,7 @@ async function ejecutarStopLossNoTradable(pos) {
       [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
     );
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
+    marcarSignatureProcesada(sig);
 
     let msg = `🛑 STOP-LOSS (token no tradable en Jupiter) [${pos.wallet_alias}] ${pos.symbol}\nVendido vía PumpPortal/Jupiter.\nSalí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
     const rentRecuperado = await cerrarCuentaDelToken(pos.token_mint);
@@ -2646,11 +2719,6 @@ async function ejecutarStopLossNoTradable(pos) {
 }
 
 // ---------- Calcular proceeds desde el trade real de la wallet ----------
-// Devuelve { proceedsSol, precioUnitario, fuente } o null si no es confiable.
-// Reglas:
-//   - trade.tokenAmount > 0 y trade.solAmount > 0
-//   - trade.solAmountEstimado !== true (el parser no inventó el monto)
-//   - trade.solAmount > 0.005 (evita dust/ruido)
 function calcularProceedsDesdeTradeReal(trade, position) {
   if (!trade || !position) return null;
   if (trade.solAmountEstimado === true) return null;
@@ -2733,7 +2801,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
   const amountSol = usdToSolNeto(tracked.amount, solPrice);
 
-  // El `origen` ya viene normalizado desde procesarWebhookHelius.
   const dexIdsDexScreener = ['pumpfun', 'pumpswap', 'raydium', 'meteora', 'jupiter', 'orca', 'lifinity', 'phoenix', 'openbook'];
   const origenDex = origen && dexIdsDexScreener.includes(origen.toLowerCase()) ? origen.toLowerCase() : null;
 
@@ -2761,7 +2828,6 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     log('warn', `No se pudo obtener precio de DexScreener para ${symbol}: ${e.message}`);
   }
 
-  // Fallback: usar el trade de la wallet trackeada
   if (tokensBought === 0) {
     if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
       const factorEscala = amountSol / trade.solAmount;
@@ -2944,9 +3010,6 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         const after = await getWalletSolBalance();
         const proceedsSolOnChain = after - before;
 
-        // ===== Validación cruzada con el trade real de la wallet =====
-        // Si el trade real es confiable y el on-chain se desvía >30%, usamos el trade real.
-        // Protege contra: RPC con lag, race con otra tx, saldo mal leído.
         let proceedsSol = proceedsSolOnChain;
         const desdeTrade = calcularProceedsDesdeTradeReal(trade, position);
         if (desdeTrade && proceedsSolOnChain > 0) {
@@ -2968,6 +3031,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
           [trade.mint, tracked.alias, MODO_ACTUAL]
         );
         await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
+        marcarSignatureProcesada(sig);
 
         let msg = `📤 VENTA REAL [${tracked.alias}] ${symbol} 100% · Salí con: ${proceedsSol.toFixed(4)} SOL · ${formatearResultado(r)} · tx: ${linkTx(sig)}`;
         if (r.profitSol > 0) {
@@ -3008,24 +3072,23 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         }
       }
     } else {
-      // ===== PAPER: prioridad al trade real de la wallet =====
+      // PAPER: prioridad al trade real
       let proceedsSol;
       let fuente;
 
-      // 1. Trade real de la wallet (fuente primaria, sin sobreestimación)
       const desdeTrade = calcularProceedsDesdeTradeReal(trade, position);
       if (desdeTrade) {
         proceedsSol = desdeTrade.proceedsSol;
         fuente = `${desdeTrade.fuente} (${desdeTrade.precioUnitario.toExponential(4)} SOL/token)`;
       } else {
-        // 2. DexScreener/Jupiter (fallback)
         const { decimals } = await getTokenInfoHelius(trade.mint);
         const resultado = await estimarValorEnSol(
           trade.mint,
           position.amount,
           decimals,
           position.origen_dex,
-          position.precio_compra_native
+          position.precio_compra_native,
+          30
         );
 
         if (resultado.valorSol !== null) {
@@ -3039,20 +3102,13 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
 
       log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
 
-      // ===== Validaciones de sanidad (red de seguridad) =====
       const costBasis = Number(position.cost_basis_sol) || 0;
       if (costBasis > 0 && proceedsSol > costBasis * 50) {
-        log(
-          'warn',
-          `⚠️ proceedsSol sospechoso para ${symbol}: ${proceedsSol.toFixed(4)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL (ratio ${(proceedsSol / costBasis).toFixed(2)}x). Usando cost_basis.`
-        );
+        log('warn', `⚠️ proceedsSol sospechoso para ${symbol}. Usando cost_basis.`);
         proceedsSol = costBasis;
       }
       if (costBasis > 0 && proceedsSol < costBasis * 0.001) {
-        log(
-          'warn',
-          `⚠️ proceedsSol sospechosamente bajo para ${symbol}: ${proceedsSol.toFixed(6)} SOL vs cost_basis ${costBasis.toFixed(4)} SOL. Usando cost_basis.`
-        );
+        log('warn', `⚠️ proceedsSol sospechosamente bajo para ${symbol}. Usando cost_basis.`);
         proceedsSol = costBasis;
       }
       if (costBasis > 0 && proceedsSol < 0) {
@@ -3060,10 +3116,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       }
 
       let solPrice = await getSolPriceUSD();
-      if (!solPrice) {
-        log('warn', '⚠️ Sin precio de SOL disponible, usando fallback 150 USD para no abortar la venta');
-        solPrice = 150;
-      }
+      if (!solPrice) solPrice = 150;
 
       const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
       const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
