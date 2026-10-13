@@ -632,14 +632,28 @@ function extraerMontoDeDescription(description, walletAddress) {
 }
 
 // ---------- Extraer cambios de tx completa para una wallet ----------
-function extraerCambiosDeTxParaWallet(tx, walletAddress) {
+function extraerCambiosDeTxParaWallet(tx, walletAddress, solPriceUsd = null) {
   const porMint = new Map();
-  const sumarToken = (mint, tokenDelta, decimals = 6) => {
+  // Helius entrega el mismo movimiento de tokens DOS veces: en `tokenTransfers`
+  // y en `tokenBalanceChanges`. Sumar ambos duplicaba la cantidad de tokens
+  // (bug del 2x). Se prefiere `tokenBalanceChanges` (raw + decimals exactos) y,
+  // cuando existe, se ignora el duplicado de `tokenTransfers`.
+  const sumarToken = (mint, tokenDelta, decimals = 6, origen = 'transfers') => {
     if (!mint || MINTS_A_IGNORAR.has(mint)) return;
-    const prev = porMint.get(mint) || { tokenDelta: 0, decimals };
+    let prev = porMint.get(mint);
+    if (!prev) {
+      prev = { tokenDelta: 0, decimals, origen };
+      porMint.set(mint, prev);
+    } else if (prev.origen !== origen) {
+      if (origen === 'cambios' && prev.origen === 'transfers') {
+        prev.tokenDelta = 0;
+        prev.origen = 'cambios';
+      } else {
+        return;
+      }
+    }
     prev.tokenDelta += tokenDelta;
     prev.decimals = decimals;
-    porMint.set(mint, prev);
   };
 
   let wsolInLamports = 0;
@@ -695,11 +709,15 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       if (nt.toUserAccount === walletAddress) nativeSolInLamports += amount;
     }
 
-    for (const acc of tx.accountData || []) {
-      if (acc.account !== walletAddress) continue;
-      const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
-      if (nativeDelta < 0) nativeSolOutLamports += Math.abs(nativeDelta);
-      else if (nativeDelta > 0) nativeSolInLamports += nativeDelta;
+    // Solo si nativeTransfers no reportó nada se usa el cambio neto de la cuenta:
+    // sumar ambos duplicaba el SOL del trade.
+    if (nativeSolInLamports + nativeSolOutLamports === 0) {
+      for (const acc of tx.accountData || []) {
+        if (acc.account !== walletAddress) continue;
+        const nativeDelta = numeroSeguro(acc.nativeBalanceChange);
+        if (nativeDelta < 0) nativeSolOutLamports += Math.abs(nativeDelta);
+        else if (nativeDelta > 0) nativeSolInLamports += nativeDelta;
+      }
     }
   }
 
@@ -707,13 +725,66 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     ? wsolAbsLamports
     : (nativeSolInLamports + nativeSolOutLamports);
 
+  // ===== USDC =====
+  // Muchas wallets (rutas Jupiter) operan contra USDC, no contra SOL: en esos
+  // swaps no hay ningún delta de SOL y el parser terminaba inventando 0.001 SOL
+  // (o atribuyendo el SOL de un tramo interno de la ruta).
+  let usdcIn = 0;
+  let usdcOut = 0;
+  let usdcInTT = 0;
+  let usdcOutTT = 0;
+  for (const tt of tx.tokenTransfers || []) {
+    if (tt.mint !== USDC_MINT) continue;
+    const valor = Math.abs(numeroSeguro(tt.tokenAmount)); // tokenTransfers: monto en unidades UI
+    if (!valor) continue;
+    if (tt.fromUserAccount === walletAddress) usdcOutTT += valor;
+    if (tt.toUserAccount === walletAddress) usdcInTT += valor;
+  }
+  let usdcInCambios = 0;
+  let usdcOutCambios = 0;
+  for (const acc of tx.accountData || []) {
+    for (const tbc of acc.tokenBalanceChanges || []) {
+      if (tbc.mint !== USDC_MINT) continue;
+      const owner = tbc.userAccount || tbc.owner || acc.account;
+      if (owner !== walletAddress) continue;
+      const dec = tbc.rawTokenAmount?.decimals ?? 6;
+      const valor = numeroSeguro(tbc.rawTokenAmount?.tokenAmount) / Math.pow(10, dec);
+      if (!Number.isFinite(valor) || valor === 0) continue;
+      if (valor > 0) usdcInCambios += valor;
+      else usdcOutCambios += Math.abs(valor);
+    }
+  }
+  // Igual que con los tokens: si hay tokenBalanceChanges de USDC, se usan esos
+  // (raw exacto) y se ignora el duplicado de tokenTransfers.
+  if (usdcInCambios + usdcOutCambios > 0) {
+    usdcIn = usdcInCambios;
+    usdcOut = usdcOutCambios;
+  } else {
+    usdcIn = usdcInTT;
+    usdcOut = usdcOutTT;
+  }
+  const usdcAbs = usdcIn + usdcOut;
+
+  // Si la wallet movió USDC en esta tx, ESE es el valor real de su operación:
+  // el SOL que aparece en los tramos internos de la ruta (wSOL) no es lo que
+  // pagó/cobró la wallet. Antes se usaba ese SOL de ruta y salían montos falsos
+  // (ej. 1.3356 SOL por una compra de 500 USDC).
+  if (usdcAbs > 0 && solPriceUsd && solPriceUsd > 0) {
+    const solDesdeUsdc = Math.round((usdcAbs / solPriceUsd) * LAMPORTS_PER_SOL);
+    log(
+      'info',
+      `🎯 Parser: swap con USDC — ${usdcAbs.toFixed(4)} USDC ÷ $${solPriceUsd.toFixed(2)}/SOL → ${(solDesdeUsdc / LAMPORTS_PER_SOL).toFixed(6)} SOL${solAbsLamports > 0 ? ` (se descarta el SOL de ruta: ${(solAbsLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)` : ''}`
+    );
+    solAbsLamports = solDesdeUsdc;
+  }
+
   for (const tt of tx.tokenTransfers || []) {
     if (tt.mint === SOL_MINT || MINTS_A_IGNORAR.has(tt.mint)) continue;
     const amount = numeroSeguro(tt.tokenAmount);
     if (!amount) continue;
     const decimals = tt.decimals ?? 6;
-    if (tt.fromUserAccount === walletAddress) sumarToken(tt.mint, -amount, decimals);
-    if (tt.toUserAccount === walletAddress) sumarToken(tt.mint, amount, decimals);
+    if (tt.fromUserAccount === walletAddress) sumarToken(tt.mint, -amount, decimals, 'transfers');
+    if (tt.toUserAccount === walletAddress) sumarToken(tt.mint, amount, decimals, 'transfers');
   }
 
   for (const acc of tx.accountData || []) {
@@ -724,7 +795,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       const decimals = tbc.rawTokenAmount?.decimals ?? 6;
       const rawAmount = numeroSeguro(tbc.rawTokenAmount?.tokenAmount);
       const delta = rawAmount / Math.pow(10, decimals);
-      if (delta !== 0) sumarToken(tbc.mint, delta, decimals);
+      if (delta !== 0) sumarToken(tbc.mint, delta, decimals, 'cambios');
     }
   }
 
@@ -764,10 +835,9 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
     }
 
     if (lamportsAsignados === 0) {
-      lamportsAsignados = 1_000_000;
       log(
         'warn',
-        `⚠️ Parser: no se encontró SOL (ni wSOL, ni nativo, ni description) para ${c.mint.slice(0, 6)}..., usando fallback 0.001 SOL`
+        `⚠️ Parser: sin SOL ni USDC para valorizar ${c.mint.slice(0, 6)}... (${c.direction}) — monto marcado como desconocido (ya no se inventa 0.001 SOL)`
       );
     }
 
@@ -776,7 +846,7 @@ function extraerCambiosDeTxParaWallet(tx, walletAddress) {
       tokenAmount: Math.abs(c.info.tokenDelta),
       solAmount: lamportsAsignados / LAMPORTS_PER_SOL,
       direction: c.direction,
-      solAmountEstimado: lamportsAsignados === 1_000_000 && solAbsLamports === 0
+      solAmountEstimado: solAbsLamports === 0
     });
   }
 
@@ -1082,6 +1152,7 @@ async function parsearTransaccionViaHeliusAPI(signature) {
     const USDC_MINT_LOCAL = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
     let direction, mint, solAmountLamports, tokenAmountRaw, tokenDecimals;
+    let notaValoracion = null;
 
     if (input_mint === SOL_MINT_LOCAL) {
       direction = 'buy';
@@ -1096,9 +1167,31 @@ async function parsearTransaccionViaHeliusAPI(signature) {
       tokenAmountRaw = Number(in_amount);
       tokenDecimals = await getDecimalsDelMint(mint);
     } else if (output_mint === USDC_MINT_LOCAL || input_mint === USDC_MINT_LOCAL) {
-      log('debug', `🔍 Parsed Events: swap con USDC, ignorado`);
-      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
-      return null;
+      // Swap denominado en USDC (la wallet paga/cobra USDC, no SOL).
+      // Se valoriza en SOL con el precio actual en vez de descartarlo:
+      // antes se hacía `ignorado` y el trade completo se perdía.
+      const usdcEsEntrada = input_mint === USDC_MINT_LOCAL;
+      const usdcAmount = Number(usdcEsEntrada ? in_amount : actual_out_amount) / 1e6;
+      if (!Number.isFinite(usdcAmount) || usdcAmount <= 0) {
+        log('debug', `🔍 Parsed Events: swap USDC con monto inválido, ignorado`);
+        parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+        return null;
+      }
+      const solPriceUsdc = await getSolPriceUSD();
+      if (!solPriceUsdc || solPriceUsdc <= 0) {
+        log(
+          'warn',
+          `🔍 Parsed Events: sin precio de SOL para valorizar swap USDC (${signature.slice(0, 12)}...), se ignora`
+        );
+        parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+        return null;
+      }
+      direction = usdcEsEntrada ? 'buy' : 'sell';
+      mint = usdcEsEntrada ? output_mint : input_mint;
+      tokenAmountRaw = Number(usdcEsEntrada ? actual_out_amount : in_amount);
+      tokenDecimals = await getDecimalsDelMint(mint);
+      solAmountLamports = Math.round((usdcAmount / solPriceUsdc) * LAMPORTS_PER_SOL);
+      notaValoracion = `valorado en USDC: ${usdcAmount.toFixed(4)} USDC ÷ $${solPriceUsdc.toFixed(2)}/SOL`;
     } else {
       log('debug', `🔍 Parsed Events: par no-SOL/USDC, ignorado`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
@@ -1113,12 +1206,13 @@ async function parsearTransaccionViaHeliusAPI(signature) {
       mint,
       solAmount,
       tokenAmount,
-      protocol: parsedData.protocol || null
+      protocol: parsedData.protocol || null,
+      valoradoEnUsdc: notaValoracion
     };
 
     log(
       'debug',
-      `🎯 Parsed Events: ${direction} ${mint.slice(0, 6)}... · ${solAmount.toFixed(6)} SOL · ${tokenAmount.toFixed(4)} tokens (protocol: ${resultado.protocol})`
+      `🎯 Parsed Events: ${direction} ${mint.slice(0, 6)}... · ${solAmount.toFixed(6)} SOL · ${tokenAmount.toFixed(4)} tokens (protocol: ${resultado.protocol})${notaValoracion ? ' · ' + notaValoracion : ''}`
     );
 
     parsedEventsCache.set(signature, { value: resultado, timestamp: Date.now() });
@@ -1650,6 +1744,8 @@ async function procesarWebhookHelius(rawBody) {
 
   const { rows: trackedRows } = await pool.query('SELECT * FROM tracked_wallets');
   const trackedMap = new Map(trackedRows.map((r) => [r.address, r]));
+  // Precio de SOL una vez por lote: se usa para valorizar swaps denominados en USDC.
+  const solPriceBatch = await getSolPriceUSD();
 
   for (const tx of eventos) {
     const signature = tx.signature;
@@ -1712,7 +1808,7 @@ async function procesarWebhookHelius(rawBody) {
         const tracked = trackedMap.get(ownerWallet);
         log(
           'info',
-          `🌐 Actividad detectada (Parsed Events): ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... · ${parsed.solAmount.toFixed(4)} SOL · ${parsed.tokenAmount.toFixed(4)} tokens (protocol: ${parsed.protocol})`
+          `🌐 Actividad detectada (Parsed Events): ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... · ${parsed.solAmount.toFixed(4)} SOL · ${parsed.tokenAmount.toFixed(4)} tokens (protocol: ${parsed.protocol})${parsed.valoradoEnUsdc ? ' · ' + parsed.valoradoEnUsdc : ''}`
         );
 
         const tradeCompatible = {
@@ -1776,7 +1872,7 @@ async function procesarWebhookHelius(rawBody) {
     for (const tracked of trackedRows) {
       if (!cuentasDetectadas.includes(tracked.address)) continue;
 
-      const cambiosFallback = extraerCambiosDeTxParaWallet(tx, tracked.address);
+      const cambiosFallback = extraerCambiosDeTxParaWallet(tx, tracked.address, solPriceBatch);
       for (const cambio of cambiosFallback) {
         const key = `${tracked.address}:${cambio.mint}:${cambio.direction}`;
         if (cambiosProcesados.has(key)) continue;
@@ -2742,6 +2838,23 @@ function calcularProceedsDesdeTradeReal(trade, position) {
 // ---------- Compra ----------
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
+
+  // Monto no determinable (swap sin SOL ni USDC): antes el parser inventaba
+  // 0.001 SOL y el trade moría en silencio ("Dust ignorado"). Ahora se avisa.
+  if (trade.solAmountEstimado === true || !(solPaid > 0)) {
+    log(
+      'warn',
+      `⚠️ Monto no determinable para ${tracked.alias} ${trade.mint.slice(0, 6)}... [${origen}] — no se copia`
+    );
+    if (CHAT_ID) {
+      bot.sendMessage(
+        CHAT_ID,
+        `⚠️ No copiado (${tracked.alias} → ${trade.mint.slice(0, 6)}…): no se pudo determinar el monto del swap (ni SOL ni USDC).`
+      );
+    }
+    return;
+  }
+
   if (solPaid < DUST_MIN_SOL) {
     log('info', `Dust ignorado ${tracked.alias} (${solPaid} SOL) [${origen}]`);
     return;
@@ -2832,6 +2945,10 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
       const factorEscala = amountSol / trade.solAmount;
       tokensBought = trade.tokenAmount * factorEscala;
+      // Guardamos el precio real del trade como ancla: así la reconciliación
+      // puede comparar contra un precio de compra válido aunque DexScreener
+      // no tenga par (antes quedaba null).
+      precioCompraNative = trade.solAmount / trade.tokenAmount;
       fuentePrecio = 'trade de la wallet (fallback)';
     } else {
       const priceAtBuy = bondingCurvePriceSol(trade);
@@ -3431,6 +3548,7 @@ bot.onText(/\/help/, async (msg) => {
 ⚙️ SISTEMA:
 /status – Estado general del bot
 /cleanup – Limpia posiciones de wallets borradas
+/resetpaper – Reinicia el modo PAPER: balance a $${INITIAL_PAPER_BALANCE}, sin posiciones ni historial
 /fixwebhook – Fuerza la recreación del webhook en Helius
 /help – Esta ayuda
 `;
@@ -4210,6 +4328,30 @@ bot.onText(/\/cleanup/, async (msg) => {
   } catch (e) {
     log('error', `Error en /cleanup: ${e.message}`);
     bot.sendMessage(msg.chat.id, 'Error en cleanup: ' + e.message);
+  }
+});
+
+// /resetpaper — reinicia el modo PAPER de cero (balance, posiciones, historial)
+bot.onText(/\/resetpaper/, async (msg) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE global_balance SET initial_usdc=$1, current_usdc=$1 WHERE id=1 RETURNING current_usdc`,
+      [INITIAL_PAPER_BALANCE]
+    );
+    const { rowCount: pos } = await pool.query(`DELETE FROM bot_positions WHERE modo='paper'`);
+    const { rowCount: hist } = await pool.query(`DELETE FROM trade_history WHERE modo='paper'`);
+    const { rowCount: vistos } = await pool.query(
+      `DELETE FROM seen_tokens WHERE token_mint NOT IN (SELECT token_mint FROM bot_positions)`
+    );
+    const saldo = Number(rows[0]?.current_usdc ?? INITIAL_PAPER_BALANCE);
+    bot.sendMessage(
+      msg.chat.id,
+      `♻️ PAPER reiniciado de cero:\n💰 Balance: $${saldo.toFixed(2)}\n📉 Posiciones borradas: ${pos}\n📜 Historial borrado: ${hist}\n🧹 Seen tokens limpiados: ${vistos}`
+    );
+  } catch (e) {
+    log('error', `Error en /resetpaper: ${e.message}`);
+    bot.sendMessage(msg.chat.id, '❌ Error en /resetpaper: ' + e.message);
   }
 });
 
