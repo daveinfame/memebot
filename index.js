@@ -4331,7 +4331,7 @@ bot.onText(/\/pnl/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {
     const { rows: hist } = await pool.query(
-      `SELECT SUM(profit_sol) as realized_sol FROM trade_history WHERE modo = $1`,
+      `SELECT SUM(profit_sol) as realized_sol, COUNT(*)::int AS n FROM trade_history WHERE modo = $1`,
       [MODO_ACTUAL]
     );
     const realizedSol = Number(hist[0]?.realized_sol || 0);
@@ -4390,10 +4390,14 @@ bot.onText(/\/pnl/, async (msg) => {
       const paper = await getPaperBalance();
       const deltaSaldo = paper.current_usdc - paper.initial_usdc;
       const esperado = realizedSol * solPrice - costoAbiertoUsd;
-      const cuadra = Math.abs(deltaSaldo - esperado) < 0.05;
+      // Tolerancia: el saldo es en USD y el PnL en SOL, así que la deriva del
+      // precio de SOL entre la apertura y el cierre deja ~2 centavos por trade.
+      const nTrades = Number(hist[0]?.n || 0);
+      const tol = 0.05 + 0.02 * nTrades;
+      const cuadra = Math.abs(deltaSaldo - esperado) < tol;
       txt +=
         `\n⚖️ Chequeo saldo: $${paper.initial_usdc.toFixed(2)} → $${paper.current_usdc.toFixed(2)} (${deltaSaldo >= 0 ? '+' : ''}${deltaSaldo.toFixed(2)})` +
-        `\n   esperado = realizado ${(realizedSol * solPrice).toFixed(2)} − costo abierto ${costoAbiertoUsd.toFixed(2)} = ${esperado.toFixed(2)} ${cuadra ? '✅' : '⚠️ no cuadra'}`;
+        `\n   esperado = realizado ${(realizedSol * solPrice).toFixed(2)} − costo abierto ${costoAbiertoUsd.toFixed(2)} = ${esperado.toFixed(2)} ${cuadra ? '✅' : '⚠️ no cuadra'} (tolerancia ±$${tol.toFixed(2)})`;
     }
 
     bot.sendMessage(msg.chat.id, txt);
