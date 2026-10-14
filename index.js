@@ -2654,6 +2654,7 @@ async function reconciliarPosiciones(forzado = false) {
             `🔄⚠️ PAPER: venta atrasada [${pos.wallet_alias}] ${pos.symbol}\n` +
             `Fuente: ${fuente}\n` +
             `Estimado: ${r.proceedsNetoSol.toFixed(4)} SOL\n` +
+          `Costo: ${Number(pos.cost_basis_sol).toFixed(4)} SOL\n` +
             `${formatearResultado(r)}\n` +
             `Saldo: $${saldoSeguro.toFixed(2)}`
           );
@@ -2799,7 +2800,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
     if (CHAT_ID) {
       bot.sendMessage(
         CHAT_ID,
-        `🛑 PAPER STOP-LOSS: ${pos.symbol} vía ${pos.wallet_alias} · Salí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`
+        `🛑 PAPER STOP-LOSS: ${pos.symbol} vía ${pos.wallet_alias} · Salí con (estimado, neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · costo: ${Number(pos.cost_basis_sol).toFixed(4)} SOL · ${formatearResultado(r)} · Saldo ficticio: $${nuevoSaldo.toFixed(2)}`
       );
     }
   }
@@ -3117,13 +3118,20 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       'INSERT INTO seen_tokens VALUES ($1,$2) ON CONFLICT DO NOTHING',
       [trade.traderPublicKey, trade.mint]
     );
-    const nuevoSaldo = await adjustPaperBalance(-tracked.amount);
+    // Convención unificada de fees (14 oct 2026): el saldo se mueve EXACTAMENTE
+    // por el PnL que se registra en trade_history. Al abrir se descuenta el mismo
+    // costo que usará el cierre (cost_basis_sol = SOL netos de fees de compra) y
+    // al cerrar se acredita el proceeds neto: el diferencial es r.profitSol.
+    // Antes se descontaba `tracked.amount` ($4 brutos) y el saldo caía ~8% por
+    // trade más rápido que la suma de los PnL.
+    const costoUsd = solPrice ? amountSol * solPrice : tracked.amount;
+    const nuevoSaldo = await adjustPaperBalance(-costoUsd);
     const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
     if (CHAT_ID) {
       bot.sendMessage(
         CHAT_ID,
-        `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (~$${tracked.amount} todo incluido) · Saldo ficticio: $${saldoSeguro.toFixed(2)}`
+        `🧪 PAPER: ${NOMBRE_BOT} copió a ${tracked.alias} - compró ${symbol} con ${amountSol.toFixed(4)} SOL (costo ~$${costoUsd.toFixed(2)}, mismo criterio que el PnL) · Saldo ficticio: $${saldoSeguro.toFixed(2)}`
       );
     }
     chequearRetraso(horaDeteccion, tracked.alias, symbol);
@@ -3313,7 +3321,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
       const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
-      let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
+      let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · costo: ${Number(position.cost_basis_sol).toFixed(4)} SOL · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
       if (r.profitSol > 0) {
         msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
       }
@@ -3759,6 +3767,7 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
         `🖐️ CIERRE MANUAL PAPER [${pos.wallet_alias}] ${pos.symbol}\n` +
         `Fuente: ${fuente}\n` +
         `Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)})\n` +
+        `Costo: ${Number(pos.cost_basis_sol).toFixed(4)} SOL\n` +
         `${formatearResultado(r)}\n` +
         `Saldo ficticio: $${saldoSeguro.toFixed(2)}`
       );
@@ -4372,6 +4381,21 @@ bot.onText(/\/pnl/, async (msg) => {
     txt += `🧮 Total: ${totalSol.toFixed(4)} SOL`;
     const solPrice = await getSolPriceUSD();
     if (solPrice) txt += ` (~$${(totalSol * solPrice).toFixed(2)})`;
+
+    // Chequeo de consistencia (solo PAPER): saldo real de la tabla vs lo que el
+    // PnL dice que debería ser. Con la convención unificada:
+    //   saldo = inicial + realizado×precio − costo de las posiciones abiertas
+    if (!LIVE && solPrice) {
+      const costoAbiertoUsd = pos.reduce((a, p) => a + (Number(p.cost_basis_sol) || 0), 0) * solPrice;
+      const paper = await getPaperBalance();
+      const deltaSaldo = paper.current_usdc - paper.initial_usdc;
+      const esperado = realizedSol * solPrice - costoAbiertoUsd;
+      const cuadra = Math.abs(deltaSaldo - esperado) < 0.05;
+      txt +=
+        `\n⚖️ Chequeo saldo: $${paper.initial_usdc.toFixed(2)} → $${paper.current_usdc.toFixed(2)} (${deltaSaldo >= 0 ? '+' : ''}${deltaSaldo.toFixed(2)})` +
+        `\n   esperado = realizado ${(realizedSol * solPrice).toFixed(2)} − costo abierto ${costoAbiertoUsd.toFixed(2)} = ${esperado.toFixed(2)} ${cuadra ? '✅' : '⚠️ no cuadra'}`;
+    }
+
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
     log('error', `Error en /pnl: ${e.message}`);
