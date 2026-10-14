@@ -81,7 +81,15 @@ const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqC
 const HELIUS_WEBHOOK_URL = process.env.HELIUS_WEBHOOK_URL;
 const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET;
 
-const MINTS_A_IGNORAR = new Set([SOL_MINT, USDC_MINT]);
+// Mints que NUNCA son el token objetivo de una copia: SOL/wSOL y stables.
+// Una "compra de USDC" en realidad es una venta del token que la wallet tenía,
+// y los tramos internos de una ruta de Jupiter pueden reportar USDC↔USDC.
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const PYUSD_MINT = '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo';
+const USDS_MINT = 'USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA';
+const MINTS_A_IGNORAR = new Set([SOL_MINT, USDC_MINT, USDT_MINT, PYUSD_MINT, USDS_MINT]);
+
+const esMintNoCopiable = (mint) => !!mint && MINTS_A_IGNORAR.has(mint);
 
 const LIVE = process.env.LIVE_TRADING === 'true';
 const MODO_ACTUAL = LIVE ? 'real' : 'paper';
@@ -1040,9 +1048,27 @@ function buscarSwapParsedData(parsed) {
   const instructions = parsed.instructions || [];
   for (const ins of instructions) {
     const pd = ins?.summary?.parsedData;
-    if (pd && pd.type === 'swap' && pd.in_amount && pd.actual_out_amount) {
-      return pd;
-    }
+    if (!pd || pd.type !== 'swap' || !pd.in_amount || !pd.actual_out_amount) continue;
+
+    const inp = pd.input_mint;
+    const out = pd.output_mint;
+    if (!inp || !out) continue;
+
+    // P1: una instrucción con el MISMO mint a los dos lados no es un swap de la
+    // wallet, es un tramo interno de la ruta (así se generaba la falsa
+    // "compra de USDC" que abría posición en la stable).
+    if (inp === out) continue;
+
+    const inpRef = inp === SOL_MINT || MINTS_A_IGNORAR.has(inp);
+    const outRef = out === SOL_MINT || MINTS_A_IGNORAR.has(out);
+
+    // SOL↔stable o stable↔stable: no es una operación de token que nos interese.
+    if (inpRef && outRef) continue;
+
+    // token↔token: no sabemos valorarlo (opción B: se ignora y el fallback decide).
+    if (!inpRef && !outRef) continue;
+
+    return pd;
   }
   return null;
 }
@@ -1194,6 +1220,15 @@ async function parsearTransaccionViaHeliusAPI(signature) {
       notaValoracion = `valorado en USDC: ${usdcAmount.toFixed(4)} USDC ÷ $${solPriceUsdc.toFixed(2)}/SOL`;
     } else {
       log('debug', `🔍 Parsed Events: par no-SOL/USDC, ignorado`);
+      parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
+      return null;
+    }
+
+    // P2: una stable (USDC/USDT/…) o SOL nunca puede ser el token objetivo de
+    // una copia. Si el tramo elegido las deja como mint, es una venta del otro
+    // lado o un tramo interno: se descarta.
+    if (esMintNoCopiable(mint)) {
+      log('debug', `🔍 Parsed Events: ${direction} de ${mint.slice(0, 6)}... (stable/SOL), ignorado`);
       parsedEventsCache.set(signature, { value: null, timestamp: Date.now() });
       return null;
     }
@@ -2177,7 +2212,10 @@ async function cotizarViaJupiter(mint, cantidadTokens, decimals) {
 // ---------- Valor estimado en SOL ----------
 async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido = null, precioCompraNative = null, maxRatio = 30) {
   let cantidadReal = cantidadTokens;
-  if (walletKeypair) {
+  // En PAPER la posición es ficticia: el saldo on-chain de la wallet del bot no
+  // tiene nada que ver (usar "saldo real" aquí valuaba una posición de USDC
+  // contra el USDC real que el usuario tuviera en la wallet).
+  if (LIVE && walletKeypair) {
     try {
       const saldoReal = await getBalanceDeTokenEnWallet(
         walletKeypair.publicKey.toBase58(),
@@ -2836,22 +2874,37 @@ function calcularProceedsDesdeTradeReal(trade, position) {
 }
 
 // ---------- Compra ----------
+// P4: evita ráfagas del mismo aviso de Telegram (misma clave = mismo alias+mint).
+// Los eventos repetidos se siguen registrando en logs, pero no spamean el chat.
+const avisosRecientes = new Map();
+function avisarUnaVez(clave, mensaje, ttlMs = 30 * 60 * 1000) {
+  const ahora = Date.now();
+  for (const [k, t] of avisosRecientes) {
+    if (ahora - t > ttlMs) avisosRecientes.delete(k);
+  }
+  if (avisosRecientes.has(clave)) return false;
+  avisosRecientes.set(clave, ahora);
+  if (CHAT_ID) bot.sendMessage(CHAT_ID, mensaje);
+  return true;
+}
+
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
 
-  // Monto no determinable (swap sin SOL ni USDC): antes el parser inventaba
-  // 0.001 SOL y el trade moría en silencio ("Dust ignorado"). Ahora se avisa.
+  // P2: SOL/wSOL y stables NUNCA son el token objetivo de una copia. Una
+  // "compra de USDC" es en realidad la venta del token que la wallet tenía.
+  if (esMintNoCopiable(trade.mint)) {
+    log('debug', `🚫 ${tracked.alias} ${trade.mint.slice(0, 6)}... es stable/SOL — no se copia`);
+    return;
+  }
+
+  // Sin monto determinable (tx sin pata de pago: recepciones, airdrops, bundles):
+  // no se copia y NO se avisa por Telegram (antes llegaba un aviso por evento).
   if (trade.solAmountEstimado === true || !(solPaid > 0)) {
     log(
-      'warn',
-      `⚠️ Monto no determinable para ${tracked.alias} ${trade.mint.slice(0, 6)}... [${origen}] — no se copia`
+      'debug',
+      `ℹ️ Sin monto determinable ${tracked.alias} ${trade.mint.slice(0, 6)}... [${origen}] — no se copia (silencioso)`
     );
-    if (CHAT_ID) {
-      bot.sendMessage(
-        CHAT_ID,
-        `⚠️ No copiado (${tracked.alias} → ${trade.mint.slice(0, 6)}…): no se pudo determinar el monto del swap (ni SOL ni USDC).`
-      );
-    }
     return;
   }
 
@@ -2867,20 +2920,16 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     ? 'SOL no reportado por Helius'
     : `${solPaid.toFixed(3)} SOL`;
 
-  if (CHAT_ID) {
-    bot.sendMessage(
-      CHAT_ID,
-      `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solTxt}\n🔗 ${link}`
-    );
-  }
-
   const seen = await pool.query(
     'SELECT 1 FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
     [trade.traderPublicKey, trade.mint]
   );
   if (seen.rows.length > 0) {
     log('info', `R2: recompra/ya visto ignorado ${tracked.alias} ${symbol}`);
-    if (CHAT_ID) bot.sendMessage(CHAT_ID, `↪️ No copiado (recompra o ya visto)`);
+    avisarUnaVez(
+      `yaVisto:${tracked.alias}:${trade.mint}`,
+      `↪️ No copiado (${tracked.alias} → ${symbol}): recompra o ya visto. Repetidos del mismo token silenciados 30 min.`
+    );
     return;
   }
 
@@ -2890,12 +2939,10 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   );
   if (existingPos.rows.length > 0) {
     log('info', 'R2: posición ya abierta con esta wallet en modo actual, ignorado');
-    if (CHAT_ID) {
-      bot.sendMessage(
-        CHAT_ID,
-        `↪️ No copiado (ya tienes posición abierta en este token vía ${tracked.alias})`
-      );
-    }
+    avisarUnaVez(
+      `yaAbierta:${tracked.alias}:${trade.mint}`,
+      `↪️ No copiado (ya tienes posición abierta en ${symbol} vía ${tracked.alias})`
+    );
     return;
   }
 
@@ -2922,39 +2969,51 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
   let pairAddress = null;
   let fuentePrecio = 'ninguna';
 
+  // P3: el precio del trade de la wallet (SOL que pagó ÷ tokens que recibió) es
+  // la fuente fiable: es lo que costó de verdad. DexScreener puede devolver
+  // pools con un precio desviado decenas de veces (XTO: 5.18e-3 vs 6.44e-5 real)
+  // y ese error se convertía en una pérdida/ganancia ficticia al vender.
+  const precioTrade =
+    trade.solAmount > 0 && trade.tokenAmount > 0 ? trade.solAmount / trade.tokenAmount : null;
+
+  let precioDex = null;
   try {
     const precio = await obtenerPrecioUnitarioDexScreener(trade.mint, origenDex);
     if (precio.precioSol !== null && precio.precioSol > 0) {
-      if (precio.precioSol >= 1e-15 && precio.precioSol <= 1e-2) {
-        tokensBought = amountSol / precio.precioSol;
-        precioCompraNative = precio.precioSol;
-        pairAddress = precio.pairAddress;
-        fuentePrecio = `DexScreener (${precio.dexId || origenDex || 'n/d'})`;
-      } else {
+      precioDex = precio;
+      if (precioTrade && (precio.precioSol > precioTrade * 30 || precio.precioSol < precioTrade * 0.033)) {
         log(
           'warn',
-          `💰 ${symbol}: precio de DexScreener fuera de rango (${precio.precioSol.toExponential(4)} SOL/token). Usando fallback.`
+          `🔒 DexScreener descartado para ${symbol}: ${precio.precioSol.toExponential(4)} vs trade de la wallet ${precioTrade.toExponential(4)} SOL/token (fuera de [0.03x, 30x])`
         );
+        precioDex = null;
       }
     }
   } catch (e) {
     log('warn', `No se pudo obtener precio de DexScreener para ${symbol}: ${e.message}`);
   }
 
+  if (precioTrade) {
+    tokensBought = amountSol / precioTrade;
+    precioCompraNative = precioTrade;
+    pairAddress = precioDex ? precioDex.pairAddress : null;
+    fuentePrecio = `trade de la wallet (${precioTrade.toExponential(4)} SOL/token)`;
+  } else if (precioDex && precioDex.precioSol >= 1e-15 && precioDex.precioSol <= 1e-2) {
+    tokensBought = amountSol / precioDex.precioSol;
+    precioCompraNative = precioDex.precioSol;
+    pairAddress = precioDex.pairAddress;
+    fuentePrecio = `DexScreener (${precioDex.dexId || origenDex || 'n/d'})`;
+  } else if (precioDex) {
+    log(
+      'warn',
+      `💰 ${symbol}: precio de DexScreener fuera de rango (${precioDex.precioSol.toExponential(4)} SOL/token). Usando fallback.`
+    );
+  }
+
   if (tokensBought === 0) {
-    if (trade.tokenAmount && trade.solAmount > 0 && trade.solAmount > 0.005) {
-      const factorEscala = amountSol / trade.solAmount;
-      tokensBought = trade.tokenAmount * factorEscala;
-      // Guardamos el precio real del trade como ancla: así la reconciliación
-      // puede comparar contra un precio de compra válido aunque DexScreener
-      // no tenga par (antes quedaba null).
-      precioCompraNative = trade.solAmount / trade.tokenAmount;
-      fuentePrecio = 'trade de la wallet (fallback)';
-    } else {
-      const priceAtBuy = bondingCurvePriceSol(trade);
-      tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
-      fuentePrecio = priceAtBuy ? 'bonding curve (fallback)' : 'ninguna';
-    }
+    const priceAtBuy = bondingCurvePriceSol(trade);
+    tokensBought = priceAtBuy ? amountSol / priceAtBuy : 0;
+    fuentePrecio = priceAtBuy ? 'bonding curve (fallback)' : 'ninguna';
   }
 
   log(
@@ -2964,13 +3023,21 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
   if (!tokensBought || tokensBought <= 0) {
     log('warn', `⚠️ ${symbol}: tokensBought = 0. NO se crea posición.`);
-    if (CHAT_ID) {
-      bot.sendMessage(
-        CHAT_ID,
-        `⚠️ No copiado (${tracked.alias} → ${symbol}): no se pudo calcular la cantidad de tokens a comprar.`
-      );
-    }
+    avisarUnaVez(
+      `sinTokens:${tracked.alias}:${trade.mint}`,
+      `⚠️ No copiado (${tracked.alias} → ${symbol}): no se pudo calcular la cantidad de tokens a comprar.`
+    );
     return;
+  }
+
+  // P4: el "👀 compró …" se manda sólo cuando de verdad se va a copiar. Antes se
+  // enviaba antes de las guardias, así que también llegaba por recompras ya
+  // vistas / tokens ignorados (ese era el spam del mismo token).
+  if (CHAT_ID) {
+    bot.sendMessage(
+      CHAT_ID,
+      `👀 [${getLabel(tracked.chain)}${etiquetaOrigen}] ${tracked.alias} compró ${symbol} · ${solTxt} → ${tokensBought.toFixed(2)} tokens vía bot (${fuentePrecio})\n🔗 ${link}`
+    );
   }
 
   if (LIVE && walletKeypair && connection) {
