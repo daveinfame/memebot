@@ -1899,6 +1899,17 @@ async function procesarWebhookHelius(rawBody) {
         };
         const origen = origenNormalizado || (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
 
+        // (a) Ventas de wallets tipo app: la wallet no mueve SOL (el swap lo hace
+        // otro pagador), así que se valora la salida con el precio del swap de la
+        // misma tx para poder cerrar EN VIVO en vez de esperar a la reconciliación.
+        if (cambio.direction === 'sell' && !(cambio.solAmount > 0)) {
+          const valorTx = await valorarSalidaConSwapDeLaTx(tx, cambio.mint, cambio.tokenAmount, tracked.alias);
+          if (valorTx) {
+            tradeCompatible.solAmount = valorTx.solAmount;
+            tradeCompatible.solAmountEstimado = false;
+          }
+        }
+
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
       }
@@ -1938,6 +1949,17 @@ async function procesarWebhookHelius(rawBody) {
           txType: cambio.direction
         };
         const origen = origenNormalizado || (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
+
+        // (a) Ventas de wallets tipo app: la wallet no mueve SOL (el swap lo hace
+        // otro pagador), así que se valora la salida con el precio del swap de la
+        // misma tx para poder cerrar EN VIVO en vez de esperar a la reconciliación.
+        if (cambio.direction === 'sell' && !(cambio.solAmount > 0)) {
+          const valorTx = await valorarSalidaConSwapDeLaTx(tx, cambio.mint, cambio.tokenAmount, tracked.alias);
+          if (valorTx) {
+            tradeCompatible.solAmount = valorTx.solAmount;
+            tradeCompatible.solAmountEstimado = false;
+          }
+        }
 
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
@@ -2856,6 +2878,96 @@ async function ejecutarStopLossNoTradable(pos) {
   }
 }
 
+// ---------- (a) Valuar ventas SIN pata de SOL (wallets tipo app) ----------
+// Hay wallets (las que operan desde una app) donde el swap lo ejecuta otro
+// pagador: a la wallet solo le entran/le salen tokens y nunca toca SOL. Sin pata
+// de SOL el parser no puede valorar la venta en vivo, así que la posición se
+// quedaba abierta hasta que la reconciliación veía el saldo en 0 y la cerraba
+// como 'venta atrasada' 60-120 s después y a precio estimado.
+// Aquí se usa el PRECIO del swap de la MISMA tx (Parsed Events) multiplicado por
+// los tokens que salieron de la wallet: el precio es el de la operación real.
+async function valorarSalidaConSwapDeLaTx(tx, mint, tokenAmountSalida, alias = '') {
+  try {
+    if (!tx || !tx.signature || !(tokenAmountSalida > 0)) return null;
+    const parsed = await parsearTransaccionViaHeliusAPI(tx.signature);
+    if (!parsed || parsed.mint !== mint) return null;
+    if (!(parsed.tokenAmount > 0) || !(parsed.solAmount > 0)) return null;
+    const precioUnitario = parsed.solAmount / parsed.tokenAmount;
+    const solAmount = tokenAmountSalida * precioUnitario;
+    if (!Number.isFinite(solAmount) || solAmount <= 0 || solAmount > 1000) return null;
+    log(
+      'info',
+      `🧩 Venta sin pata de SOL valorada con el swap de la misma tx ${alias ? '(' + alias + ') ' : ''}${mint.slice(0, 6)}...: ${precioUnitario.toExponential(4)} SOL/token × ${tokenAmountSalida.toFixed(4)} tokens → ${solAmount.toFixed(6)} SOL`
+    );
+    return { solAmount, precioUnitario };
+  } catch (e) {
+    log('warn', `No se pudo valorar la venta con el swap de la tx: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------- Verificación on-chain de múltiplos grandes ----------
+// Cuando un cierre reporta un múltiplo alto se compara contra lo que la wallet
+// hizo DE VERDAD en ese token (sus tokens y su SOL), para no cantar un x10 que la
+// cadena no respalda.
+const VERIFICAR_MULT_DESDE = parseFloat(process.env.VERIFICAR_MULT_DESDE || '3');
+
+async function verificarMultiploEnCadena(walletAddress, mint) {
+  const apiKey = getHeliusApiKey();
+  if (!apiKey || !walletAddress || !mint) return null;
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${apiKey}&limit=100`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return null;
+    const txs = await res.json();
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let solIn = 0;
+    let solOut = 0;
+    for (const tx of txs || []) {
+      for (const t of tx.tokenTransfers || []) {
+        if (t.mint !== mint) continue;
+        const a = Number(t.tokenAmount) || 0;
+        if (t.toUserAccount === walletAddress) tokensIn += a;
+        if (t.fromUserAccount === walletAddress) tokensOut += a;
+      }
+      const mio = (tx.accountData || []).find((x) => x.account === walletAddress);
+      if (mio) {
+        const d = (Number(mio.nativeBalanceChange) || 0) / LAMPORTS_PER_SOL;
+        if (d > 0) solIn += d;
+        else solOut += -d;
+      }
+    }
+    if (tokensIn <= 0 || tokensOut <= 0) {
+      return { verificable: false, motivo: 'sin compras y ventas del token en las últimas 100 tx' };
+    }
+    const precioCompra = solOut > 0 ? solOut / tokensIn : null;
+    const precioVenta = solIn > 0 ? solIn / tokensOut : null;
+    if (precioCompra && precioVenta) {
+      return { verificable: true, multiple: precioVenta / precioCompra };
+    }
+    return { verificable: false, motivo: 'la wallet no mueve SOL (wallet tipo app)' };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function lineaVerificacionOnChain(r, mint, walletAddress) {
+  try {
+    if (!r || !(r.multiplicador >= VERIFICAR_MULT_DESDE)) return '';
+    const v = await verificarMultiploEnCadena(walletAddress, mint);
+    if (!v) return '';
+    if (!v.verificable) return `\n🔎 On-chain: no verificable (${v.motivo})`;
+    const desvio = v.multiple / r.multiplicador;
+    const aviso = desvio > 2 || desvio < 0.5 ? ' ⚠️ desvío >2x' : ' ✓';
+    return `\n🔎 On-chain: la wallet hizo ${v.multiple.toFixed(2)}x (nosotros ${r.multiplicador.toFixed(2)}x)${aviso}`;
+  } catch (e) {
+    return '';
+  }
+}
+
 // ---------- Calcular proceeds desde el trade real de la wallet ----------
 function calcularProceedsDesdeTradeReal(trade, position) {
   if (!trade || !position) return null;
@@ -3238,6 +3350,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         }
         const saldoFinal = await getWalletSolBalance();
         msg += `\n💰 Saldo total: ${saldoFinal.toFixed(4)} SOL`;
+        msg += await lineaVerificacionOnChain(r, trade.mint, tracked.address);
         if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
 
         chequearRetraso(horaDeteccion, tracked.alias, symbol);
@@ -3322,6 +3435,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       if (r.profitSol > 0) {
         msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
       }
+      msg += await lineaVerificacionOnChain(r, trade.mint, tracked.address);
       if (CHAT_ID) bot.sendMessage(CHAT_ID, msg);
 
       chequearRetraso(horaDeteccion, tracked.alias, symbol);
@@ -4470,7 +4584,10 @@ setInterval(() => {
   crearOActualizarWebhookHelius();
   iniciarServidorWebhook();
 
-  intervals.push(setInterval(reconciliarPosiciones, 60_000));
+  // (c) Red de seguridad: 20 s en vez de 60 s. Las ventas de wallets tipo app que
+// no se puedan valorar por la tx se cierran por aquí, y cada minuto cuenta en
+// estos tokens. El doble cierre está cubierto por el reclamo atómico.
+  intervals.push(setInterval(reconciliarPosiciones, 20_000));
   intervals.push(setInterval(revisarStopLoss, 60_000));
   intervals.push(setInterval(monitoreoAutomaticoWebhook, 600_000));
   intervals.push(setInterval(detectarVentasManuales, 120_000));
