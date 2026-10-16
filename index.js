@@ -2506,6 +2506,24 @@ async function calcularProceedsParaReconciliacion(pos) {
 }
 
 // ---------- Reconciliación de posiciones ----------
+// ---------- Reclamo atomico de una posicion antes de cerrarla ----------
+// reconciliarPosiciones (venta atrasada) y revisarStopLoss corren en timers
+// independientes de 60s SIN exclusion mutua: los dos podian cerrar la MISMA
+// posicion, acreditando el proceeds dos veces en el saldo y duplicando el trade
+// en el historial (RIBBIT 16-oct-2026: dos cierres con 77 ms de diferencia).
+// Reclamar con DELETE ... RETURNING garantiza que solo el primero que borra la
+// fila siga con el cierre, aunque haya varios ciclos o replicas.
+async function reclamarPosicionParaCierre(mint, alias, symbol = '') {
+  const r = await pool.query(
+    'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3 RETURNING token_mint',
+    [mint, alias, MODO_ACTUAL]
+  );
+  if (r.rowCount === 0) {
+    log('warn', `⏭️ Cierre duplicado evitado: ${symbol || String(mint).slice(0, 6)} (${alias}) ya no estaba abierto`);
+    return false;
+  }
+  return true;
+}
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) {
@@ -2590,10 +2608,7 @@ async function reconciliarPosiciones(forzado = false) {
           const solPrice = await getSolPriceUSD();
           const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-          await pool.query(
-            'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-            [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-          );
+          if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) continue;
           await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
           marcarSignatureProcesada(sig);
 
@@ -2640,10 +2655,7 @@ async function reconciliarPosiciones(forzado = false) {
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
         const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-        );
+        if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) continue;
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
         const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
         const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
@@ -2742,10 +2754,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
       const solPrice = await getSolPriceUSD();
       const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-      await pool.query(
-        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-      );
+      if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) return;
       await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
       marcarSignatureProcesada(sig);
 
@@ -2790,10 +2799,7 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
     const r = calcularResultado(pos.cost_basis_sol, valorEstimadoSol, solPrice, true);
     const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
-    await pool.query(
-      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-      [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-    );
+    if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) return;
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
     const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
 
@@ -2830,10 +2836,7 @@ async function ejecutarStopLossNoTradable(pos) {
     const solPrice = await getSolPriceUSD();
     const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-    await pool.query(
-      'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-      [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-    );
+    if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) return;
     await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
     marcarSignatureProcesada(sig);
 
@@ -3218,10 +3221,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, false);
 
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [trade.mint, tracked.alias, MODO_ACTUAL]
-        );
+        if (!(await reclamarPosicionParaCierre(trade.mint, tracked.alias, symbol))) return;
         await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
         marcarSignatureProcesada(sig);
 
@@ -3313,10 +3313,7 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       const r = calcularResultado(position.cost_basis_sol, proceedsSol, solPrice, true);
       const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : tracked.amount;
 
-      await pool.query(
-        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-        [trade.mint, tracked.alias, MODO_ACTUAL]
-      );
+      if (!(await reclamarPosicionParaCierre(trade.mint, tracked.alias, symbol))) return;
       await registrarTradeCerrado(tracked.alias, symbol, r.profitSol);
       const nuevoSaldo = await adjustPaperBalance(proceedsUsd);
       const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
@@ -3386,10 +3383,7 @@ async function detectarVentasManuales() {
         const proceedsSol = cambio.solAmount;
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [pos.token_mint, pos.wallet_alias, 'real']
-        );
+        if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) continue;
         await pool.query(
           'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
           [pos.wallet_address, pos.token_mint]
@@ -3750,10 +3744,10 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
       const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
       const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
-      await pool.query(
-        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-      );
+      if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) {
+        bot.sendMessage(msg.chat.id, `↪️ ${pos.symbol} ya estaba cerrada (se cerró por otro camino).`);
+        return;
+      }
       await pool.query(
         'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
         [walletAddress, pos.token_mint]
@@ -3807,11 +3801,11 @@ bot.onText(/\/close (\S+) (\S+)/, async (msg, match) => {
       const solPrice = await getSolPriceUSD();
       const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-      // 1. Borrar posición
-      await pool.query(
-        'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-        [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-      );
+      // 1. Reclamar posición (si ya no está, otro camino la cerró)
+      if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) {
+        bot.sendMessage(msg.chat.id, `↪️ ${pos.symbol} ya estaba cerrada (se cerró por otro camino).`);
+        return;
+      }
       await pool.query(
         'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
         [pos.wallet_address || alias, pos.token_mint]
@@ -3919,12 +3913,9 @@ bot.onText(/\/closeall (\S+)/, async (msg, match) => {
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
         const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
+        if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) continue;
         await adjustPaperBalance(proceedsUsd);
         await registrarTradeCerrado(pos.wallet_alias, pos.symbol, r.profitSol);
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-        );
         await pool.query(
           'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
           [walletAddress, pos.token_mint]
@@ -3976,10 +3967,7 @@ bot.onText(/\/closeall (\S+)/, async (msg, match) => {
         const solPrice = await getSolPriceUSD();
         const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, false);
 
-        await pool.query(
-          'DELETE FROM bot_positions WHERE token_mint=$1 AND wallet_alias=$2 AND modo=$3',
-          [pos.token_mint, pos.wallet_alias, MODO_ACTUAL]
-        );
+        if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) continue;
         await pool.query(
           'DELETE FROM seen_tokens WHERE wallet_address=$1 AND token_mint=$2',
           [walletAddress, pos.token_mint]
