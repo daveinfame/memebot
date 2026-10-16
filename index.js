@@ -2959,10 +2959,16 @@ async function lineaVerificacionOnChain(r, mint, walletAddress) {
     if (!r || !(r.multiplicador >= VERIFICAR_MULT_DESDE)) return '';
     const v = await verificarMultiploEnCadena(walletAddress, mint);
     if (!v) return '';
-    if (!v.verificable) return `\n🔎 On-chain: no verificable (${v.motivo})`;
-    const desvio = v.multiple / r.multiplicador;
-    const aviso = desvio > 2 || desvio < 0.5 ? ' ⚠️ desvío >2x' : ' ✓';
-    return `\n🔎 On-chain: la wallet hizo ${v.multiple.toFixed(2)}x (nosotros ${r.multiplicador.toFixed(2)}x)${aviso}`;
+    let linea;
+    if (!v.verificable) {
+      linea = `\n🔎 On-chain: no verificable (${v.motivo})`;
+    } else {
+      const desvio = v.multiple / r.multiplicador;
+      const aviso = desvio > 2 || desvio < 0.5 ? ' ⚠️ desvío >2x' : ' ✓';
+      linea = `\n🔎 On-chain: la wallet hizo ${v.multiple.toFixed(2)}x (nosotros ${r.multiplicador.toFixed(2)}x)${aviso}`;
+    }
+    log('info', `📊 Verificación on-chain ${mint.slice(0, 6)}...: ${linea.replace(/\n/g, ' ').trim()}`);
+    return linea;
   } catch (e) {
     return '';
   }
