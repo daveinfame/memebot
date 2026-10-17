@@ -2468,7 +2468,8 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       if (filtrados.length > 0) {
         candidatos = filtrados;
       } else {
-        log(
+        avisarPrecio(
+          mint,
           'warn',
           `DexScreener: no hay par de ${dexIdPreferido} para ${mint.slice(0, 6)}..., usando el de más liquidez`
         );
@@ -2561,7 +2562,7 @@ async function estimarValorEnSol(mint, cantidadTokens, decimals, dexIdPreferido 
     return dexs;
   }
 
-  log('info', `⚠️ DexScreener falló (${dexs.error}), intentando Jupiter para ${mint.slice(0, 6)}...`);
+  avisarPrecio(mint, 'info', `⚠️ DexScreener falló (${dexs.error}), intentando Jupiter para ${mint.slice(0, 6)}...`);
   const jup = await cotizarViaJupiter(mint, cantidadReal, decimals);
   return jup;
 }
@@ -5240,7 +5241,7 @@ setInterval(() => {
   intervals.push(
     setInterval(() => {
       const marca = new Date().toISOString();
-      log('info', `💓 Heartbeat [${marca}] modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
+      log('info', `💓 Heartbeat modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
     }, 300_000)
   );
 
