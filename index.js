@@ -2690,6 +2690,17 @@ async function saldoUsdc() {
 }
 
 async function valorCajaUsd() {
+  // En PAPER la "caja" es el saldo simulado del bot; la wallet real de Solana no
+  // se usa para tradear y sumarla aqui confundia (dos numeros distintos).
+  if (!LIVE) {
+    try {
+      const { rows } = await pool.query('SELECT current_usdc FROM global_balance WHERE id=1');
+      const saldo = Number(rows[0] && rows[0].current_usdc) || 0;
+      return { sol: 0, usdc: saldo, precioSol: 0, total: saldo, paper: true };
+    } catch (e) {
+      return { sol: 0, usdc: 0, precioSol: 0, total: NaN, paper: true };
+    }
+  }
   const [precioSol, sol, usdc] = await Promise.all([
     getSolPriceUSD().catch(() => 0),
     getWalletSolBalance().catch(() => 0),
@@ -2698,7 +2709,7 @@ async function valorCajaUsd() {
   const p = Number(precioSol) || 0;
   const s = Number(sol) || 0;
   const u = Number(usdc) || 0;
-  return { sol: s, usdc: u, precioSol: p, total: u + s * p };
+  return { sol: s, usdc: u, precioSol: p, total: u + s * p, paper: false };
 }
 
 async function enviarUsdcSweep(destino, cantidadUsd) {
@@ -5132,12 +5143,15 @@ bot.onText(/\/sweep(?:\s+(.+))?/, async (msg, match) => {
     txt += `Monto a enviar: $${Number(cfg.monto_usd).toFixed(2)}\n`;
     txt += `Destino: ${SWEEP_ADDRESS || 'FALTA SWEEP_ADDRESS en Railway'}\n`;
     if (caja) {
-      txt += `Caja ahora: $${caja.total.toFixed(2)} (${caja.sol.toFixed(4)} SOL + $${caja.usdc.toFixed(2)} USDC)\n`;
+      txt += caja.paper
+        ? `Caja (saldo PAPER simulado): $${caja.total.toFixed(2)}\n`
+        : `Caja ahora: $${caja.total.toFixed(2)} (${caja.sol.toFixed(4)} SOL + $${caja.usdc.toFixed(2)} USDC)\n`;
       txt += `Excedente sobre la base: $${(caja.total - Number(cfg.base_usd)).toFixed(2)}\n`;
     }
     txt += `Enviado historico: $${Number(cfg.total_enviado_usd || 0).toFixed(2)}\n`;
     txt += `Ultimo envio: ${cfg.ultimo_envio ? new Date(cfg.ultimo_envio).toLocaleString('es-MX') : 'nunca'}\n`;
     txt += `Modo: ${LIVE ? 'REAL' : 'PAPER (solo simula)'}\n\n`;
+  if (!LIVE) txt += `Las cifras son del saldo simulado; la wallet real de Solana no se toca en PAPER.\n`;
     txt += 'Comandos: /sweep base 100 - /sweep monto 20 - /sweep on|off - /sweep ahora';
     bot.sendMessage(chat, txt, { parse_mode: 'Markdown' });
   } catch (e) {
