@@ -2772,11 +2772,27 @@ async function ejecutarSweep({ forzar = false } = {}) {
   }
 
   if (!LIVE) {
+    // PAPER: se mueve el saldo ficticio igual que en REAL para poder probar la
+    // regla completa, pero no sale dinero. El cooldown de 10 min evita el bucle.
+    const saldoNuevo = await adjustPaperBalance(-d.monto);
+    await guardarSweepConfig({
+      ultimo_envio: new Date(),
+      total_enviado_usd: Number(cfg.total_enviado_usd || 0) + d.monto
+    });
     log(
       'info',
-      `[PAPER] sweep simulado: $${d.monto.toFixed(2)} -> ${SWEEP_ADDRESS.slice(0, 8)}... - caja $${caja.total.toFixed(2)} - base $${Number(cfg.base_usd).toFixed(2)}`
+      `💰 [PAPER] retiro simulado: $${d.monto.toFixed(2)} -> ${SWEEP_ADDRESS.slice(0, 8)}... - saldo paper $${saldoNuevo.toFixed(2)}`
     );
-    return { ok: true, simulado: true, monto: d.monto, caja };
+    if (CHAT_ID) {
+      bot
+        .sendMessage(
+          CHAT_ID,
+          `💰 *Retiro simulado (PAPER)*\n$${d.monto.toFixed(2)} → ${SWEEP_ADDRESS.slice(0, 6)}…${SWEEP_ADDRESS.slice(-4)}\nCaja antes: $${caja.total.toFixed(2)} · base $${Number(cfg.base_usd).toFixed(2)}\nSaldo paper ahora: $${saldoNuevo.toFixed(2)}\nNo salió dinero real.`,
+          { parse_mode: 'Markdown', disable_web_page_preview: true }
+        )
+        .catch(() => {});
+    }
+    return { ok: true, simulado: true, monto: d.monto, caja, saldoNuevo };
   }
 
   let sig = null;
@@ -5130,7 +5146,7 @@ bot.onText(/\/sweep(?:\s+(.+))?/, async (msg, match) => {
     if (sub === 'ahora') {
       const r = await ejecutarSweep({ forzar: true });
       if (r.ok && r.simulado) {
-        return bot.sendMessage(chat, `PAPER: se enviarian $${r.monto.toFixed(2)} -> ${SWEEP_ADDRESS || 'sin destino'}`);
+        return bot.sendMessage(chat, `PAPER: retiro simulado de $${r.monto.toFixed(2)} → ${SWEEP_ADDRESS || 'sin destino'} · saldo paper $${Number(r.saldoNuevo).toFixed(2)}`);
       }
       if (r.ok) return bot.sendMessage(chat, `Enviado $${r.monto.toFixed(2)} via ${r.via} -> ${SWEEP_ADDRESS}`);
       return bot.sendMessage(chat, `No se envio nada: ${r.motivo}`);
