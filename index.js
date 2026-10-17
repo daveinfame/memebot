@@ -26,9 +26,16 @@ const CURRENT_LEVEL = process.env.LOG_LEVEL
   ? (LOG_LEVELS[process.env.LOG_LEVEL.toLowerCase()] ?? LOG_LEVELS.info)
   : LOG_LEVELS.info;
 
+// Ultimos logs en memoria: se leen por Telegram con /logs (sin dar acceso a Railway).
+const ULTIMOS_LOGS = [];
+const MAX_LOGS_MEMORIA = 400;
+
 function log(level, ...args) {
+  const prefix = `[${new Date().toISOString()}][${level.toUpperCase()}]`;
+  const linea = [prefix, ...args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))].join(' ');
+  ULTIMOS_LOGS.push(linea);
+  if (ULTIMOS_LOGS.length > MAX_LOGS_MEMORIA) ULTIMOS_LOGS.shift();
   if ((LOG_LEVELS[level] ?? LOG_LEVELS.info) <= CURRENT_LEVEL) {
-    const prefix = `[${new Date().toISOString()}][${level.toUpperCase()}]`;
     console.log(prefix, ...args);
   }
 }
@@ -4216,6 +4223,7 @@ bot.onText(/\/help/, async (msg) => {
 /unfreeze – Reactiva el bot tras un /freeze
 /seguridad – Muestra el estado de los candados (destino permitido, topes, clave)
 /sweep [base|monto|on|off|ahora] - Retiro de ganancias a tu otra wallet (ej: /sweep base 100, /sweep monto 20)
+/logs [n] - Ultimas n lineas del log (default 60), sin acceso a Railway
 /resetpaper – Reinicia el modo PAPER: balance a $${INITIAL_PAPER_BALANCE}, sin posiciones ni historial
 /fixwebhook – Fuerza la recreación del webhook en Helius
 /help – Esta ayuda
@@ -5121,6 +5129,22 @@ bot.onText(/\/sweep(?:\s+(.+))?/, async (msg, match) => {
     bot.sendMessage(chat, txt, { parse_mode: 'Markdown' });
   } catch (e) {
     bot.sendMessage(chat, 'Error: ' + e.message);
+  }
+});
+
+// /logs [n] - ultimas lineas del log (para diagnosticar sin acceso a Railway)
+bot.onText(/\/logs(?:\s+(\d+))?/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  const chat = msg.chat.id;
+  const n = Math.min(parseInt(match[1] || '60', 10) || 60, 200);
+  const seleccion = ULTIMOS_LOGS.slice(-n);
+  if (!seleccion.length) return bot.sendMessage(chat, 'Sin logs en memoria todavia.');
+  const NL = String.fromCharCode(10);
+  const texto = seleccion.join(NL);
+  const trozos = [];
+  for (let i = 0; i < texto.length; i += 3500) trozos.push(texto.slice(i, i + 3500));
+  for (const t of trozos.slice(-3)) {
+    await bot.sendMessage(chat, '```' + NL + t + NL + '```', { parse_mode: 'Markdown' });
   }
 });
 
