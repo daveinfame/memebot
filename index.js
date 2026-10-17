@@ -4225,6 +4225,12 @@ bot.onText(/\/status/, async (msg) => {
     txt += `💵 Precio SOL: $${solPrice?.toFixed(2) ?? 'N/A'}\n`;
     txt += `💰 SOL en wallet: ${typeof solBal === 'number' ? solBal.toFixed(4) : solBal}\n`;
     txt += `📄 Balance paper: $${paper.current_usdc.toFixed(2)} (inicial $${paper.initial_usdc.toFixed(2)})\n`;
+    const sw = await leerSweepConfig();
+    txt += `💸 Retirado a ganancias: $${Number(sw.total_enviado_usd || 0).toFixed(2)}`;
+    txt += SWEEP_ADDRESS ? ` → ${SWEEP_ADDRESS.slice(0, 6)}…${SWEEP_ADDRESS.slice(-4)}` : ' (sin wallet de retiro configurada)';
+    txt += sw.ultimo_envio ? ` · último: ${new Date(sw.ultimo_envio).toLocaleString('es-MX', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : ' · todavía ninguno';
+    txt += `\n`;
+    if (!LIVE) txt += `💸 Caja paper: $${paper.current_usdc.toFixed(2)} · base $${Number(sw.base_usd).toFixed(2)} · monto $${Number(sw.monto_usd).toFixed(2)} (${sw.activo ? 'activo' : 'apagado'})\n`;
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
     log('error', `Error en /status: ${e.message}`);
