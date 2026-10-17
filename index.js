@@ -15,6 +15,7 @@ const {
   VersionedTransaction,
   Transaction,
   TransactionInstruction,
+  SystemProgram,
   LAMPORTS_PER_SOL
 } = require('@solana/web3.js');
 const bs58 = require('bs58');
@@ -277,6 +278,18 @@ const ALLOWED_WITHDRAW_ADDRESS =
   // Rotar la clave no requiere tocar nada: la allowlist sigue a la wallet cargada.
   process.env.ALLOWED_WITHDRAW_ADDRESS ||
   (walletKeypair ? walletKeypair.publicKey.toBase58() : null);
+
+// 1b) SWEEP_ADDRESS: wallet de retiro de ganancias (opcional). Es el UNICO destino
+//     adicional permitido ademas de la propia wallet del bot. Se configura SOLO en
+//     Railway (variable sellada): si un comando de Telegram pudiera cambiarlo,
+//     robar el bot de Telegram seria robar la wallet.
+const SWEEP_ADDRESS = (process.env.SWEEP_ADDRESS || '').trim();
+const ALLOWED_WITHDRAW_ADDRESSES = new Set(
+  [ALLOWED_WITHDRAW_ADDRESS, ...(process.env.ALLOWED_WITHDRAW_ADDRESS_LIST || '').split(',')]
+    .map((s) => (s || '').trim())
+    .filter(Boolean)
+    .concat(SWEEP_ADDRESS ? [SWEEP_ADDRESS] : [])
+);
 const MAX_DAILY_SPEND_SOL = parseFloat(process.env.MAX_DAILY_SPEND_SOL || '0.5');
 const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || '0.1');
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
@@ -378,8 +391,14 @@ async function auditarTransaccionSaliente(rawTx) {
   const destinos = [];
   let lamportsFuera = 0;
 
-  const revisarInstruccion = (programa, dataBytes, destinosIx) => {
+  const destinosToken = [];
+  const revisarInstruccion = (programa, dataBytes, destinosIx, cuentas) => {
     programas.add(programa);
+    if (dataBytes && cuentas && TOKEN_PROGRAMS.has(programa) && dataBytes[0] === 12) {
+      // TransferChecked: cuentas = [origen, mint, destino, owner]. Solo vigilamos USDC.
+      if (cuentas[1] === USDC_MINT && cuentas[2]) destinosToken.push(cuentas[2]);
+      return;
+    }
     if (programa !== SYSTEM_PROGRAM_ID || !dataBytes || dataBytes.length < 12) return;
     const tipo = dataBytes[0] | (dataBytes[1] << 8) | (dataBytes[2] << 16) | (dataBytes[3] << 24);
     if (tipo !== 2) return; // SystemProgram.transfer
@@ -394,24 +413,49 @@ async function auditarTransaccionSaliente(rawTx) {
     for (const ix of tx.message.compiledInstructions) {
       const programa = direcciones[ix.programIdIndex];
       const destino = direcciones[ix.accountKeyIndexes && ix.accountKeyIndexes[1]];
-      revisarInstruccion(programa, ix.data, destino);
+      revisarInstruccion(programa, ix.data, destino, ix.accountKeyIndexes ? ix.accountKeyIndexes.map((i2) => direcciones[i2]) : (ix.keys ? ix.keys.map((k) => (k.pubkey && k.pubkey.toBase58 ? k.pubkey.toBase58() : String(k.pubkey))) : [destino]));
     }
   } else if (tx.instructions) {
     for (const ix of tx.instructions) {
       const programa = ix.programId ? ix.programId.toBase58() : null;
       const destino = ix.keys && ix.keys[1] ? ix.keys[1].pubkey.toBase58() : null;
-      revisarInstruccion(programa, ix.data, destino);
+      revisarInstruccion(programa, ix.data, destino, ix.accountKeyIndexes ? ix.accountKeyIndexes.map((i2) => direcciones[i2]) : (ix.keys ? ix.keys.map((k) => (k.pubkey && k.pubkey.toBase58 ? k.pubkey.toBase58() : String(k.pubkey))) : [destino]));
     }
   }
 
   const esSwap = [...programas].some((p) => PROGRAMAS_SWAP.has(p));
+
+  // Transferencias SPL de USDC (TransferChecked) fuera de los destinos permitidos:
+  // es la forma de sacar la tesoreria sin mover SOL, que era lo unico vigilado.
+  if (destinosToken.length > 0 && !esSwap) {
+    const permitidas = new Set();
+    try {
+      const spl = require('@solana/spl-token');
+      for (const a of ALLOWED_WITHDRAW_ADDRESSES) {
+        permitidas.add(spl.getAssociatedTokenAddressSync(new PublicKey(USDC_MINT), new PublicKey(a)).toBase58());
+      }
+    } catch (e) {
+      // fail closed: si no se pueden calcular los destinos permitidos, no sale USDC
+      notificarSeguridad('BLOQUEADA transferencia de USDC: no se pudo verificar el destino (' + e.message + ')');
+      throw new Error('Transaccion bloqueada: no se pudo verificar el destino del USDC');
+    }
+    if (permitidas.size > 0) {
+      const malos = destinosToken.filter((d) => !permitidas.has(d));
+      if (malos.length > 0) {
+        notificarSeguridad(
+          `BLOQUEADA transferencia de USDC a ${malos.map((d) => d.slice(0, 8) + '...').join(', ')}. Destinos permitidos: ${[...ALLOWED_WITHDRAW_ADDRESSES].map((a) => a.slice(0, 8)).join(', ')}...`
+        );
+        throw new Error('Transaccion bloqueada: USDC fuera de los destinos permitidos (ALLOWED_WITHDRAW_ADDRESSES)');
+      }
+    }
+  }
   const hayTokens = [...programas].some((p) => TOKEN_PROGRAMS.has(p));
   const mínimo = 0.002 * LAMPORTS_PER_SOL;
-  const sospechosos = destinos.filter((d) => d.destino !== ALLOWED_WITHDRAW_ADDRESS && d.lamports >= mínimo);
+  const sospechosos = destinos.filter((d) => !ALLOWED_WITHDRAW_ADDRESSES.has(d.destino) && d.lamports >= mínimo);
 
   if (sospechosos.length > 0 && !esSwap && !hayTokens) {
     notificarSeguridad(
-      `BLOQUEADA transferencia de SOL a ${sospechosos.map((d) => `${d.destino.slice(0, 8)}… (${(d.lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL)`).join(', ')}. Destino permitido: ${ALLOWED_WITHDRAW_ADDRESS.slice(0, 8)}…`
+      `BLOQUEADA transferencia de SOL a ${sospechosos.map((d) => `${d.destino.slice(0, 8)}… (${(d.lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL)`).join(', ')}. Destino permitido: ${[...ALLOWED_WITHDRAW_ADDRESSES].map((a) => a.slice(0, 8)).join(', ')}…`
     );
     throw new Error('Transacción bloqueada por el candado de destino (ALLOWED_WITHDRAW_ADDRESS)');
   }
@@ -444,7 +488,7 @@ if (connection) {
   };
   log(
     'info',
-    `🔐 Candados activos: destino permitido ${ALLOWED_WITHDRAW_ADDRESS} · tope diario ${MAX_DAILY_SPEND_SOL} SOL · tope por operación ${MAX_TRADE_SOL} SOL`
+    `🔐 Candados activos: destinos permitidos ${[...ALLOWED_WITHDRAW_ADDRESSES].join(', ')} · tope diario ${MAX_DAILY_SPEND_SOL} SOL · tope por operación ${MAX_TRADE_SOL} SOL`
   );
 }
 // ================== FIN CANDADOS ==================
@@ -1091,6 +1135,13 @@ async function initDB() {
     );
     await pool.query(
       `INSERT INTO bot_seguridad (id, congelado, gasto_sol) VALUES (1, FALSE, 0) ON CONFLICT (id) DO NOTHING`
+    );
+    // Retiro de ganancias: base/monto/estado (configurable por /sweep)
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS bot_sweep (id INT PRIMARY KEY, activo BOOLEAN DEFAULT TRUE, base_usd REAL DEFAULT 100, monto_usd REAL DEFAULT 20, total_enviado_usd REAL DEFAULT 0, ultimo_envio TIMESTAMPTZ)`
+    );
+    await pool.query(
+      `INSERT INTO bot_sweep (id, activo, base_usd, monto_usd, total_enviado_usd) VALUES (1, TRUE, 100, 20, 0) ON CONFLICT (id) DO NOTHING`
     );
     await pool.query(`ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS real_initial_sol REAL`);
     await pool.query(`ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS helius_webhook_id TEXT`);
@@ -2294,6 +2345,7 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
     if (solCompra > MAX_TRADE_SOL) {
       notificarSeguridad(`BLOQUEADA compra de ${solCompra.toFixed(4)} SOL: supera el tope por operación (${MAX_TRADE_SOL} SOL).`);
       throw new Error('Tope por operación excedido (MAX_TRADE_SOL)');
+    txt += `Retiro de ganancias: ${SWEEP_ADDRESS ? 'destino ' + SWEEP_ADDRESS : 'sin destino (desactivado)'}\n`;
     }
     const gastadoHoy = await gastoDiario();
     if (gastadoHoy + solCompra > MAX_DAILY_SPEND_SOL) {
@@ -2561,6 +2613,192 @@ async function swapProfitToUsdc(amountSol) {
   } catch (e) {
     log('error', `Error swap a USDC: ${e.message}`);
     return null;
+  }
+}
+
+
+// ---------- Retiro de ganancias (sweep) ----------
+// Regla: cuando el valor en caja (USDC + SOL) supera BASE + MONTO, se envian MONTO
+// dolares a SWEEP_ADDRESS. La BASE es el capital que se queda trabajando dentro del
+// bot y no se mueve: asi el retiro solo toca ganancias, nunca el capital.
+// El destino se configura SOLO en Railway, nunca por Telegram (si un comando pudiera
+// cambiarlo, robar el bot seria robar la wallet).
+// En PAPER solo se registra lo que habria hecho: jamas envia nada.
+const SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
+const SWEEP_MAX_USD = 1000;
+const SWEEP_RESERVA_SOL = parseFloat(process.env.SWEEP_RESERVA_SOL || '0.02');
+
+async function leerSweepConfig() {
+  try {
+    const { rows } = await pool.query('SELECT * FROM bot_sweep WHERE id=1');
+    if (rows[0]) return rows[0];
+  } catch (e) {
+    log('warn', `No se pudo leer bot_sweep: ${e.message}`);
+  }
+  return { activo: true, base_usd: 100, monto_usd: 20, total_enviado_usd: 0, ultimo_envio: null };
+}
+
+async function guardarSweepConfig(campos) {
+  const sets = [];
+  const vals = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(campos)) {
+    sets.push(`${k} = $${i++}`);
+    vals.push(v);
+  }
+  if (!sets.length) return;
+  await pool.query(`UPDATE bot_sweep SET ${sets.join(', ')} WHERE id=1`, vals);
+}
+
+// Funcion pura y testeable: toca retirar y cuanto?
+function decidirSweep({ totalUsd, baseUsd, montoUsd, activo }) {
+  if (!activo) return { hacer: false, motivo: 'apagado' };
+  if (!Number.isFinite(montoUsd) || montoUsd <= 0) return { hacer: false, motivo: 'monto no valido' };
+  if (!Number.isFinite(baseUsd) || baseUsd < 0) return { hacer: false, motivo: 'base no valida' };
+  if (!Number.isFinite(totalUsd)) return { hacer: false, motivo: 'sin valor de cartera' };
+  const excedente = totalUsd - baseUsd;
+  if (excedente + 1e-9 < montoUsd) {
+    return { hacer: false, excedente, motivo: `excedente $${excedente.toFixed(2)} < $${montoUsd.toFixed(2)}` };
+  }
+  return { hacer: true, excedente, monto: montoUsd, motivo: 'objetivo alcanzado' };
+}
+
+async function saldoUsdc() {
+  if (!connection || !walletKeypair) return 0;
+  const r = await connection.getParsedTokenAccountsByOwner(walletKeypair.publicKey, {
+    mint: new PublicKey(USDC_MINT)
+  });
+  return r.value.reduce((s, c) => s + (c.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
+}
+
+async function valorCajaUsd() {
+  const [precioSol, sol, usdc] = await Promise.all([
+    getSolPriceUSD().catch(() => 0),
+    getWalletSolBalance().catch(() => 0),
+    saldoUsdc().catch(() => 0)
+  ]);
+  const p = Number(precioSol) || 0;
+  const s = Number(sol) || 0;
+  const u = Number(usdc) || 0;
+  return { sol: s, usdc: u, precioSol: p, total: u + s * p };
+}
+
+async function enviarUsdcSweep(destino, cantidadUsd) {
+  const spl = require('@solana/spl-token');
+  const mint = new PublicKey(USDC_MINT);
+  const destinoKey = new PublicKey(destino);
+  const origenAta = await spl.getAssociatedTokenAddress(mint, walletKeypair.publicKey);
+  const destinoAta = await spl.getAssociatedTokenAddress(mint, destinoKey);
+  const tx = new Transaction();
+  const info = await connection.getAccountInfo(destinoAta);
+  if (!info) {
+    tx.add(spl.createAssociatedTokenAccountInstruction(walletKeypair.publicKey, destinoAta, destinoKey, mint));
+  }
+  tx.add(
+    spl.createTransferInstruction(origenAta, destinoAta, walletKeypair.publicKey, Math.round(cantidadUsd * 1000000))
+  );
+  tx.feePayer = walletKeypair.publicKey;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  tx.sign(walletKeypair);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  await confirmarYVerificarTx(sig);
+  return sig;
+}
+
+async function enviarSolSweep(destino, sol) {
+  const tx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: walletKeypair.publicKey,
+      toPubkey: new PublicKey(destino),
+      lamports: Math.floor(sol * LAMPORTS_PER_SOL)
+    })
+  );
+  tx.feePayer = walletKeypair.publicKey;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  tx.sign(walletKeypair);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  await confirmarYVerificarTx(sig);
+  return sig;
+}
+
+async function ejecutarSweep({ forzar = false } = {}) {
+  if (!SWEEP_ADDRESS) return { ok: false, motivo: 'SWEEP_ADDRESS no configurada en Railway' };
+  if (!walletKeypair || !connection) return { ok: false, motivo: 'wallet o RPC no disponible' };
+
+  const cfg = await leerSweepConfig();
+  const caja = await valorCajaUsd();
+  const d = decidirSweep({
+    totalUsd: caja.total,
+    baseUsd: Number(cfg.base_usd),
+    montoUsd: Number(cfg.monto_usd),
+    activo: !!cfg.activo
+  });
+  if (!d.hacer) return { ok: false, motivo: d.motivo, caja };
+
+  if (!forzar && cfg.ultimo_envio) {
+    const pasado = Date.now() - new Date(cfg.ultimo_envio).getTime();
+    if (pasado < SWEEP_COOLDOWN_MS) {
+      return { ok: false, motivo: `esperando ${Math.ceil((SWEEP_COOLDOWN_MS - pasado) / 60000)} min`, caja };
+    }
+  }
+
+  if (!LIVE) {
+    log(
+      'info',
+      `[PAPER] sweep simulado: $${d.monto.toFixed(2)} -> ${SWEEP_ADDRESS.slice(0, 8)}... - caja $${caja.total.toFixed(2)} - base $${Number(cfg.base_usd).toFixed(2)}`
+    );
+    return { ok: true, simulado: true, monto: d.monto, caja };
+  }
+
+  let sig = null;
+  let via = null;
+  if (caja.usdc >= d.monto) {
+    sig = await enviarUsdcSweep(SWEEP_ADDRESS, d.monto);
+    via = 'USDC';
+  } else {
+    const precio = caja.precioSol;
+    if (!precio) return { ok: false, motivo: 'sin precio SOL/USD para valorar el retiro', caja };
+    const solNecesario = d.monto / precio;
+    if (caja.sol - solNecesario < SWEEP_RESERVA_SOL) {
+      return { ok: false, motivo: `SOL insuficiente dejando reserva de ${SWEEP_RESERVA_SOL} SOL`, caja };
+    }
+    sig = await enviarSolSweep(SWEEP_ADDRESS, solNecesario);
+    via = 'SOL';
+  }
+
+  await guardarSweepConfig({
+    ultimo_envio: new Date(),
+    total_enviado_usd: Number(cfg.total_enviado_usd || 0) + d.monto
+  });
+  log('info', `RETIRO de ganancias: $${d.monto.toFixed(2)} via ${via} -> ${SWEEP_ADDRESS} - tx ${sig}`);
+  if (CHAT_ID) {
+    bot
+      .sendMessage(
+        CHAT_ID,
+        `*Retiro de ganancias*\n$${d.monto.toFixed(2)} (${via}) -> ${SWEEP_ADDRESS.slice(0, 6)}...${SWEEP_ADDRESS.slice(-4)}\nCaja: $${caja.total.toFixed(2)} - base $${Number(cfg.base_usd).toFixed(2)}\n[Ver tx](https://solscan.io/tx/${sig})`,
+        { parse_mode: 'Markdown', disable_web_page_preview: true }
+      )
+      .catch(() => {});
+  }
+  return { ok: true, monto: d.monto, via, sig, caja, simulado: false };
+}
+
+// Chequeo periodico: solo si hay destino configurado y es valido.
+if (SWEEP_ADDRESS) {
+  let destinoValido = true;
+  try {
+    new PublicKey(SWEEP_ADDRESS);
+  } catch (e) {
+    destinoValido = false;
+    log('error', 'SWEEP_ADDRESS invalida: el retiro de ganancias queda DESACTIVADO');
+  }
+  if (destinoValido) {
+    setTimeout(() => {
+      ejecutarSweep().catch((e) => log('warn', `Sweep: ${e.message}`));
+    }, 30000);
+    setInterval(() => {
+      ejecutarSweep().catch((e) => log('warn', `Sweep: ${e.message}`));
+    }, 60000);
   }
 }
 
@@ -3977,6 +4215,7 @@ bot.onText(/\/help/, async (msg) => {
 /freeze – FRENA el bot por completo (no compra ni vende) hasta /unfreeze
 /unfreeze – Reactiva el bot tras un /freeze
 /seguridad – Muestra el estado de los candados (destino permitido, topes, clave)
+/sweep [base|monto|on|off|ahora] - Retiro de ganancias a tu otra wallet (ej: /sweep base 100, /sweep monto 20)
 /resetpaper – Reinicia el modo PAPER: balance a $${INITIAL_PAPER_BALANCE}, sin posiciones ni historial
 /fixwebhook – Fuerza la recreación del webhook en Helius
 /help – Esta ayuda
@@ -4825,6 +5064,66 @@ bot.onText(/\/seguridad/, async (msg) => {
   }
 });
 // /resetpaper — reinicia el modo PAPER de cero (balance, posiciones, historial)
+// /sweep - estado y configuracion del retiro de ganancias
+bot.onText(/\/sweep(?:\s+(.+))?/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  const chat = msg.chat.id;
+  const args = (match[1] || '').trim().split(/\s+/).filter(Boolean);
+  const sub = (args[0] || 'estado').toLowerCase();
+  try {
+    const cfg = await leerSweepConfig();
+
+    if (sub === 'base' || sub === 'monto') {
+      const n = parseFloat((args[1] || '').replace(',', '.'));
+      if (!Number.isFinite(n) || n < 0 || n > SWEEP_MAX_USD) {
+        return bot.sendMessage(chat, `Uso: /sweep ${sub} <USD> (0 a ${SWEEP_MAX_USD})`);
+      }
+      if (sub === 'base') {
+        await guardarSweepConfig({ base_usd: n });
+      } else {
+        if (n <= 0) return bot.sendMessage(chat, 'El monto a enviar debe ser mayor que 0.');
+        await guardarSweepConfig({ monto_usd: n });
+      }
+      return bot.sendMessage(
+        chat,
+        `OK: ${sub === 'base' ? 'Base' : 'Monto a enviar'} = $${n.toFixed(2)}${LIVE ? '' : ' (modo PAPER: solo simula)'}`
+      );
+    }
+
+    if (sub === 'on' || sub === 'off') {
+      await guardarSweepConfig({ activo: sub === 'on' });
+      return bot.sendMessage(chat, `Retiro de ganancias ${sub === 'on' ? 'ACTIVADO' : 'APAGADO'}`);
+    }
+
+    if (sub === 'ahora') {
+      const r = await ejecutarSweep({ forzar: true });
+      if (r.ok && r.simulado) {
+        return bot.sendMessage(chat, `PAPER: se enviarian $${r.monto.toFixed(2)} -> ${SWEEP_ADDRESS || 'sin destino'}`);
+      }
+      if (r.ok) return bot.sendMessage(chat, `Enviado $${r.monto.toFixed(2)} via ${r.via} -> ${SWEEP_ADDRESS}`);
+      return bot.sendMessage(chat, `No se envio nada: ${r.motivo}`);
+    }
+
+    const caja = await valorCajaUsd().catch(() => null);
+    let txt = '*Retiro de ganancias*\n';
+    txt += `Estado: ${cfg.activo ? 'activo' : 'apagado'}\n`;
+    txt += `Base (capital que se queda): $${Number(cfg.base_usd).toFixed(2)}\n`;
+    txt += `Monto a enviar: $${Number(cfg.monto_usd).toFixed(2)}\n`;
+    txt += `Destino: ${SWEEP_ADDRESS || 'FALTA SWEEP_ADDRESS en Railway'}\n`;
+    if (caja) {
+      txt += `Caja ahora: $${caja.total.toFixed(2)} (${caja.sol.toFixed(4)} SOL + $${caja.usdc.toFixed(2)} USDC)\n`;
+      txt += `Excedente sobre la base: $${(caja.total - Number(cfg.base_usd)).toFixed(2)}\n`;
+    }
+    txt += `Enviado historico: $${Number(cfg.total_enviado_usd || 0).toFixed(2)}\n`;
+    txt += `Ultimo envio: ${cfg.ultimo_envio ? new Date(cfg.ultimo_envio).toLocaleString('es-MX') : 'nunca'}\n`;
+    txt += `Modo: ${LIVE ? 'REAL' : 'PAPER (solo simula)'}\n\n`;
+    txt += 'Comandos: /sweep base 100 - /sweep monto 20 - /sweep on|off - /sweep ahora';
+    bot.sendMessage(chat, txt, { parse_mode: 'Markdown' });
+  } catch (e) {
+    bot.sendMessage(chat, 'Error: ' + e.message);
+  }
+});
+
 bot.onText(/\/resetpaper/, async (msg) => {
   if (!esAdmin(msg)) return;
   try {

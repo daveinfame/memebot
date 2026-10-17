@@ -4,11 +4,12 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.61.0",
     "pg": "^8.11.3",
-    "ws": "^8.16.0",
-    "dotenv": "^16.4.5",
-    "@solana/web3.js": "^1.95.3",
-    "bs58": "^5.0.0"
+    "ws": "^8.16.0"
   }
 }
