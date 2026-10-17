@@ -40,6 +40,15 @@ function log(level, ...args) {
   }
 }
 
+// Avisos de precio que se repiten cada 20 s por posicion: maximo 1 cada 10 min.
+const AVISOS_PRECIO = new Map();
+function avisarPrecio(mint, nivel, mensaje) {
+  const ahora = Date.now();
+  if (ahora - (AVISOS_PRECIO.get(mint) || 0) < 10 * 60 * 1000) return;
+  AVISOS_PRECIO.set(mint, ahora);
+  log(nivel, mensaje);
+}
+
 // ---------- Validación de variables de entorno ----------
 const REQUIRED_ENV = [
   'TELEGRAM_TOKEN',
@@ -2420,7 +2429,7 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       const mcap = p.marketCap || p.fdv;
       if (!mcap || mcap < 10000 || mcap > 500000000) return false;
 
-      if (price > 1) return false;
+      if (price > 10) return false; // memecoins < 1 SOL; acciones tokenizadas ~2 SOL/token
 
       return true;
     });
@@ -2437,15 +2446,16 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
         return true;
       });
       if (pairsValidos.length < antes) {
-        log(
+        avisarPrecio(
+          mint,
           'info',
-          `🔒 DexScreener: ${antes - pairsValidos.length} par(es) descartado(s) por estar fuera del rango [${(1/maxRatio).toFixed(2)}x, ${maxRatio}x] del precio de compra (${precioCompraNative.toExponential(4)} SOL/token)`
+          `🔒 DexScreener: ${antes - pairsValidos.length} par(es) descartado(s) por estar fuera del rango [${(1 / maxRatio).toFixed(2)}x, ${maxRatio}x] del precio de compra (${precioCompraNative.toExponential(4)} SOL/token)`
         );
       }
     }
 
     if (pairsValidos.length === 0) {
-      log('warn', `DexScreener: ningún par válido para ${mint.slice(0, 6)}... (liquidez, mcap, precio o rango)`);
+      avisarPrecio(mint, 'warn', `DexScreener: ningún par válido para ${mint.slice(0, 6)}... (liquidez, mcap, precio o rango)`);
       return { valorSol: null, precioSolUnitario: null, dexId: null, pairAddress: null, error: 'NO_VALID_PAIRS' };
     }
 
@@ -3169,10 +3179,12 @@ async function reconciliarPosiciones(forzado = false) {
       }
     }
 
-    log(
-      'info',
-      `🔍 [${marca}] Reconciliación completa [${MODO_ACTUAL.toUpperCase()}]${forzado ? ' (manual)' : ''}: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`
-    );
+    if (cerradas > 0 || forzado) {
+      log(
+        'info',
+        `🔍 Reconciliación [${MODO_ACTUAL.toUpperCase()}]${forzado ? ' (manual)' : ''}: ${posiciones.length} posiciones revisadas, ${cerradas} cerradas por venta atrasada.`
+      );
+    }
   } catch (e) {
     log('error', `Error en reconciliación de posiciones: ${e.message}`);
   }
