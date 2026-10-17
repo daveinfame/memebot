@@ -3,6 +3,7 @@ require('dotenv').config();
 
 // ---------- Dependencies ----------
 const http = require('http');
+const fs = require('fs');
 const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
@@ -233,20 +234,218 @@ function getLabel(c) {
 }
 
 // ---------- Inicialización de Solana ----------
+let fuenteClaveWallet = null;
 try {
   if (process.env.HELIUS_RPC_URL) {
     connection = new Connection(process.env.HELIUS_RPC_URL, 'confirmed');
   }
-  if (process.env.WALLET_PRIVATE_KEY) {
-    walletKeypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+  // La clave puede leerse de un ARCHIVO (secreto montado) en vez de una variable
+  // de entorno, que es visible para cualquiera con acceso al panel del proyecto.
+  // Se prefiere el archivo si WALLET_PRIVATE_KEY_FILE está definida.
+  const rutaClave = process.env.WALLET_PRIVATE_KEY_FILE;
+  let claveCruda = null;
+  if (rutaClave) {
+    claveCruda = fs.readFileSync(rutaClave, 'utf8').trim();
+    fuenteClaveWallet = `archivo ${rutaClave}`;
+  } else if (process.env.WALLET_PRIVATE_KEY) {
+    claveCruda = String(process.env.WALLET_PRIVATE_KEY).trim();
+    fuenteClaveWallet = 'variable de entorno WALLET_PRIVATE_KEY (visible en el panel de Railway)';
+  }
+  if (claveCruda) {
+    walletKeypair = Keypair.fromSecretKey(bs58.decode(claveCruda));
   }
   if (walletKeypair) {
-    log('info', `Wallet Solana cargada: ${walletKeypair.publicKey.toBase58()}`);
+    // NUNCA se loguea la clave: sólo la dirección pública y de dónde se leyó.
+    log('info', `Wallet Solana cargada: ${walletKeypair.publicKey.toBase58()} (clave desde ${fuenteClaveWallet})`);
   }
 } catch (e) {
   log('error', `Error cargando wallet/RPC de Solana: ${e.message}`);
   process.exit(1);
 }
+
+// ================== CANDADOS DE SEGURIDAD (mínimo privilegio) ==================
+// Principio: cualquier cambio de código o de variables que intente mover fondos
+// fuera de lo previsto debe FALLAR, no pasar. Estos candados no necesitan conocer
+// la clave privada: solo limitan y auditan lo que se firma.
+//
+// 1) ALLOWED_WITHDRAW_ADDRESS: único destino al que se permite mover SOL fuera de
+//    un swap conocido (por defecto, la propia wallet del bot: el bot no tiene
+//    función de retiro). Cualquier transferencia a otra dirección se bloquea.
+// 2) MAX_DAILY_SPEND_SOL: SOL máximo que puede salir de la wallet por día.
+// 3) MAX_TRADE_SOL: tope duro por operación de compra.
+const ALLOWED_WITHDRAW_ADDRESS =
+  process.env.ALLOWED_WITHDRAW_ADDRESS || '1UCqavVY9BqLtqryuCwUz54bnzoJc6Vp6HZavHpUA9r';
+const MAX_DAILY_SPEND_SOL = parseFloat(process.env.MAX_DAILY_SPEND_SOL || '0.5');
+const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || '0.1');
+const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
+const TOKEN_PROGRAMS = new Set([
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' // Token-2022
+]);
+const PROGRAMAS_SWAP = new Set([
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter v6
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB', // Jupiter v4 (legacy)
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // pump.fun
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // pump AMM
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // raydium v4
+  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', // meteora DLMM
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc' // whirlpool
+]);
+
+function fechaHoyUTC() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function notificarSeguridad(mensaje) {
+  log('warn', `🚨 SEGURIDAD: ${mensaje}`);
+  if (CHAT_ID) {
+    bot.sendMessage(CHAT_ID, `🚨 SEGURIDAD: ${mensaje}`).catch(() => {});
+  }
+}
+
+async function estaCongelado() {
+  try {
+    const { rows } = await pool.query('SELECT congelado FROM bot_seguridad WHERE id=1');
+    return !!(rows[0] && rows[0].congelado);
+  } catch (e) {
+    return false; // si la BD falla no bloqueamos el bot; el resto de candados sigue
+  }
+}
+
+async function gastoDiario() {
+  try {
+    const hoy = fechaHoyUTC();
+    const { rows } = await pool.query('SELECT fecha_gasto, gasto_sol FROM bot_seguridad WHERE id=1');
+    const r = rows[0];
+    if (!r) return 0;
+    const fecha = r.fecha_gasto ? new Date(r.fecha_gasto).toISOString().slice(0, 10) : null;
+    if (fecha !== hoy) return 0;
+    return Number(r.gasto_sol) || 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+async function registrarGastoDiario(sol) {
+  try {
+    const hoy = fechaHoyUTC();
+    await pool.query(
+      `INSERT INTO bot_seguridad (id, congelado, fecha_gasto, gasto_sol) VALUES (1, FALSE, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET
+         gasto_sol = CASE WHEN bot_seguridad.fecha_gasto = $1 THEN COALESCE(bot_seguridad.gasto_sol, 0) + $2 ELSE $2 END,
+         fecha_gasto = $1`,
+      [hoy, sol]
+    );
+  } catch (e) {
+    log('warn', `No se pudo registrar el gasto diario: ${e.message}`);
+  }
+}
+
+// Audita TODA transacción firmada antes de mandarla a la red:
+//  - si el bot está congelado, no sale nada;
+//  - bloquea transferencias de SOL a direcciones fuera de ALLOWED_WITHDRAW_ADDRESS
+//    cuando la tx NO es un swap (sin programa DEX y sin movimiento de tokens): esa
+//    es exactamente la firma de un 'mándame los fondos';
+//  - cuenta todo el SOL que sale contra MAX_DAILY_SPEND_SOL;
+//  - registra destinos y montos en el log (rastro auditable).
+async function auditarTransaccionSaliente(rawTx) {
+  if (await estaCongelado()) {
+    notificarSeguridad('BLOQUEADO: el bot está CONGELADO (/unfreeze para reactivar).');
+    throw new Error('Bot congelado por seguridad (/unfreeze)');
+  }
+
+  let tx = null;
+  try {
+    tx = VersionedTransaction.deserialize(rawTx);
+  } catch (e) {
+    try {
+      tx = Transaction.from(rawTx);
+    } catch (e2) {
+      tx = null;
+    }
+  }
+  if (!tx) {
+    log('warn', '🔐 No se pudo inspeccionar la tx saliente (formato desconocido) — se permite y se registra');
+    return;
+  }
+
+  const claves =
+    (tx.message && (tx.message.staticAccountKeys || tx.message.accountKeys)) || tx.accountKeys || [];
+  const direcciones = claves.map((k) => (k && k.toBase58 ? k.toBase58() : String(k)));
+  const programas = new Set();
+  const destinos = [];
+  let lamportsFuera = 0;
+
+  const revisarInstruccion = (programa, dataBytes, destinosIx) => {
+    programas.add(programa);
+    if (programa !== SYSTEM_PROGRAM_ID || !dataBytes || dataBytes.length < 12) return;
+    const tipo = dataBytes[0] | (dataBytes[1] << 8) | (dataBytes[2] << 16) | (dataBytes[3] << 24);
+    if (tipo !== 2) return; // SystemProgram.transfer
+    const buf = new Uint8Array(dataBytes);
+    const lamports = Number(new DataView(buf.buffer, buf.byteOffset + 4, 8).getBigUint64(0, true));
+    if (!Number.isFinite(lamports) || lamports <= 0) return;
+    destinos.push({ destino: destinosIx, lamports });
+    lamportsFuera += lamports;
+  };
+
+  if (tx.message && tx.message.compiledInstructions) {
+    for (const ix of tx.message.compiledInstructions) {
+      const programa = direcciones[ix.programIdIndex];
+      const destino = direcciones[ix.accountKeyIndexes && ix.accountKeyIndexes[1]];
+      revisarInstruccion(programa, ix.data, destino);
+    }
+  } else if (tx.instructions) {
+    for (const ix of tx.instructions) {
+      const programa = ix.programId ? ix.programId.toBase58() : null;
+      const destino = ix.keys && ix.keys[1] ? ix.keys[1].pubkey.toBase58() : null;
+      revisarInstruccion(programa, ix.data, destino);
+    }
+  }
+
+  const esSwap = [...programas].some((p) => PROGRAMAS_SWAP.has(p));
+  const hayTokens = [...programas].some((p) => TOKEN_PROGRAMS.has(p));
+  const mínimo = 0.002 * LAMPORTS_PER_SOL;
+  const sospechosos = destinos.filter((d) => d.destino !== ALLOWED_WITHDRAW_ADDRESS && d.lamports >= mínimo);
+
+  if (sospechosos.length > 0 && !esSwap && !hayTokens) {
+    notificarSeguridad(
+      `BLOQUEADA transferencia de SOL a ${sospechosos.map((d) => `${d.destino.slice(0, 8)}… (${(d.lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL)`).join(', ')}. Destino permitido: ${ALLOWED_WITHDRAW_ADDRESS.slice(0, 8)}…`
+    );
+    throw new Error('Transacción bloqueada por el candado de destino (ALLOWED_WITHDRAW_ADDRESS)');
+  }
+
+  if (lamportsFuera > 0) {
+    const solFuera = lamportsFuera / LAMPORTS_PER_SOL;
+    const gastado = await gastoDiario();
+    if (gastado + solFuera > MAX_DAILY_SPEND_SOL) {
+      notificarSeguridad(
+        `BLOQUEADA salida de ${solFuera.toFixed(4)} SOL: excede el tope diario (${gastado.toFixed(4)}/${MAX_DAILY_SPEND_SOL} SOL ya gastados hoy).`
+      );
+      throw new Error('Transacción bloqueada por el tope diario (MAX_DAILY_SPEND_SOL)');
+    }
+    await registrarGastoDiario(solFuera);
+  }
+
+  log(
+    'info',
+    `🔐 Tx auditada: ${(lamportsFuera / LAMPORTS_PER_SOL).toFixed(6)} SOL fuera · destinos: ${destinos.map((d) => `${d.destino.slice(0, 6)}:${(d.lamports / LAMPORTS_PER_SOL).toFixed(4)}`).join(', ') || 'ninguno'} · swap: ${esSwap ? 'sí' : 'no'} · tokens: ${hayTokens ? 'sí' : 'no'}`
+  );
+}
+
+// Interceptamos TODOS los envíos (compras, ventas, swaps de ganancia, cierre de
+// cuentas): nada sale a la red sin pasar por el candado.
+if (connection) {
+  const _sendRawTransaction = connection.sendRawTransaction.bind(connection);
+  connection.sendRawTransaction = async (rawTx, opciones) => {
+    await auditarTransaccionSaliente(rawTx);
+    return _sendRawTransaction(rawTx, opciones);
+  };
+  log(
+    'info',
+    `🔐 Candados activos: destino permitido ${ALLOWED_WITHDRAW_ADDRESS} · tope diario ${MAX_DAILY_SPEND_SOL} SOL · tope por operación ${MAX_TRADE_SOL} SOL`
+  );
+}
+// ================== FIN CANDADOS ==================
 
 // ---------- Jupiter con reintento ----------
 async function fetchJupiterConReintento(url, opts = {}) {
@@ -883,6 +1082,13 @@ async function initDB() {
 
     await pool.query(
       `CREATE TABLE IF NOT EXISTS global_balance (id INT PRIMARY KEY, initial_usdc REAL, current_usdc REAL)`
+    );
+    // Estado de los candados: congelado + gasto del día (sobrevive reinicios).
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS bot_seguridad (id INT PRIMARY KEY, congelado BOOLEAN DEFAULT FALSE, fecha_gasto DATE, gasto_sol REAL DEFAULT 0)`
+    );
+    await pool.query(
+      `INSERT INTO bot_seguridad (id, congelado, gasto_sol) VALUES (1, FALSE, 0) ON CONFLICT (id) DO NOTHING`
     );
     await pool.query(`ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS real_initial_sol REAL`);
     await pool.query(`ALTER TABLE global_balance ADD COLUMN IF NOT EXISTS helius_webhook_id TEXT`);
@@ -2076,6 +2282,26 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
   const origenesPump = new Set(['PumpPortal', 'PUMP_FUN', 'PUMP_AMM', 'OnChain', 'pump.fun', 'pumpswap']);
   const esPump = origenesPump.has(origen);
 
+  // ===== Candados: congelado, tope por operación y tope diario =====
+  if (await estaCongelado()) {
+    notificarSeguridad(`BLOQUEADO ${action} ${mint.slice(0, 6)}...: bot CONGELADO.`);
+    throw new Error('Bot congelado por seguridad (/unfreeze)');
+  }
+  if (action === 'buy') {
+    const solCompra = Number(amount) || 0;
+    if (solCompra > MAX_TRADE_SOL) {
+      notificarSeguridad(`BLOQUEADA compra de ${solCompra.toFixed(4)} SOL: supera el tope por operación (${MAX_TRADE_SOL} SOL).`);
+      throw new Error('Tope por operación excedido (MAX_TRADE_SOL)');
+    }
+    const gastadoHoy = await gastoDiario();
+    if (gastadoHoy + solCompra > MAX_DAILY_SPEND_SOL) {
+      notificarSeguridad(
+        `BLOQUEADA compra de ${solCompra.toFixed(4)} SOL: tope diario alcanzado (${gastadoHoy.toFixed(4)}/${MAX_DAILY_SPEND_SOL} SOL).`
+      );
+      throw new Error('Tope diario excedido (MAX_DAILY_SPEND_SOL)');
+    }
+  }
+
   try {
     if (esPump) {
       return await pumpPortalTrade({
@@ -3013,6 +3239,11 @@ function avisarUnaVez(clave, mensaje, ttlMs = 30 * 60 * 1000) {
 async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
   const solPaid = trade.solAmount || 0;
 
+  if (await estaCongelado()) {
+    log('warn', `🧊 Congelado: compra de ${tracked.alias} ${trade.mint.slice(0, 6)}... ignorada`);
+    return;
+  }
+
   // P2: SOL/wSOL y stables NUNCA son el token objetivo de una copia. Una
   // "compra de USDC" es en realidad la venta del token que la wallet tenía.
   if (esMintNoCopiable(trade.mint)) {
@@ -3261,6 +3492,10 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
 
 // ---------- Venta ----------
 async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDeteccion = null) {
+  if (await estaCongelado()) {
+    log('warn', `🧊 Congelado: venta de ${tracked.alias} ${trade.mint.slice(0, 6)}... ignorada`);
+    return;
+  }
   const lockKey = `${trade.mint}:${tracked.alias}`;
   if (ventasEnProceso.has(lockKey)) {
     log('warn', `⏸️ Venta duplicada ignorada para ${trade.mint.slice(0, 6)}... vía ${tracked.alias}`);
@@ -3737,6 +3972,9 @@ bot.onText(/\/help/, async (msg) => {
 ⚙️ SISTEMA:
 /status – Estado general del bot
 /cleanup – Limpia posiciones de wallets borradas
+/freeze – FRENA el bot por completo (no compra ni vende) hasta /unfreeze
+/unfreeze – Reactiva el bot tras un /freeze
+/seguridad – Muestra el estado de los candados (destino permitido, topes, clave)
 /resetpaper – Reinicia el modo PAPER: balance a $${INITIAL_PAPER_BALANCE}, sin posiciones ni historial
 /fixwebhook – Fuerza la recreación del webhook en Helius
 /help – Esta ayuda
@@ -4534,6 +4772,56 @@ bot.onText(/\/cleanup/, async (msg) => {
   }
 });
 
+// /freeze — frena el bot por completo (no compra ni vende hasta /unfreeze)
+bot.onText(/\/freeze/, async (msg) => {
+  if (!esAdmin(msg)) return;
+  try {
+    await pool.query(
+      'INSERT INTO bot_seguridad (id, congelado) VALUES (1, TRUE) ON CONFLICT (id) DO UPDATE SET congelado=TRUE'
+    );
+    log('warn', '🧊 Bot CONGELADO por el admin (/unfreeze para reactivar)');
+    bot.sendMessage(msg.chat.id, '🧊 Bot CONGELADO: no ejecutará compras ni ventas hasta que uses /unfreeze.');
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// /unfreeze — reactiva el bot
+bot.onText(/\/unfreeze/, async (msg) => {
+  if (!esAdmin(msg)) return;
+  try {
+    await pool.query(
+      'INSERT INTO bot_seguridad (id, congelado) VALUES (1, FALSE) ON CONFLICT (id) DO UPDATE SET congelado=FALSE'
+    );
+    log('info', '🔓 Bot reactivado por el admin (/unfreeze)');
+    bot.sendMessage(msg.chat.id, '🔓 Bot reactivado: vuelve a operar con normalidad.');
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
+
+// /seguridad — estado de los candados y de la custodia de la clave
+bot.onText(/\/seguridad/, async (msg) => {
+  if (!esAdmin(msg)) return;
+  try {
+    const congelado = await estaCongelado();
+    const gastado = await gastoDiario();
+    const solBal = LIVE && connection && walletKeypair ? await getWalletSolBalance() : null;
+    let txt = `🔐 Estado de seguridad\n`;
+    txt += `🧊 Congelado: ${congelado ? 'SÍ (/unfreeze para reactivar)' : 'no'}\n`;
+    txt += `🎯 Destino permitido: ${ALLOWED_WITHDRAW_ADDRESS}\n`;
+    txt += `💸 Gasto de hoy: ${gastado.toFixed(4)} / ${MAX_DAILY_SPEND_SOL} SOL\n`;
+    txt += `🛡️ Tope por operación: ${MAX_TRADE_SOL} SOL\n`;
+    if (solBal !== null) txt += `💰 Saldo wallet: ${solBal.toFixed(4)} SOL\n`;
+    txt += `🔑 Clave privada desde: ${fuenteClaveWallet || 'no cargada'}\n`;
+    if (fuenteClaveWallet && fuenteClaveWallet.includes('variable de entorno')) {
+      txt += `⚠️ La clave vive en una variable de entorno visible en el panel de Railway. Muévela a WALLET_PRIVATE_KEY_FILE (secreto montado) o a un firmante externo.\n`;
+    }
+    bot.sendMessage(msg.chat.id, txt);
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, 'Error: ' + e.message);
+  }
+});
 // /resetpaper — reinicia el modo PAPER de cero (balance, posiciones, historial)
 bot.onText(/\/resetpaper/, async (msg) => {
   if (!esAdmin(msg)) return;
