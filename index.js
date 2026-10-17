@@ -274,7 +274,9 @@ try {
 // 2) MAX_DAILY_SPEND_SOL: SOL máximo que puede salir de la wallet por día.
 // 3) MAX_TRADE_SOL: tope duro por operación de compra.
 const ALLOWED_WITHDRAW_ADDRESS =
-  process.env.ALLOWED_WITHDRAW_ADDRESS || '1UCqavVY9BqLtqryuCwUz54bnzoJc6Vp6HZavHpUA9r';
+  // Rotar la clave no requiere tocar nada: la allowlist sigue a la wallet cargada.
+  process.env.ALLOWED_WITHDRAW_ADDRESS ||
+  (walletKeypair ? walletKeypair.publicKey.toBase58() : null);
 const MAX_DAILY_SPEND_SOL = parseFloat(process.env.MAX_DAILY_SPEND_SOL || '0.5');
 const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || '0.1');
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
