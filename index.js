@@ -2361,7 +2361,6 @@ async function ejecutarTrade({ action, mint, amount, origen, slippage = DEFAULT_
     if (solCompra > MAX_TRADE_SOL) {
       notificarSeguridad(`BLOQUEADA compra de ${solCompra.toFixed(4)} SOL: supera el tope por operación (${MAX_TRADE_SOL} SOL).`);
       throw new Error('Tope por operación excedido (MAX_TRADE_SOL)');
-    txt += `Retiro de ganancias: ${SWEEP_ADDRESS ? 'destino ' + SWEEP_ADDRESS : 'sin destino (desactivado)'}\n`;
     }
     const gastadoHoy = await gastoDiario();
     if (gastadoHoy + solCompra > MAX_DAILY_SPEND_SOL) {
@@ -5107,10 +5106,11 @@ bot.onText(/\/seguridad/, async (msg) => {
     txt += `🎯 Destino permitido: ${ALLOWED_WITHDRAW_ADDRESS}\n`;
     txt += `💸 Gasto de hoy: ${gastado.toFixed(4)} / ${MAX_DAILY_SPEND_SOL} SOL\n`;
     txt += `🛡️ Tope por operación: ${MAX_TRADE_SOL} SOL\n`;
+    txt += `💸 Retiro de ganancias: ${SWEEP_ADDRESS ? 'destino ' + SWEEP_ADDRESS : 'sin destino (desactivado)'}\n`;
     if (solBal !== null) txt += `💰 Saldo wallet: ${solBal.toFixed(4)} SOL\n`;
     txt += `🔑 Clave privada desde: ${fuenteClaveWallet || 'no cargada'}\n`;
     if (fuenteClaveWallet && fuenteClaveWallet.includes('variable de entorno')) {
-      txt += `⚠️ La clave vive en una variable de entorno visible en el panel de Railway. Muévela a WALLET_PRIVATE_KEY_FILE (secreto montado) o a un firmante externo.\n`;
+      txt += `🔒 Si esa variable NO está sellada en Railway (Seal), cualquiera con acceso al panel o a un token puede leerla.\n`;
     }
     bot.sendMessage(msg.chat.id, txt);
   } catch (e) {
