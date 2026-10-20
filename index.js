@@ -775,21 +775,70 @@ async function getHoldings(address) {
   }
 }
 
+// ---------- Balance de token: caché + single-flight + corta-circuitos ----------
+// Helius responde 429 "max usage reached" cuando se agotan los créditos. Sin
+// freno, el reconciliador (cada 20 s por posición) y el resto de rutas lo
+// martillan y el bot se queda sin datos: no detecta ventas y no valora.
+// Reglas: cada (wallet,mint) se cachea BALANCE_CACHE_MS, las llamadas simultáneas
+// comparten una sola petición y ante un 429 se deja de llamar RPC_COOLDOWN_MS
+// devolviendo el último valor conocido (nunca 0, que cerraría una posición).
+const BALANCE_CACHE_MS = parseInt(process.env.BALANCE_CACHE_MS || '45000', 10);
+const RPC_COOLDOWN_MS = parseInt(process.env.RPC_COOLDOWN_MS || '300000', 10);
+const balancesCache = new Map();
+const balancesEnVuelo = new Map();
+let rpcCooldownHasta = 0;
+let rpcAvisoHasta = 0;
+
+function esErrorDeLimiteRpc(mensaje) {
+  return /429|too many requests|max usage|rate limit/i.test(String(mensaje || ''));
+}
+
 async function getBalanceDeTokenEnWallet(walletAddress, mint) {
   if (!connection) return null;
-  try {
-    const owner = new PublicKey(walletAddress);
-    const mintKey = new PublicKey(mint);
-    const cuentas = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey });
-    let total = 0;
-    for (const c of cuentas.value) {
-      total += parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
+  const clave = `${walletAddress}:${mint}`;
+  const ahora = Date.now();
+
+  const cacheado = balancesCache.get(clave);
+  if (cacheado && ahora - cacheado.ts < BALANCE_CACHE_MS) return cacheado.valor;
+
+  if (ahora < rpcCooldownHasta) return cacheado ? cacheado.valor : null;
+
+  if (balancesEnVuelo.has(clave)) return balancesEnVuelo.get(clave);
+
+  const promesa = (async () => {
+    try {
+      const owner = new PublicKey(walletAddress);
+      const mintKey = new PublicKey(mint);
+      const cuentas = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey });
+      let total = 0;
+      for (const c of cuentas.value) {
+        total += parseFloat(c.account.data.parsed.info.tokenAmount.uiAmount || 0);
+      }
+      balancesCache.set(clave, { valor: total, ts: Date.now() });
+      return total;
+    } catch (e) {
+      if (esErrorDeLimiteRpc(e.message)) {
+        rpcCooldownHasta = Date.now() + RPC_COOLDOWN_MS;
+        if (Date.now() >= rpcAvisoHasta) {
+          rpcAvisoHasta = Date.now() + RPC_COOLDOWN_MS;
+          log(
+            'error',
+            `⛔ RPC sin créditos (429 max usage): pauso las consultas de balance ${Math.round(
+              RPC_COOLDOWN_MS / 60000
+            )} min y uso el último dato conocido. Revisa los créditos de Helius.`
+          );
+        }
+        return cacheado ? cacheado.valor : null;
+      }
+      log('error', `Error consultando balance de token en wallet: ${e.message}`);
+      return null;
+    } finally {
+      balancesEnVuelo.delete(clave);
     }
-    return total;
-  } catch (e) {
-    log('error', `Error consultando balance de token en wallet: ${e.message}`);
-    return null;
-  }
+  })();
+
+  balancesEnVuelo.set(clave, promesa);
+  return promesa;
 }
 
 // ---------- Balance SOL ----------
