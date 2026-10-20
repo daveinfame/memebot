@@ -25,6 +25,16 @@ const LAMPORTS_PER_SOL = 1e9;
 const SOL_PRICE = 100;
 const getSolPriceUSD = async () => SOL_PRICE;
 const getHeliusApiKey = () => 'FAKE_KEY';
+// Gotcha del arnés: si el código extraído usa un helper y no se pasa como stub,
+// el try/catch se lo traga y TODO devuelve null como si el código estuviera mal.
+const USDC_STUB = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT_STUB = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const MINTS_A_IGNORAR = new Set([
+  'So11111111111111111111111111111111111111112',
+  USDC_STUB,
+  USDT_STUB
+]);
+const esMintNoCopiable = (m) => !!m && MINTS_A_IGNORAR.has(m);
 const processStub = { env: {} };
 
 // fetch falso: devuelve las tx que le pase el test
@@ -36,6 +46,7 @@ const fns = new Function(
   'LAMPORTS_PER_SOL',
   'getSolPriceUSD',
   'getHeliusApiKey',
+  'esMintNoCopiable',
   'fetch',
   'process',
   'PUMPFUN_FEE_PCT',
@@ -47,7 +58,7 @@ const fns = new Function(
     bVerif,
     'return { calcularProceedsPorProporcion, calcularResultado, verificarMultiploEnCadena };'
   ].join('\n')
-)(numeroSeguro, LAMPORTS_PER_SOL, getSolPriceUSD, getHeliusApiKey, fetchStub, processStub, 0.0125, 0.0005);
+)(numeroSeguro, LAMPORTS_PER_SOL, getSolPriceUSD, getHeliusApiKey, esMintNoCopiable, fetchStub, processStub, 0.0125, 0.0005);
 
 let fallos = 0;
 function check(nombre, cond, detalle) {
@@ -139,6 +150,32 @@ const cerca = (a, b, tol = 1e-6) => Math.abs(a - b) <= Math.abs(b) * tol + 1e-12
   const v3 = await fns.verificarMultiploEnCadena(W, MINT);
   check('recepción sin pago no falsea el múltiplo → 1.50x', v3 && v3.verificable && cerca(v3.multiple, 1.5), v3);
 
+  // Tx ambigua: la wallet paga 0.4 SOL y en la misma tx recibe polvo del mint +
+  // otro token. Ese SOL no es de este mint: la tx se ignora.
+  const txAmbigua = {
+    accountData: [{ account: W, nativeBalanceChange: -400_000_000 }],
+    tokenTransfers: [
+      { mint: MINT, fromUserAccount: 'POOL', toUserAccount: W, tokenAmount: 0.000001 },
+      { mint: OTRO, fromUserAccount: 'POOL', toUserAccount: W, tokenAmount: 1000 }
+    ]
+  };
+  TXS = [txCompra, txVenta, txAmbigua];
+  const v5 = await fns.verificarMultiploEnCadena(W, MINT);
+  check('tx ambigua (polvo + otro token) se ignora → 1.50x', v5 && v5.verificable && cerca(v5.multiple, 1.5), v5);
+
+  // Dos round trips: manda la tx dominante de cada lado (1M tokens), no la suma
+  const txCompra2 = {
+    accountData: [{ account: W, nativeBalanceChange: -300_000_000 }],
+    tokenTransfers: [{ mint: MINT, fromUserAccount: 'POOL', toUserAccount: W, tokenAmount: 200_000 }]
+  };
+  const txVenta2 = {
+    accountData: [{ account: W, nativeBalanceChange: 100_000_000 }],
+    tokenTransfers: [{ mint: MINT, fromUserAccount: W, toUserAccount: 'POOL', tokenAmount: 200_000 }]
+  };
+  TXS = [txCompra, txVenta, txCompra2, txVenta2];
+  const v6 = await fns.verificarMultiploEnCadena(W, MINT);
+  check('dos round trips → usa la dominante (1.50x)', v6 && v6.verificable && cerca(v6.multiple, 1.5), v6);
+
   // Wallet tipo app: no mueve SOL ni USDC propio
   TXS = [
     {
@@ -152,6 +189,6 @@ const cerca = (a, b, tol = 1e-6) => Math.abs(a - b) <= Math.abs(b) * tol + 1e-12
   const v4 = await fns.verificarMultiploEnCadena(W, MINT);
   check('wallet tipo app → no verificable', v4 && v4.verificable === false, v4);
 
-  console.log(fallos ? `\n${fallos} FALLO(S)` : '\nTODO OK (13 casos)');
+  console.log(fallos ? `\n${fallos} FALLO(S)` : '\nTODO OK (15 casos)');
   process.exit(fallos ? 1 : 0);
 })();

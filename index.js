@@ -2305,6 +2305,17 @@ async function procesarWebhookHelius(rawBody) {
           if (valorTx) {
             tradeCompatible.solAmount = valorTx.solAmount;
             tradeCompatible.solAmountEstimado = false;
+          } else {
+            // Una TRANSFERENCIA de tokens (sin pata de SOL de la wallet y sin swap
+            // dentro de la tx para valorarla) NO es una venta copiable: puede ser
+            // un regalo, un movimiento a otra wallet del dueño o un depósito a un
+            // router. Antes se cerraba la posición valuando a mercado y se
+            // reportaba como si fuera lo que recibió la wallet.
+            log(
+              'info',
+              `📤 ${tracked.alias} ENVIÓ ${cambio.mint.slice(0, 6)}... (transferencia sin swap ni pata de SOL) — no se copia la venta`
+            );
+            continue;
           }
         }
 
@@ -2368,6 +2379,17 @@ async function procesarWebhookHelius(rawBody) {
           if (valorTx) {
             tradeCompatible.solAmount = valorTx.solAmount;
             tradeCompatible.solAmountEstimado = false;
+          } else {
+            // Una TRANSFERENCIA de tokens (sin pata de SOL de la wallet y sin swap
+            // dentro de la tx para valorarla) NO es una venta copiable: puede ser
+            // un regalo, un movimiento a otra wallet del dueño o un depósito a un
+            // router. Antes se cerraba la posición valuando a mercado y se
+            // reportaba como si fuera lo que recibió la wallet.
+            log(
+              'info',
+              `📤 ${tracked.alias} ENVIÓ ${cambio.mint.slice(0, 6)}... (transferencia sin swap ni pata de SOL) — no se copia la venta`
+            );
+            continue;
           }
         }
 
@@ -3612,46 +3634,55 @@ async function verificarMultiploEnCadena(walletAddress, mint) {
     const txs = await res.json();
     const solPrice = await getSolPriceUSD();
 
-    let tokensIn = 0;
-    let tokensOut = 0;
-    let solPagado = 0;
-    let solCobrado = 0;
+    // Se toma la tx DOMINANTE de cada lado (la que movió más tokens del mint) en
+    // vez de sumar todo: sumar mezclaba tramos y polvo. Visto: la wallet pagó
+    // 0.4 SOL en una tx que además le dejó polvo de otro token y el múltiplo
+    // salía 0.00x. Y una recepción (bundler/airdrop) sumaba tokens sin SOL.
+    let mejorCompra = null;
+    let mejorVenta = null;
 
-    // El SOL se atribuye POR TX y sólo en las tx que mueven ESTE mint. Antes se
-    // sumaba el SOL de las 100 tx completas (todos los tokens de la wallet) y el
-    // múltiplo salía sin sentido: 0.97x donde la wallet hizo 1.37x, 1.02x donde
-    // hizo 3.49x.
     for (const tx of txs || []) {
       const flujo = flujoPropioDeWallet(tx, walletAddress, mint);
       if (!(flujo.tokensIn > 0) && !(flujo.tokensOut > 0)) continue;
 
-      // Sólo cuentan las tx con pata de pago propia: una recepción de tokens
-      // (bundler/airdrop) sumaría tokens sin SOL y falsearía el múltiplo.
+      // Tx ambigua: la wallet mueve OTRO token (no stable) en la misma tx, así
+      // que el SOL de esa tx no es atribuible a este mint.
+      const mueveOtroToken = (tx.tokenTransfers || []).some(
+        (t) =>
+          t.mint !== mint &&
+          !esMintNoCopiable(t.mint) &&
+          (t.toUserAccount === walletAddress || t.fromUserAccount === walletAddress)
+      );
+      if (mueveOtroToken) continue;
+
       if (flujo.tokensIn > 0) {
         let pagado = flujo.solPropio < 0 ? -flujo.solPropio : 0;
         if (!(pagado > 0) && flujo.stableOut > 0 && solPrice) pagado = flujo.stableOut / solPrice;
-        if (pagado > 0) {
-          tokensIn += flujo.tokensIn;
-          solPagado += pagado;
+        if (pagado > 0 && (!mejorCompra || flujo.tokensIn > mejorCompra.tokens)) {
+          mejorCompra = { tokens: flujo.tokensIn, sol: pagado };
         }
       }
       if (flujo.tokensOut > 0) {
         let cobrado = flujo.solPropio > 0 ? flujo.solPropio : 0;
         if (!(cobrado > 0) && flujo.stableIn > 0 && solPrice) cobrado = flujo.stableIn / solPrice;
-        if (cobrado > 0) {
-          tokensOut += flujo.tokensOut;
-          solCobrado += cobrado;
+        if (cobrado > 0 && (!mejorVenta || flujo.tokensOut > mejorVenta.tokens)) {
+          mejorVenta = { tokens: flujo.tokensOut, sol: cobrado };
         }
       }
     }
 
-    if (tokensIn <= 0 || tokensOut <= 0) {
+    if (!mejorCompra || !mejorVenta) {
       return { verificable: false, motivo: 'sin compras y ventas del token en las últimas 100 tx' };
     }
-    const precioCompra = solPagado > 0 ? solPagado / tokensIn : null;
-    const precioVenta = solCobrado > 0 ? solCobrado / tokensOut : null;
-    if (precioCompra && precioVenta) {
-      return { verificable: true, multiple: precioVenta / precioCompra };
+    const precioCompra = mejorCompra.sol / mejorCompra.tokens;
+    const precioVenta = mejorVenta.sol / mejorVenta.tokens;
+    if (precioCompra > 0 && precioVenta > 0) {
+      return {
+        verificable: true,
+        multiple: precioVenta / precioCompra,
+        compra: mejorCompra,
+        venta: mejorVenta
+      };
     }
     return { verificable: false, motivo: 'la wallet no mueve SOL ni USDC propio (wallet tipo app)' };
   } catch (e) {
@@ -3670,7 +3701,11 @@ async function lineaVerificacionOnChain(r, mint, walletAddress) {
     } else {
       const desvio = v.multiple / r.multiplicador;
       const aviso = desvio > 2 || desvio < 0.5 ? ' ⚠️ desvío >2x' : ' ✓';
-      linea = `\n🔎 On-chain: la wallet hizo ${v.multiple.toFixed(2)}x (nosotros ${r.multiplicador.toFixed(2)}x)${aviso}`;
+      const detalle =
+        v.compra && v.venta
+          ? ` [compró ${v.compra.sol.toFixed(4)} SOL / vendió ${v.venta.sol.toFixed(4)} SOL]`
+          : '';
+      linea = `\n🔎 On-chain: la wallet hizo ${v.multiple.toFixed(2)}x (nosotros ${r.multiplicador.toFixed(2)}x)${aviso}${detalle}`;
     }
     log('info', `📊 Verificación on-chain ${mint.slice(0, 6)}...: ${linea.replace(/\n/g, ' ').trim()}`);
     return linea;
