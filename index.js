@@ -1774,9 +1774,20 @@ async function crearOActualizarWebhookHelius() {
     const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
     let webhookIdExistente = gb[0]?.helius_webhook_id;
 
+    // Créditos de Helius: cada evento entregado cuesta 1 crédito, y 'ANY'
+    // entrega TODO (incluidas las transferencias que desde el fix de copias
+    // ya no se usan). Con 'SWAP' baja mucho el consumo sin perder nada.
+    // Configurable por HELIUS_WEBHOOK_TYPES (ej. 'SWAP,TRANSFER').
+    const tiposWebhook = (process.env.HELIUS_WEBHOOK_TYPES || 'SWAP')
+      .split(',')
+      .map((t) => t.trim().toUpperCase())
+      .filter(Boolean);
+    // Ojo: transactionTypes: [] en Helius significa "todos los tipos", así que
+    // una variable mal escrita no debe dejar la lista vacía.
+    if (tiposWebhook.length === 0) tiposWebhook.push('SWAP');
     const payload = {
       webhookURL: HELIUS_WEBHOOK_URL,
-      transactionTypes: ['ANY'],
+      transactionTypes: tiposWebhook,
       accountAddresses: direcciones,
       webhookType: 'enhanced',
       authHeader: HELIUS_WEBHOOK_SECRET
@@ -1795,7 +1806,7 @@ async function crearOActualizarWebhookHelius() {
           }
         );
         if (res.ok) {
-          log('info', `🌐 Webhook (ANY) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
+          log('info', `🌐 Webhook (${tiposWebhook.join(',')}) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
           exito = true;
         } else {
           log('warn', `⚠️ No se pudo actualizar webhook ${webhookIdExistente} (${res.status}), se creará uno nuevo`);
