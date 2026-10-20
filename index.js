@@ -1534,6 +1534,106 @@ async function parsearTransaccionViaHeliusAPI(signature) {
   }
 }
 
+// ---------- Pata de pago PROPIA de la wallet (anti-copia de tokens recibidos) ----------
+// Una tx puede contener un swap donde la wallet trackeada NO paga nada: un
+// pagador/bundler compra y reparte tokens a N wallets (multisend), o la wallet
+// recibe un airdrop. El swap existe, así que sin este filtro el bot copiaba la
+// "compra" con el SOL DEL PAGADOR. Regla: sólo hay compra/venta copiable si la
+// wallet movió SU propio SOL o USDC en esa misma tx.
+const MIN_PAGO_PROPIO_SOL = parseFloat(process.env.MIN_PAGO_PROPIO_SOL || '0.005');
+const USDC_ATRIB_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT_ATRIB_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+
+function flujoPropioDeWallet(tx, walletAddress, mint) {
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let stableIn = 0;
+  let stableOut = 0;
+  for (const tt of tx.tokenTransfers || []) {
+    const cantidad = Math.abs(numeroSeguro(tt.tokenAmount));
+    if (!cantidad) continue;
+    const entra = tt.toUserAccount === walletAddress;
+    const sale = tt.fromUserAccount === walletAddress;
+    if (!entra && !sale) continue;
+    if (tt.mint === mint) {
+      if (entra) tokensIn += cantidad;
+      if (sale) tokensOut += cantidad;
+    } else if (tt.mint === USDC_ATRIB_MINT || tt.mint === USDT_ATRIB_MINT) {
+      if (entra) stableIn += cantidad;
+      if (sale) stableOut += cantidad;
+    }
+  }
+
+  let solPropio = 0;
+  const mia = (tx.accountData || []).find((a) => a.account === walletAddress);
+  if (mia && Number.isFinite(numeroSeguro(mia.nativeBalanceChange))) {
+    solPropio = numeroSeguro(mia.nativeBalanceChange) / LAMPORTS_PER_SOL;
+  } else {
+    let lamports = 0;
+    for (const nt of tx.nativeTransfers || []) {
+      const lam = numeroSeguro(nt.amount);
+      if (nt.toUserAccount === walletAddress) lamports += lam;
+      if (nt.fromUserAccount === walletAddress) lamports -= lam;
+    }
+    solPropio = lamports / LAMPORTS_PER_SOL;
+  }
+
+  return { tokensIn, tokensOut, stableIn, stableOut, solPropio };
+}
+
+// Devuelve el monto REAL que puso/cobró la wallet en el swap de esa tx, o null
+// si no hubo pata de pago propia (recepción de tokens, airdrop, bundle ajeno).
+async function atribuirTradeParsedAWallet(tx, parsed, walletAddress) {
+  const flujo = flujoPropioDeWallet(tx, walletAddress, parsed.mint);
+  const precioSwap =
+    parsed.solAmount > 0 && parsed.tokenAmount > 0 ? parsed.solAmount / parsed.tokenAmount : null;
+
+  if (parsed.direction === 'buy') {
+    // Sólo cuentan los tokens que recibió ESTA wallet. Nunca el total del swap:
+    // en un bundle el total es del pagador, no suyo.
+    const tokensRecibidos = flujo.tokensIn;
+    if (!(tokensRecibidos > 0)) return null;
+
+    let solPagado = flujo.solPropio < 0 ? -flujo.solPropio : 0;
+    let metodo = 'pago propio en SOL';
+    if (solPagado < MIN_PAGO_PROPIO_SOL && flujo.stableOut > 0) {
+      const solPrice = await getSolPriceUSD();
+      if (!solPrice) return null;
+      solPagado = flujo.stableOut / solPrice;
+      metodo = 'pago propio en stable (USDC/USDT)';
+    }
+    if (!(solPagado >= MIN_PAGO_PROPIO_SOL)) return null;
+
+    return { solAmount: solPagado, tokenAmount: tokensRecibidos, fuente: metodo };
+  }
+
+  const tokensEnviados = flujo.tokensOut;
+  if (!(tokensEnviados > 0)) return null;
+
+  let solRecibido = flujo.solPropio > 0 ? flujo.solPropio : 0;
+  let metodo = 'cobro propio en SOL';
+  if (solRecibido < MIN_PAGO_PROPIO_SOL && flujo.stableIn > 0) {
+    const solPrice = await getSolPriceUSD();
+    if (solPrice) {
+      solRecibido = flujo.stableIn / solPrice;
+      metodo = 'cobro propio en stable (USDC/USDT)';
+    }
+  }
+  if (solRecibido >= MIN_PAGO_PROPIO_SOL) {
+    return { solAmount: solRecibido, tokenAmount: tokensEnviados, fuente: metodo };
+  }
+
+  // Wallet tipo app: no cobra ella misma (el swap lo ejecuta otro pagador). Se
+  // valora la salida con el precio del swap de la MISMA tx y SUS propios tokens.
+  if (!precioSwap) return null;
+  return {
+    solAmount: tokensEnviados * precioSwap,
+    tokenAmount: tokensEnviados,
+    fuente: 'precio del swap de la tx (la wallet no cobra)',
+    valoradoConSwapDeLaTx: true
+  };
+}
+
 // Encuentra qué wallet trackeada es la dueña del swap según el parsed data
 function encontrarWalletTrackeadaDelSwap(tx, parsed, trackedMap) {
   const feePayer = tx.feePayer;
@@ -2121,25 +2221,39 @@ async function procesarWebhookHelius(rawBody) {
           `🌐 Actividad detectada (Parsed Events): ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... · ${parsed.solAmount.toFixed(4)} SOL · ${parsed.tokenAmount.toFixed(4)} tokens (protocol: ${parsed.protocol})${parsed.valoradoEnUsdc ? ' · ' + parsed.valoradoEnUsdc : ''}`
         );
 
-        const tradeCompatible = {
-          mint: parsed.mint,
-          solAmount: parsed.solAmount,
-          tokenAmount: parsed.tokenAmount,
-          solAmountEstimado: false,
-          traderPublicKey: tracked.address,
-          txType: parsed.direction
-        };
-        const origen =
-          parsed.protocol ||
-          origenNormalizado ||
-          (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
-
-        if (parsed.direction === 'buy') {
-          await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
+        // Pata de pago propia: un swap donde la wallet NO puso su SOL/USDC es una
+        // recepción de tokens (bundler/multisend/airdrop), no una compra suya.
+        const atribucion = await atribuirTradeParsedAWallet(tx, parsed, tracked.address);
+        if (!atribucion) {
+          log(
+            'info',
+            `🚫 Parsed Events: ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... sin pata de pago propia (tokens recibidos de un tercero) — no se copia`
+          );
         } else {
-          await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
+          log(
+            'info',
+            `🎯 Atribución propia: ${tracked.alias} ${parsed.direction} ${parsed.mint.slice(0, 6)}... · ${atribucion.solAmount.toFixed(4)} SOL · ${atribucion.tokenAmount.toFixed(4)} tokens (${atribucion.fuente})`
+          );
+          const tradeCompatible = {
+            mint: parsed.mint,
+            solAmount: atribucion.solAmount,
+            tokenAmount: atribucion.tokenAmount,
+            solAmountEstimado: false,
+            traderPublicKey: tracked.address,
+            txType: parsed.direction
+          };
+          const origen =
+            parsed.protocol ||
+            origenNormalizado ||
+            (tx.source && tx.source !== 'PUMP_FUN' ? tx.source : 'OnChain');
+
+          if (parsed.direction === 'buy') {
+            await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
+          } else {
+            await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
+          }
+          continue;
         }
-        continue;
       }
     }
 
@@ -2185,6 +2299,18 @@ async function procesarWebhookHelius(rawBody) {
           }
         }
 
+        // Misma regla que en Parsed Events: sin pago propio no hay compra copiable.
+        if (cambio.direction === 'buy') {
+          const flujoPropio = flujoPropioDeWallet(tx, tracked.address, cambio.mint);
+          const pagoSol = flujoPropio.solPropio < 0 ? -flujoPropio.solPropio : 0;
+          if (pagoSol < MIN_PAGO_PROPIO_SOL && !(flujoPropio.stableOut > 0)) {
+            log(
+              'info',
+              `🚫 ${tracked.alias} ${cambio.mint.slice(0, 6)}... sin pago propio en la tx (tokens recibidos) — no se copia`
+            );
+            continue;
+          }
+        }
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
       }
@@ -2236,6 +2362,18 @@ async function procesarWebhookHelius(rawBody) {
           }
         }
 
+        // Misma regla que en Parsed Events: sin pago propio no hay compra copiable.
+        if (cambio.direction === 'buy') {
+          const flujoPropio = flujoPropioDeWallet(tx, tracked.address, cambio.mint);
+          const pagoSol = flujoPropio.solPropio < 0 ? -flujoPropio.solPropio : 0;
+          if (pagoSol < MIN_PAGO_PROPIO_SOL && !(flujoPropio.stableOut > 0)) {
+            log(
+              'info',
+              `🚫 ${tracked.alias} ${cambio.mint.slice(0, 6)}... sin pago propio en la tx (tokens recibidos) — no se copia`
+            );
+            continue;
+          }
+        }
         if (cambio.direction === 'buy') await handleTrackedBuy(tracked, tradeCompatible, origen, horaDeteccion);
         else await handleTrackedSell(tracked, tradeCompatible, origen, horaDeteccion);
       }
@@ -3434,33 +3572,50 @@ async function verificarMultiploEnCadena(walletAddress, mint) {
     );
     if (!res.ok) return null;
     const txs = await res.json();
+    const solPrice = await getSolPriceUSD();
+
     let tokensIn = 0;
     let tokensOut = 0;
-    let solIn = 0;
-    let solOut = 0;
+    let solPagado = 0;
+    let solCobrado = 0;
+
+    // El SOL se atribuye POR TX y sólo en las tx que mueven ESTE mint. Antes se
+    // sumaba el SOL de las 100 tx completas (todos los tokens de la wallet) y el
+    // múltiplo salía sin sentido: 0.97x donde la wallet hizo 1.37x, 1.02x donde
+    // hizo 3.49x.
     for (const tx of txs || []) {
-      for (const t of tx.tokenTransfers || []) {
-        if (t.mint !== mint) continue;
-        const a = Number(t.tokenAmount) || 0;
-        if (t.toUserAccount === walletAddress) tokensIn += a;
-        if (t.fromUserAccount === walletAddress) tokensOut += a;
+      const flujo = flujoPropioDeWallet(tx, walletAddress, mint);
+      if (!(flujo.tokensIn > 0) && !(flujo.tokensOut > 0)) continue;
+
+      // Sólo cuentan las tx con pata de pago propia: una recepción de tokens
+      // (bundler/airdrop) sumaría tokens sin SOL y falsearía el múltiplo.
+      if (flujo.tokensIn > 0) {
+        let pagado = flujo.solPropio < 0 ? -flujo.solPropio : 0;
+        if (!(pagado > 0) && flujo.stableOut > 0 && solPrice) pagado = flujo.stableOut / solPrice;
+        if (pagado > 0) {
+          tokensIn += flujo.tokensIn;
+          solPagado += pagado;
+        }
       }
-      const mio = (tx.accountData || []).find((x) => x.account === walletAddress);
-      if (mio) {
-        const d = (Number(mio.nativeBalanceChange) || 0) / LAMPORTS_PER_SOL;
-        if (d > 0) solIn += d;
-        else solOut += -d;
+      if (flujo.tokensOut > 0) {
+        let cobrado = flujo.solPropio > 0 ? flujo.solPropio : 0;
+        if (!(cobrado > 0) && flujo.stableIn > 0 && solPrice) cobrado = flujo.stableIn / solPrice;
+        if (cobrado > 0) {
+          tokensOut += flujo.tokensOut;
+          solCobrado += cobrado;
+        }
       }
     }
+
     if (tokensIn <= 0 || tokensOut <= 0) {
       return { verificable: false, motivo: 'sin compras y ventas del token en las últimas 100 tx' };
     }
-    const precioCompra = solOut > 0 ? solOut / tokensIn : null;
-    const precioVenta = solIn > 0 ? solIn / tokensOut : null;
+    const precioCompra = solPagado > 0 ? solPagado / tokensIn : null;
+    const precioVenta = solCobrado > 0 ? solCobrado / tokensOut : null;
     if (precioCompra && precioVenta) {
       return { verificable: true, multiple: precioVenta / precioCompra };
     }
-    return { verificable: false, motivo: 'la wallet no mueve SOL (wallet tipo app)' };
+    return { verificable: false, motivo: 'la wallet no mueve SOL ni USDC propio (wallet tipo app)' };
   } catch (e) {
     return null;
   }
@@ -3504,6 +3659,53 @@ function calcularProceedsDesdeTradeReal(trade, position) {
     proceedsSol,
     precioUnitario,
     fuente: 'trade real de la wallet'
+  };
+}
+
+// ---------- Proceeds por PROPORCIÓN (venta ÷ compra de la wallet) ----------
+// El múltiplo de una copia tiene que ser el movimiento de precio de la wallet.
+// Calcularlo como `position.amount × precio_absoluto_de_venta` amplifica
+// cualquier error de `amount` (o de un precio absoluto fuera de rango) en una
+// ganancia ficticia: visto +52.4% donde la wallet salió en -6.7% y +218.9%
+// donde hizo +36.5%. Aquí todo se deriva de cost_basis × (precioVenta/precioCompra),
+// sin usar `amount`.
+const RATIO_SALIDA_MIN = parseFloat(process.env.RATIO_SALIDA_MIN || '0.02');
+const RATIO_SALIDA_MAX = parseFloat(process.env.RATIO_SALIDA_MAX || '30');
+
+function calcularProceedsPorProporcion(trade, position) {
+  if (!trade || !position) return null;
+  if (trade.solAmountEstimado === true) return null;
+  if (!(trade.solAmount > 0.005)) return null;
+  if (!(trade.tokenAmount > 0)) return null;
+
+  const precioVenta = trade.solAmount / trade.tokenAmount;
+  const precioCompra = Number(position.precio_compra_native);
+  const costBasis = Number(position.cost_basis_sol);
+
+  if (!Number.isFinite(precioVenta) || precioVenta <= 0) return null;
+  if (!Number.isFinite(precioCompra) || precioCompra <= 0) return null;
+  if (!Number.isFinite(costBasis) || costBasis <= 0) return null;
+
+  let ratio = precioVenta / precioCompra;
+  if (!Number.isFinite(ratio) || ratio <= 0) return null;
+
+  let clampado = false;
+  if (ratio < RATIO_SALIDA_MIN) {
+    ratio = RATIO_SALIDA_MIN;
+    clampado = true;
+  }
+  if (ratio > RATIO_SALIDA_MAX) {
+    ratio = RATIO_SALIDA_MAX;
+    clampado = true;
+  }
+
+  return {
+    proceedsSol: costBasis * ratio,
+    ratio,
+    precioVenta,
+    precioCompra,
+    clampado,
+    fuente: `proporción venta/compra de la wallet (${ratio.toFixed(2)}x)`
   };
 }
 
@@ -3904,17 +4106,31 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         }
       }
     } else {
-      // PAPER: prioridad al trade real
-      let proceedsSol;
-      let fuente;
-
+      // PAPER: la salida se valora con el MOVIMIENTO DE PRECIO de la wallet
+      // (precio de venta ÷ precio de compra). Así un `amount` corrupto no puede
+      // fabricar una ganancia: el múltiplo queda pegado al de la wallet.
+      const costBasis = Number(position.cost_basis_sol) || 0;
+      const porProporcion = calcularProceedsPorProporcion(trade, position);
       const desdeTrade = calcularProceedsDesdeTradeReal(trade, position);
-      if (desdeTrade) {
+
+      let proceedsSol = null;
+      let fuente = 'sin dato';
+      let valoracionDudosa = false;
+
+      if (porProporcion) {
+        proceedsSol = porProporcion.proceedsSol;
+        fuente = `${porProporcion.fuente}${porProporcion.clampado ? ' [tope aplicado]' : ''}`;
+      } else if (desdeTrade) {
         proceedsSol = desdeTrade.proceedsSol;
         fuente = `${desdeTrade.fuente} (${desdeTrade.precioUnitario.toExponential(4)} SOL/token)`;
-      } else {
+      }
+
+      // Sin precio propio de la wallet, o con un valor imposiblemente bajo
+      // (pata wSOL de la ruta): se intenta el mercado ANTES de cerrar. Con
+      // proporción de la wallet NO se rescata: un -90% real también da <25%.
+      if (!porProporcion && (proceedsSol === null || (costBasis > 0 && proceedsSol < costBasis * 0.25))) {
         const { decimals } = await getTokenInfoHelius(trade.mint);
-        const resultado = await estimarValorEnSol(
+        const mercado = await estimarValorEnSol(
           trade.mint,
           position.amount,
           decimals,
@@ -3922,30 +4138,30 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
           position.precio_compra_native,
           30
         );
-
-        if (resultado.valorSol !== null) {
-          proceedsSol = resultado.valorSol;
-          fuente = `DexScreener/Jupiter (dex: ${resultado.dexId || 'n/d'})`;
+        const mercadoUtil =
+          mercado.valorSol !== null &&
+          (!costBasis || (mercado.valorSol >= costBasis * 0.05 && mercado.valorSol <= costBasis * 50));
+        if (mercadoUtil) {
+          proceedsSol = mercado.valorSol;
+          fuente = `DexScreener/Jupiter (dex: ${mercado.dexId || 'n/d'}) [rescate de valoración]`;
+        } else if (costBasis > 0) {
+          proceedsSol = costBasis;
+          fuente = 'cost_basis (sin valoración fiable: PnL 0)';
+          valoracionDudosa = true;
         } else {
-          proceedsSol = position.cost_basis_sol;
-          fuente = 'cost_basis (fallback, PnL = 0)';
+          proceedsSol = 0;
+          fuente = 'sin dato ni coste (PnL 0)';
+          valoracionDudosa = true;
         }
       }
 
       log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
 
-      const costBasis = Number(position.cost_basis_sol) || 0;
       if (costBasis > 0 && proceedsSol > costBasis * 50) {
         log('warn', `⚠️ proceedsSol sospechoso para ${symbol}. Usando cost_basis.`);
         proceedsSol = costBasis;
       }
-      if (costBasis > 0 && proceedsSol < costBasis * 0.001) {
-        log('warn', `⚠️ proceedsSol sospechosamente bajo para ${symbol}. Usando cost_basis.`);
-        proceedsSol = costBasis;
-      }
-      if (costBasis > 0 && proceedsSol < 0) {
-        proceedsSol = 0;
-      }
+      if (proceedsSol < 0) proceedsSol = 0;
 
       let solPrice = await getSolPriceUSD();
       if (!solPrice) solPrice = 150;
@@ -3959,6 +4175,12 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
       const saldoSeguro = Number.isFinite(nuevoSaldo) ? nuevoSaldo : INITIAL_PAPER_BALANCE;
 
       let msg = `🧪 PAPER: ${NOMBRE_BOT} vendió 100% ${symbol} (copiando a ${tracked.alias}) · Salí con (neto de fees): ${r.proceedsNetoSol.toFixed(4)} SOL (~$${proceedsUsd.toFixed(2)}) · costo: ${Number(position.cost_basis_sol).toFixed(4)} SOL · ${formatearResultado(r)} · Saldo ficticio: $${saldoSeguro.toFixed(2)}`;
+      if (valoracionDudosa) {
+        msg += `\n⚠️ Valuación no fiable (la wallet no deja pata de pago y no hay par válido): se cierra a costo, PnL 0.`;
+      }
+      if (proceedsSol > 0 && r.proceedsNetoSol === 0) {
+        msg += `\n⚠️ El valor de salida (${proceedsSol.toFixed(6)} SOL) no cubre las fees de venta: se reporta -100%.`;
+      }
       if (r.profitSol > 0) {
         msg += `\n💵 (simulado) ${r.profitSol.toFixed(4)} SOL de ganancia se convertirían a USDC`;
       }
