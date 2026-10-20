@@ -37,8 +37,9 @@ const fns = new Function(
   'log',
   'PublicKey',
   'process',
+  'contarRpc',
   `${bloque}; return { getBalanceDeTokenEnWallet, esErrorDeLimiteRpc, __setCooldown: (ms) => { rpcCooldownHasta = ms; }, __cache: balancesCache };`
-)(connection, log, PublicKey, { env: {} });
+)(connection, log, PublicKey, { env: {} }, () => {});
 
 let fallos = 0;
 function check(nombre, cond, detalle) {

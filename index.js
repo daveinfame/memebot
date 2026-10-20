@@ -697,6 +697,33 @@ function normalizarDexIdParaDexScreener(origen) {
 // ===== FIN BLOQUE 1 =====
 
 // ---------- Cache de info de token ----------
+// ---------- Contador de llamadas RPC (créditos de Helius) ----------
+// No evita el gasto: lo hace visible. Cuenta cada llamada real al RPC/DAS por
+// tipo; el heartbeat imprime el resumen del último minuto y el total del día,
+// para medir el consumo real cuando vuelvan los créditos.
+const rpcContador = { minuto: {}, dia: {}, totalDia: 0, fecha: '' };
+
+function contarRpc(tipo) {
+  const hoy = new Date().toISOString().slice(0, 10);
+  if (hoy !== rpcContador.fecha) {
+    rpcContador.fecha = hoy;
+    rpcContador.dia = {};
+    rpcContador.totalDia = 0;
+  }
+  rpcContador.minuto[tipo] = (rpcContador.minuto[tipo] || 0) + 1;
+  rpcContador.dia[tipo] = (rpcContador.dia[tipo] || 0) + 1;
+  rpcContador.totalDia++;
+}
+
+function resumenRpcDelMinuto() {
+  const partes = Object.entries(rpcContador.minuto);
+  const total = partes.reduce((a, [, v]) => a + v, 0);
+  rpcContador.minuto = {};
+  if (!total) return null;
+  const detalle = partes.map(([k, v]) => `${k} ${v}`).join(', ');
+  return `📈 RPC: ${total} llamada(s) en el último minuto (${detalle}) · hoy ${rpcContador.totalDia}`;
+}
+
 async function getTokenInfoHelius(mint) {
   const cached = cacheTokenInfo.get(mint);
   if (cached) return cached;
@@ -706,6 +733,7 @@ async function getTokenInfoHelius(mint) {
 
   try {
     if (process.env.HELIUS_RPC_URL) {
+      contarRpc('tokenInfo');
       const res = await fetch(process.env.HELIUS_RPC_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -807,6 +835,7 @@ async function getBalanceDeTokenEnWallet(walletAddress, mint) {
 
   const promesa = (async () => {
     try {
+      contarRpc('balance');
       const owner = new PublicKey(walletAddress);
       const mintKey = new PublicKey(mint);
       const cuentas = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintKey });
@@ -844,6 +873,7 @@ async function getBalanceDeTokenEnWallet(walletAddress, mint) {
 // ---------- Balance SOL ----------
 async function getWalletSolBalance() {
   if (!connection || !walletKeypair) return 0;
+  contarRpc('saldoSol');
   const lamports = await connection.getBalance(walletKeypair.publicKey);
   return lamports / LAMPORTS_PER_SOL;
 }
@@ -3226,8 +3256,12 @@ async function buscarUltimoTradeReal(walletAlias, mint, minutosAtras = 30) {
 //   3. cost_basis (PnL = 0)
 async function calcularProceedsParaReconciliacion(pos) {
   const costBasis = Number(pos.cost_basis_sol) || 0;
+  const precioCompra = Number(pos.precio_compra_native) || 0;
 
-  // 1. DexScreener con filtro 3x
+  // El múltiplo se calcula por PRECIO (mercado ÷ compra) aplicado al costo, no
+  // como amount × precio. Antes se colapsaba a cost_basis cuando salía >3x o
+  // <0.33x: un 5x real se reportaba como 0% y un -70% también como 0%, y además
+  // cualquier `amount` corrupto inflaba el resultado.
   try {
     const { decimals } = await getTokenInfoHelius(pos.token_mint);
     const resultado = await estimarValorEnSol(
@@ -3235,8 +3269,8 @@ async function calcularProceedsParaReconciliacion(pos) {
       pos.amount,
       decimals,
       pos.origen_dex,
-      pos.precio_compra_native,
-      3  // ← filtro 3x en reconciliación (más estricto)
+      precioCompra > 0 ? precioCompra : null,
+      30
     );
 
     if (resultado.error === 'NOT_TRADABLE') {
@@ -3244,26 +3278,47 @@ async function calcularProceedsParaReconciliacion(pos) {
       return { proceedsSol: costBasis, fuente: 'cost_basis (no tradable)' };
     }
 
-    if (resultado.valorSol !== null && resultado.valorSol > 0) {
+    const precioMercado = Number(resultado.precioSolUnitario) || 0;
+
+    // 1) Con ancla de compra: múltiplo = precio mercado ÷ precio compra.
+    if (precioMercado > 0 && precioCompra > 0 && costBasis > 0) {
+      let ratio = precioMercado / precioCompra;
+      let clampado = false;
+      if (ratio < RATIO_SALIDA_MIN) {
+        ratio = RATIO_SALIDA_MIN;
+        clampado = true;
+      }
+      if (ratio > RATIO_SALIDA_MAX) {
+        ratio = RATIO_SALIDA_MAX;
+        clampado = true;
+      }
+      return {
+        proceedsSol: costBasis * ratio,
+        fuente: `mercado vs compra (${ratio.toFixed(2)}x${clampado ? ' [tope]' : ''}, dex: ${resultado.dexId || 'n/d'})`
+      };
+    }
+
+    // 2) Sin ancla: valor absoluto, con cordura amplia contra el costo.
+    if (resultado.valorSol !== null && resultado.valorSol > 0 && costBasis > 0) {
       let proceeds = resultado.valorSol;
-
-      // Validaciones 3x / 0.33x
-      if (costBasis > 0 && proceeds > costBasis * 3) {
-        log('warn', `⚠️ Reconciliación ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL > 3x cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
-        proceeds = costBasis;
+      let clampado = false;
+      if (proceeds > costBasis * RATIO_SALIDA_MAX) {
+        proceeds = costBasis * RATIO_SALIDA_MAX;
+        clampado = true;
       }
-      if (costBasis > 0 && proceeds < costBasis * 0.33) {
-        log('warn', `⚠️ Reconciliación ${pos.symbol}: proceeds ${proceeds.toFixed(6)} SOL < 0.33x cost_basis ${costBasis.toFixed(4)}. Usando cost_basis.`);
-        proceeds = costBasis;
+      if (proceeds < costBasis * RATIO_SALIDA_MIN) {
+        proceeds = costBasis * RATIO_SALIDA_MIN;
+        clampado = true;
       }
-
-      return { proceedsSol: proceeds, fuente: `DexScreener (dex: ${resultado.dexId || 'n/d'})` };
+      return {
+        proceedsSol: proceeds,
+        fuente: `mercado absoluto${clampado ? ' [tope]' : ''} (dex: ${resultado.dexId || 'n/d'})`
+      };
     }
   } catch (e) {
     log('warn', `🔍 Reconciliación ${pos.symbol}: error en estimarValorEnSol: ${e.message}`);
   }
 
-  // 2. Fallback: cost_basis
   log('warn', `🔍 Reconciliación ${pos.symbol}: sin cotización válida, usando cost_basis (PnL = 0).`);
   return { proceedsSol: costBasis, fuente: 'cost_basis (fallback)' };
 }
@@ -5629,6 +5684,8 @@ setInterval(() => {
     setInterval(() => {
       const marca = new Date().toISOString();
       log('info', `💓 Heartbeat modo=${MODO_ACTUAL} WS=${ws ? ws.readyState : 'null'}`);
+      const rpcResumen = resumenRpcDelMinuto();
+      if (rpcResumen) log('info', rpcResumen);
     }, 300_000)
   );
 
