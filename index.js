@@ -308,6 +308,15 @@ const ALLOWED_WITHDRAW_ADDRESSES = new Set(
 );
 const MAX_DAILY_SPEND_SOL = parseFloat(process.env.MAX_DAILY_SPEND_SOL || '0.5');
 const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || '0.1');
+// --- Umbrales de la valoración por DexScreener ---
+// El bot copia memecoins de curva de bonding con mcap de ~3k y sin campo
+// `liquidity`, así que el piso de mcap debe ser coherente con eso. El candado
+// que realmente protege es el ratio contra el precio de compra (0.03x-30x)
+// más el tope de 10 SOL/token, no el mcap.
+//   MIN_LIQ_USD = 0 → no se exige liquidez (curvas de bonding no la publican).
+const MIN_MCAP_USD = parseFloat(process.env.MIN_MCAP_USD || '1000');
+const MAX_MCAP_USD = parseFloat(process.env.MAX_MCAP_USD || '500000000');
+const MIN_LIQ_USD = parseFloat(process.env.MIN_LIQ_USD || '0');
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 const TOKEN_PROGRAMS = new Set([
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token
@@ -2560,11 +2569,19 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       const price = parseFloat(p.priceNative);
       if (!Number.isFinite(price) || price <= 0) return false;
 
-      const liq = p.liquidity?.usd;
-      if (!liq || liq < 5000) return false;
+      // Liquidez: solo se exige si MIN_LIQ_USD > 0. Las curvas de bonding
+      // (dexId 'pumpfun') no publican el campo `liquidity` y aun así tienen
+      // un precio real: exigirlo descartaba tokens que el bot sí copia.
+      if (MIN_LIQ_USD > 0) {
+        const liq = p.liquidity?.usd;
+        if (!liq || liq < MIN_LIQ_USD) return false;
+      }
 
+      // El piso de mcap debe ser coherente con lo que se copia: los memecoins
+      // de curva de bonding arrancan en ~3k. El candado que de verdad protege
+      // es el ratio contra el precio de compra (abajo) + el tope de 10 SOL.
       const mcap = p.marketCap || p.fdv;
-      if (!mcap || mcap < 10000 || mcap > 500000000) return false;
+      if (!mcap || mcap < MIN_MCAP_USD || mcap > MAX_MCAP_USD) return false;
 
       if (price > 10) return false; // memecoins < 1 SOL; acciones tokenizadas ~2 SOL/token
 
@@ -2613,14 +2630,18 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       }
     }
 
-    const pair = candidatos.sort((a, b) => (b.liquidity.usd || 0) - (a.liquidity.usd || 0))[0];
+    const pair = candidatos.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
 
     const precioNative = parseFloat(pair.priceNative);
     const valorSol = cantidadTokens * precioNative;
+    // Los pares de curva de bonding no traen `liquidity`: no se puede imprimir
+    // 'undefined' ni reventar el log con un TypeError.
+    const liqPar = pair.liquidity?.usd;
+    const esCurva = liqPar == null;
 
     log(
       'info',
-      `📊 DexScreener: precio ${precioNative.toExponential(4)} SOL/token · posición ${cantidadTokens.toFixed(4)} tokens → ${valorSol.toFixed(6)} SOL (dex: ${pair.dexId}, liq: $${pair.liquidity.usd}, mcap: $${pair.marketCap || 'n/d'})`
+      `📊 DexScreener: precio ${precioNative.toExponential(4)} SOL/token · posición ${cantidadTokens.toFixed(4)} tokens → ${valorSol.toFixed(6)} SOL (dex: ${pair.dexId}, liq: ${esCurva ? 'curva/sin dato' : '$' + liqPar}, mcap: $${pair.marketCap || pair.fdv || 'n/d'})${esCurva ? ' [curva]' : ''}`
     );
 
     return {
@@ -2628,6 +2649,7 @@ async function cotizarViaDexScreener(mint, cantidadTokens, dexIdPreferido = null
       precioSolUnitario: precioNative,
       dexId: pair.dexId || null,
       pairAddress: pair.pairAddress || null,
+      curva: esCurva,
       error: null
     };
   } catch (e) {
@@ -3380,7 +3402,23 @@ async function revisarStopLoss() {
 
       if (resultado.error === 'NOT_TRADABLE') {
         if (LIVE) {
-          await ejecutarStopLossNoTradable(pos);
+          // Fail-closed: sin precio no se puede saber si tocó el umbral, y
+          // vender "a ciegas" puede realizar una pérdida enorme o malvender
+          // una posición ganadora. Se avisa y se deja la decisión a /close.
+          log(
+            'warn',
+            `⛔ ${pos.symbol}: sin precio confiable (NOT_TRADABLE) — NO se vende a ciegas. Usa /close o espera la venta de la wallet.`
+          );
+          if (CHAT_ID) {
+            bot
+              .sendMessage(
+                CHAT_ID,
+                `⛔ STOP-LOSS BLOQUEADO [${pos.wallet_alias}] ${pos.symbol}\n` +
+                  `No hay precio confiable (sin ruta en Jupiter y sin par válido en DexScreener).\n` +
+                  `No se vende a ciegas: si quieres salir, usa /close ${pos.wallet_alias} ${pos.token_mint}`
+              )
+              .catch(() => {});
+          }
         } else {
           log(
             'info',
