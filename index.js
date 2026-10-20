@@ -5487,8 +5487,15 @@ bot.onText(/\/logs(?:\s+(\d+))?/, async (msg, match) => {
   const texto = seleccion.join(NL);
   const trozos = [];
   for (let i = 0; i < texto.length; i += 3500) trozos.push(texto.slice(i, i + 3500));
+  // Texto PLANO a propósito: los logs traen `_`, `*`, `[`, backticks y demás
+  // que rompen el parser de Markdown, y Telegram rechazaba el mensaje entero
+  // (síntoma: /logs no contestaba nada mientras el resto de comandos sí).
   for (const t of trozos.slice(-3)) {
-    await bot.sendMessage(chat, '```' + NL + t + NL + '```', { parse_mode: 'Markdown' });
+    try {
+      await bot.sendMessage(chat, t);
+    } catch (e) {
+      log('warn', `No se pudo enviar un bloque de /logs: ${e.message}`);
+    }
   }
 });
 
