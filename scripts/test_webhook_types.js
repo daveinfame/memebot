@@ -20,10 +20,12 @@ function check(nombre, cond, extra = '') {
 }
 
 check('el default es SWAP', /process\.env\.HELIUS_WEBHOOK_TYPES \|\| 'SWAP'/.test(src));
-check('ya no se registra ANY', !/transactionTypes: \['ANY'\]/.test(src));
+const anyCount = (src.match(/transactionTypes: \['ANY'\]/g) || []).length;
+check('ANY solo aparece en el fallback', anyCount === 1 && /Reintentando con ANY/.test(src), `ocurrencias: ${anyCount}`);
 check('el payload usa la lista calculada', /transactionTypes: tiposWebhook,/.test(src));
 check('se normaliza y limpia la lista', /\.map\(\(t\) => t\.trim\(\)\.toUpperCase\(\)\)/.test(src) && /\.filter\(Boolean\)/.test(src));
 check('protege la lista vacía (vacío = todos en Helius)', /tiposWebhook\.length === 0\) tiposWebhook\.push\('SWAP'\)/.test(src));
+check('si Helius rechaza el filtro, reintenta con ANY', /transactionTypes: \['ANY'\] \}\)/.test(src) && /Webhook creado con ANY \(fallback\)/.test(src));
 
 // Simulación de la normalización tal como está en el código
 const parsear = (v) => {

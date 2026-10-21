@@ -1822,13 +1822,36 @@ async function crearOActualizarWebhookHelius() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) {
-        throw new Error(`Error creando webhook de Helius: ${res.status} ${await res.text()}`);
+      if (res.ok) {
+        const data = await res.json();
+        await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]);
+        webhookIdExistente = data.webhookID;
+        log('info', `🌐 Webhook (${tiposWebhook.join(',')}) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
+      } else {
+        // Si Helius rechaza el filtro (tipo no soportado, formato, etc.) NO nos
+        // quedamos sin webhook: se reintenta con ANY, que siempre acepta. Perder
+        // el webhook dejaría al bot ciego y eso es peor que gastar más créditos.
+        const detalle = await res.text();
+        log(
+          'warn',
+          `⚠️ Webhook con tipos ${tiposWebhook.join(',')} rechazado (${res.status}): ${String(detalle).slice(0, 160)}. Reintentando con ANY.`
+        );
+        const res2 = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...payload, transactionTypes: ['ANY'] })
+        });
+        if (!res2.ok) {
+          throw new Error(`Error creando webhook de Helius: ${res2.status} ${await res2.text()}`);
+        }
+        const data2 = await res2.json();
+        await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data2.webhookID]);
+        webhookIdExistente = data2.webhookID;
+        log(
+          'warn',
+          `🌐 Webhook creado con ANY (fallback): ${direcciones.length} wallets, id=${data2.webhookID} — el consumo de créditos será mayor`
+        );
       }
-      const data = await res.json();
-      await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [data.webhookID]);
-      webhookIdExistente = data.webhookID;
-      log('info', `🌐 Webhook (ANY) creado: ${direcciones.length} wallets, id=${data.webhookID}`);
     }
 
     if (webhookIdExistente) {
