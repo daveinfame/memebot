@@ -19,12 +19,12 @@ function check(nombre, cond, extra = '') {
   }
 }
 
-check('el default es SWAP', /process\.env\.HELIUS_WEBHOOK_TYPES \|\| 'SWAP'/.test(src));
+check('el default es ANY (pump.fun se clasifica mal)', /process\.env\.HELIUS_WEBHOOK_TYPES \|\| 'ANY'/.test(src) && /clasifica mal/.test(src));
 const anyCount = (src.match(/transactionTypes: \['ANY'\]/g) || []).length;
 check('ANY solo aparece en el fallback', anyCount === 1 && /Reintentando con ANY/.test(src), `ocurrencias: ${anyCount}`);
 check('el payload usa la lista calculada', /transactionTypes: tiposWebhook,/.test(src));
 check('se normaliza y limpia la lista', /\.map\(\(t\) => t\.trim\(\)\.toUpperCase\(\)\)/.test(src) && /\.filter\(Boolean\)/.test(src));
-check('protege la lista vacía (vacío = todos en Helius)', /tiposWebhook\.length === 0\) tiposWebhook\.push\('SWAP'\)/.test(src));
+check('protege la lista vacía (vacío = todos en Helius)', /tiposWebhook\.length === 0\) tiposWebhook\.push\('ANY'\)/.test(src));
 check('si Helius rechaza el filtro, reintenta con ANY', /transactionTypes: \['ANY'\] \}\)/.test(src) && /Webhook creado con ANY \(fallback\)/.test(src));
 check('deduplica webhooks de la misma URL', /mismos\.length > 1/.test(src) && /Webhook duplicado/.test(src));
 check('borra los duplicados (DELETE)', /method: 'DELETE'/.test(src));
@@ -33,17 +33,17 @@ check('solo el 404 justifica crear uno nuevo', /res\.status === 404/.test(src) &
 
 // Simulación de la normalización tal como está en el código
 const parsear = (v) => {
-  const lista = (v || 'SWAP')
+  const lista = (v || 'ANY')
     .split(',')
     .map((t) => t.trim().toUpperCase())
     .filter(Boolean);
-  if (lista.length === 0) lista.push('SWAP');
+  if (lista.length === 0) lista.push('ANY');
   return lista;
 };
 
-check('sin variable → [SWAP]', JSON.stringify(parsear('')) === '["SWAP"]', JSON.stringify(parsear('')));
+check('sin variable → [ANY]', JSON.stringify(parsear('')) === '["ANY"]', JSON.stringify(parsear('')));
 check('"swap, transfer" → [SWAP,TRANSFER]', JSON.stringify(parsear('swap, transfer')) === '["SWAP","TRANSFER"]', JSON.stringify(parsear('swap, transfer')));
-check('solo comas → [SWAP] no lista vacía', JSON.stringify(parsear(', ,')) === '["SWAP"]', JSON.stringify(parsear(', ,')));
+check('solo comas → [ANY] no lista vacía', JSON.stringify(parsear(', ,')) === '["ANY"]', JSON.stringify(parsear(', ,')));
 
 console.log(`\n${fail === 0 ? 'TODO OK' : 'FALLARON'} (${ok} bien, ${fail} mal)`);
 process.exit(fail === 0 ? 0 : 1);

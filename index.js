@@ -1824,17 +1824,21 @@ async function crearOActualizarWebhookHelius() {
       log('warn', `No se pudieron revisar webhooks duplicados: ${e.message}`);
     }
 
-    // Créditos de Helius: cada evento entregado cuesta 1 crédito, y 'ANY'
-    // entrega TODO (incluidas las transferencias que desde el fix de copias
-    // ya no se usan). Con 'SWAP' baja mucho el consumo sin perder nada.
-    // Configurable por HELIUS_WEBHOOK_TYPES (ej. 'SWAP,TRANSFER').
-    const tiposWebhook = (process.env.HELIUS_WEBHOOK_TYPES || 'SWAP')
+    // Créditos de Helius: cada evento entregado cuesta 1 crédito.
+    // OJO: el default es ANY a propósito. Helius clasifica mal una parte de los
+    // swaps de pump.fun (llegan como UNKNOWN u otro tipo), así que filtrar a
+    // SWAP hizo que el bot NO se enterara de operaciones reales — ese bug ya
+    // nos costó copias perdidas. El ahorro grande viene de tener UN solo
+    // webhook (ver dedupe abajo), no de estrechar el filtro.
+    // Si algún día se quiere experimentar: HELIUS_WEBHOOK_TYPES=SWAP,UNKNOWN
+    // y vigilar que sigan entrando 'TX recibida' en el log.
+    const tiposWebhook = (process.env.HELIUS_WEBHOOK_TYPES || 'ANY')
       .split(',')
       .map((t) => t.trim().toUpperCase())
       .filter(Boolean);
     // Ojo: transactionTypes: [] en Helius significa "todos los tipos", así que
     // una variable mal escrita no debe dejar la lista vacía.
-    if (tiposWebhook.length === 0) tiposWebhook.push('SWAP');
+    if (tiposWebhook.length === 0) tiposWebhook.push('ANY');
     const payload = {
       webhookURL: HELIUS_WEBHOOK_URL,
       transactionTypes: tiposWebhook,
