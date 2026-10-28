@@ -26,6 +26,10 @@ check('el payload usa la lista calculada', /transactionTypes: tiposWebhook,/.tes
 check('se normaliza y limpia la lista', /\.map\(\(t\) => t\.trim\(\)\.toUpperCase\(\)\)/.test(src) && /\.filter\(Boolean\)/.test(src));
 check('protege la lista vacía (vacío = todos en Helius)', /tiposWebhook\.length === 0\) tiposWebhook\.push\('SWAP'\)/.test(src));
 check('si Helius rechaza el filtro, reintenta con ANY', /transactionTypes: \['ANY'\] \}\)/.test(src) && /Webhook creado con ANY \(fallback\)/.test(src));
+check('deduplica webhooks de la misma URL', /mismos\.length > 1/.test(src) && /Webhook duplicado/.test(src));
+check('borra los duplicados (DELETE)', /method: 'DELETE'/.test(src));
+check('un PUT fallido NO crea otro webhook', /if \(!exito && hayWebhookVivo\)/.test(src) && /No se crea otro/.test(src));
+check('solo el 404 justifica crear uno nuevo', /res\.status === 404/.test(src) && /ya no existe \(404\)/.test(src));
 
 // Simulación de la normalización tal como está en el código
 const parsear = (v) => {

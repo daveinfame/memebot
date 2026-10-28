@@ -1773,6 +1773,56 @@ async function crearOActualizarWebhookHelius() {
     await pool.query('INSERT INTO global_balance (id) VALUES (1) ON CONFLICT (id) DO NOTHING');
     const { rows: gb } = await pool.query('SELECT helius_webhook_id FROM global_balance WHERE id=1');
     let webhookIdExistente = gb[0]?.helius_webhook_id;
+    // ¿Ya existe un webhook vivo apuntando a nuestra URL? Si sí, un fallo al
+    // actualizarlo NO debe crear otro: eso es lo que llenó la cuenta de
+    // duplicados y multiplicó el gasto por 4.
+    let hayWebhookVivo = false;
+
+    // Deduplicar: cada webhook activo cobra 1 crédito por evento, así que dos
+    // webhooks apuntando a la misma URL duplican el gasto (visto en producción:
+    // 4 activos con 'ANY' → el ciclo se agotó en 20 días). Se conserva uno y se
+    // borran los demás; cuesta 100 créditos por borrado, pero ahorra miles.
+    try {
+      const resLista = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`);
+      if (resLista.ok) {
+        const crudo = await resLista.json();
+        const lista = Array.isArray(crudo) ? crudo : Array.isArray(crudo?.data) ? crudo.data : [];
+        const mismos = lista.filter(
+          (w) => String(w.webhookURL || '').trim() === String(HELIUS_WEBHOOK_URL).trim()
+        );
+        hayWebhookVivo = mismos.length > 0;
+        if (mismos.length > 0) {
+          const conservar =
+            mismos.find((w) => w.webhookID === webhookIdExistente) || mismos[0];
+          if (mismos.length > 1) {
+            log('warn', `🧹 Hay ${mismos.length} webhooks apuntando a esta URL: se conserva ${conservar.webhookID} y se borran los demás`);
+            for (const w of mismos) {
+              if (w.webhookID === conservar.webhookID) continue;
+              try {
+                const del = await fetch(
+                  `https://api.helius.xyz/v0/webhooks/${w.webhookID}?api-key=${apiKey}`,
+                  { method: 'DELETE' }
+                );
+                log(
+                  del.ok ? 'warn' : 'error',
+                  `🧹 Webhook duplicado ${w.webhookID}: ${del.ok ? 'borrado' : 'no se pudo borrar (' + del.status + ')'}`
+                );
+              } catch (e) {
+                log('warn', `🧹 No se pudo borrar el duplicado ${w.webhookID}: ${e.message}`);
+              }
+            }
+          }
+          if (webhookIdExistente !== conservar.webhookID) {
+            webhookIdExistente = conservar.webhookID;
+            await pool.query('UPDATE global_balance SET helius_webhook_id=$1 WHERE id=1', [
+              conservar.webhookID
+            ]);
+          }
+        }
+      }
+    } catch (e) {
+      log('warn', `No se pudieron revisar webhooks duplicados: ${e.message}`);
+    }
 
     // Créditos de Helius: cada evento entregado cuesta 1 crédito, y 'ANY'
     // entrega TODO (incluidas las transferencias que desde el fix de copias
@@ -1808,15 +1858,29 @@ async function crearOActualizarWebhookHelius() {
         if (res.ok) {
           log('info', `🌐 Webhook (${tiposWebhook.join(',')}) actualizado: ${direcciones.length} wallets (${aliases.join(', ')})`);
           exito = true;
+        } else if (res.status === 404) {
+          // El id de la BD ya no existe en Helius: este caso SÍ justifica crear
+          // uno nuevo. Cualquier otro error (402/429/500/red) no.
+          log('warn', `⚠️ Webhook ${webhookIdExistente} ya no existe (404); se creará uno nuevo`);
+          hayWebhookVivo = false;
+          webhookIdExistente = null;
         } else {
-          log('warn', `⚠️ No se pudo actualizar webhook ${webhookIdExistente} (${res.status}), se creará uno nuevo`);
+          log(
+            'warn',
+            `⚠️ No se pudo actualizar el webhook ${webhookIdExistente} (${res.status}). Se conserva el existente y se reintenta en el próximo arranque (crear otro duplicaría el gasto).`
+          );
         }
       } catch (err) {
         log('warn', `⚠️ Error haciendo PUT a webhook existente: ${err.message}`);
       }
     }
 
-    if (!exito) {
+    if (!exito && hayWebhookVivo) {
+      log(
+        'info',
+        `🌐 Se conserva el webhook vivo ${webhookIdExistente}: el PUT falló pero el webhook sigue entregando eventos. No se crea otro.`
+      );
+    } else if (!exito) {
       const res = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
