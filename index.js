@@ -1777,6 +1777,10 @@ async function crearOActualizarWebhookHelius() {
     // actualizarlo NO debe crear otro: eso es lo que llenó la cuenta de
     // duplicados y multiplicó el gasto por 4.
     let hayWebhookVivo = false;
+    // ¿Se pudo LEER la lista de webhooks? Si la lectura falla (402/429/red) el
+    // bot NO debe crear nada: sin saber qué existe, crear solo engendra
+    // duplicados y cada duplicado vuelve a cobrar por evento.
+    let listaConsultada = false;
 
     // Deduplicar: cada webhook activo cobra 1 crédito por evento, así que dos
     // webhooks apuntando a la misma URL duplican el gasto (visto en producción:
@@ -1785,6 +1789,7 @@ async function crearOActualizarWebhookHelius() {
     try {
       const resLista = await fetch(`https://api.helius.xyz/v0/webhooks?api-key=${apiKey}`);
       if (resLista.ok) {
+        listaConsultada = true;
         const crudo = await resLista.json();
         const lista = Array.isArray(crudo) ? crudo : Array.isArray(crudo?.data) ? crudo.data : [];
         const mismos = lista.filter(
@@ -1879,7 +1884,12 @@ async function crearOActualizarWebhookHelius() {
       }
     }
 
-    if (!exito && hayWebhookVivo) {
+    if (!exito && !listaConsultada) {
+      log(
+        'warn',
+        `⚠️ No se pudo leer la lista de webhooks de Helius: NO se crea ninguno para no duplicar. Se reintenta en el próximo arranque.`
+      );
+    } else if (!exito && hayWebhookVivo) {
       log(
         'info',
         `🌐 Se conserva el webhook vivo ${webhookIdExistente}: el PUT falló pero el webhook sigue entregando eventos. No se crea otro.`

@@ -30,6 +30,7 @@ check('deduplica webhooks de la misma URL', /mismos\.length > 1/.test(src) && /W
 check('borra los duplicados (DELETE)', /method: 'DELETE'/.test(src));
 check('un PUT fallido NO crea otro webhook', /if \(!exito && hayWebhookVivo\)/.test(src) && /No se crea otro/.test(src));
 check('solo el 404 justifica crear uno nuevo', /res\.status === 404/.test(src) && /ya no existe \(404\)/.test(src));
+check('sin poder leer la lista NO crea webhook', /let listaConsultada = false/.test(src) && /NO se crea ninguno para no duplicar/.test(src));
 
 // Simulación de la normalización tal como está en el código
 const parsear = (v) => {
