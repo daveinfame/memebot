@@ -266,7 +266,7 @@ try {
     fuenteClaveWallet = `archivo ${rutaClave}`;
   } else if (process.env.WALLET_PRIVATE_KEY) {
     claveCruda = String(process.env.WALLET_PRIVATE_KEY).trim();
-    fuenteClaveWallet = 'variable de entorno WALLET_PRIVATE_KEY (visible en el panel de Railway)';
+    fuenteClaveWallet = 'variable de entorno WALLET_PRIVATE_KEY (sellada: no se muestra en el panel)';
   }
   if (claveCruda) {
     walletKeypair = Keypair.fromSecretKey(bs58.decode(claveCruda));
@@ -3454,6 +3454,9 @@ async function reclamarPosicionParaCierre(mint, alias, symbol = '') {
   }
   return true;
 }
+// Evita llenar el buffer de /logs con '0 posiciones' cada 20 segundos.
+let ultimoAvisoSinPosiciones = 0;
+
 async function reconciliarPosiciones(forzado = false) {
   const marca = new Date().toISOString();
   if (!connection) {
@@ -3470,10 +3473,16 @@ async function reconciliarPosiciones(forzado = false) {
     );
 
     if (posiciones.length === 0) {
-      log(
-        'info',
+      // Sin posiciones no hay nada que revisar: loguearlo cada 20 s llenaba
+      // el buffer de /logs y tapaba lo importante. Se avisa cada 10 min o
+      // cuando el ciclo es forzado (reconciliacion manual).
+      if (forzado || Date.now() - ultimoAvisoSinPosiciones > 10 * 60 * 1000) {
+        ultimoAvisoSinPosiciones = Date.now();
+        log(
+          'info',
         `🔍 [${marca}] Reconciliación${forzado ? ' (manual)' : ''}: 0 posiciones abiertas en modo ${MODO_ACTUAL.toUpperCase()}, nada que revisar.`
-      );
+        );
+      }
       return;
     }
 
