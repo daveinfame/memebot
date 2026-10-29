@@ -3687,14 +3687,44 @@ async function revisarStopLoss() {
         'info',
         `🛑 STOP-LOSS activado: ${pos.wallet_alias} ${pos.symbol} · valor actual ${resultado.valorSol.toFixed(6)} SOL vs costo ${pos.cost_basis_sol.toFixed(4)} SOL (${(ratio * 100).toFixed(1)}%)`
       );
-      await ejecutarStopLoss(pos, resultado.valorSol);
+      await ejecutarStopLoss(pos, resultado);
     });
   } catch (e) {
     log('error', `Error revisando stop-loss: ${e.message}`);
   }
 }
 
-async function ejecutarStopLoss(pos, valorEstimadoSol) {
+// El cierre por stop-loss en PAPER se valora por PRECIO (mercado / compra)
+// aplicado al costo, no con amount x precio: un `amount` corrupto descuadraba
+// el PnL del SL (podia reportar -80% cuando fue -50%, o al reves).
+function proceedsStopLossPaper(pos, resultado) {
+  const costBasis = Number(pos.cost_basis_sol) || 0;
+  const precioCompra = Number(pos.precio_compra_native) || 0;
+  const precioMercado = Number(resultado && resultado.precioSolUnitario) || 0;
+
+  if (costBasis > 0 && precioCompra > 0 && precioMercado > 0) {
+    let ratio = precioMercado / precioCompra;
+    let clampado = false;
+    if (ratio < RATIO_SALIDA_MIN) {
+      ratio = RATIO_SALIDA_MIN;
+      clampado = true;
+    }
+    if (ratio > RATIO_SALIDA_MAX) {
+      ratio = RATIO_SALIDA_MAX;
+      clampado = true;
+    }
+    return {
+      proceedsSol: costBasis * ratio,
+      fuente: 'mercado vs compra (' + ratio.toFixed(2) + 'x' + (clampado ? ' [tope]' : '') + ')'
+    };
+  }
+
+  // Sin ancla de compra: valor absoluto, marcado como tal.
+  const absoluto = Number(resultado && resultado.valorSol) || 0;
+  return { proceedsSol: absoluto, fuente: 'mercado absoluto (sin ancla de compra)' };
+}
+
+async function ejecutarStopLoss(pos, resultado) {
   if (LIVE && pos.chain === 'solana' && walletKeypair && connection) {
     try {
       const before = await getWalletSolBalance();
@@ -3752,8 +3782,10 @@ async function ejecutarStopLoss(pos, valorEstimadoSol) {
       }
     }
   } else {
+    const { proceedsSol, fuente } = proceedsStopLossPaper(pos, resultado);
+    log('info', `PAPER stop-loss ${pos.symbol}: proceeds ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
     const solPrice = await getSolPriceUSD();
-    const r = calcularResultado(pos.cost_basis_sol, valorEstimadoSol, solPrice, true);
+    const r = calcularResultado(pos.cost_basis_sol, proceedsSol, solPrice, true);
     const proceedsUsd = solPrice ? r.proceedsNetoSol * solPrice : 0;
 
     if (!(await reclamarPosicionParaCierre(pos.token_mint, pos.wallet_alias, pos.symbol))) return;
