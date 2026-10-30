@@ -4485,7 +4485,10 @@ async function handleTrackedSell(tracked, trade, origen = 'PumpPortal', horaDete
         }
       }
 
-      log('info', `🧪 PAPER proceeds para ${symbol}: ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`);
+      log(
+      'info',
+      `🧪 PAPER proceeds para ${symbol} (${trade.mint.slice(0, 6)}…): ${proceedsSol.toFixed(6)} SOL (fuente: ${fuente})`
+    );
 
       if (costBasis > 0 && proceedsSol > costBasis * 50) {
         log('warn', `⚠️ proceedsSol sospechoso para ${symbol}. Usando cost_basis.`);
@@ -5756,8 +5759,9 @@ bot.onText(/\/logs(?:\s+(\d+))?/, async (msg, match) => {
   }
 });
 
-bot.onText(/\/resetpaper/, async (msg) => {
+bot.onText(/\/resetpaper(?:\s+(\w+))?/, async (msg, match) => {
   if (!esAdmin(msg)) return;
+  const incluirSweep = String((match && match[1]) || '').toLowerCase() === 'sweep';
   try {
     const { rows } = await pool.query(
       `UPDATE global_balance SET initial_usdc=$1, current_usdc=$1 WHERE id=1 RETURNING current_usdc`,
@@ -5768,7 +5772,21 @@ bot.onText(/\/resetpaper/, async (msg) => {
     const { rowCount: vistos } = await pool.query(
       `DELETE FROM seen_tokens WHERE token_mint NOT IN (SELECT token_mint FROM bot_positions)`
     );
+    // /resetpaper sweep: tambien deja en cero el total retirado del /sweep
+    // (vive en su propia tabla, por eso el reset normal no lo toca).
+    let sweepReiniciado = false;
+    if (incluirSweep) {
+      try {
+        await pool.query('UPDATE bot_sweep SET total_enviado_usd=0 WHERE id=1');
+        sweepReiniciado = true;
+      } catch (e) {
+        log('warn', `No se pudo reiniciar el total de /sweep: ${e.message}`);
+      }
+    }
     const saldo = Number(rows[0]?.current_usdc ?? INITIAL_PAPER_BALANCE);
+    if (sweepReiniciado && CHAT_ID) {
+      bot.sendMessage(msg.chat.id, '💸 Total retirado de /sweep reiniciado a $0');
+    }
     bot.sendMessage(
       msg.chat.id,
       `♻️ PAPER reiniciado de cero:\n💰 Balance: $${saldo.toFixed(2)}\n📉 Posiciones borradas: ${pos}\n📜 Historial borrado: ${hist}\n🧹 Seen tokens limpiados: ${vistos}`
