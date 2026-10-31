@@ -1629,6 +1629,17 @@ async function parsearTransaccionViaHeliusAPI(signature) {
 // "compra" con el SOL DEL PAGADOR. Regla: sólo hay compra/venta copiable si la
 // wallet movió SU propio SOL o USDC en esa misma tx.
 const MIN_PAGO_PROPIO_SOL = parseFloat(process.env.MIN_PAGO_PROPIO_SOL || '0.005');
+// Una compra copiable exige que la wallet haya pagado una parte sustancial del
+// valor de lo que recibio. Visto en produccion: Bestcook "compro" AAPLx pagando
+// 0.25 USDC por ~$3.70 de acciones (7% del valor) — eso es una RECEPCION donde
+// pago otro (relayer de la app / bundle), no una compra suya.
+const MIN_PAGO_VS_MERCADO = parseFloat(process.env.MIN_PAGO_VS_MERCADO || '0.30');
+
+// true = la wallet pago demasiado poco respecto al mercado -> no es su compra.
+function esPagoInsuficiente(precioTrade, precioMercado, minimo = MIN_PAGO_VS_MERCADO) {
+  if (!(Number(precioTrade) > 0) || !(Number(precioMercado) > 0)) return false;
+  return Number(precioTrade) / Number(precioMercado) < Number(minimo);
+}
 const USDC_ATRIB_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_ATRIB_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
@@ -4162,6 +4173,23 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
     }
   } catch (e) {
     log('warn', `No se pudo obtener precio de DexScreener para ${symbol}: ${e.message}`);
+  }
+
+  // Recepciones: si el precio implicito del "trade" es una fraccion del precio
+  // de mercado, la wallet no compro: recibio tokens pagados por otro.
+  if (
+    precioDex &&
+    precioDex.precioSol > 0 &&
+    precioTrade &&
+    esPagoInsuficiente(precioTrade, precioDex.precioSol)
+  ) {
+    log(
+      'info',
+      `${tracked.alias} ${trade.mint.slice(0, 6)}... pago ${((precioTrade / precioDex.precioSol) * 100).toFixed(
+        1
+      )}% del valor recibido — recepcion/relay, no se copia`
+    );
+    return;
   }
 
   if (precioTrade) {
