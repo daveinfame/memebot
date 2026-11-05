@@ -1242,6 +1242,9 @@ async function initDB() {
     );
     // Retiro de ganancias: base/monto/estado (configurable por /sweep)
     await pool.query(
+      `CREATE TABLE IF NOT EXISTS bot_metricas_eventos (fecha DATE, alias TEXT, eventos INT DEFAULT 0, PRIMARY KEY (fecha, alias))`
+    );
+    await pool.query(
       `CREATE TABLE IF NOT EXISTS bot_sweep (id INT PRIMARY KEY, activo BOOLEAN DEFAULT TRUE, base_usd REAL DEFAULT 100, monto_usd REAL DEFAULT 20, total_enviado_usd REAL DEFAULT 0, ultimo_envio TIMESTAMPTZ)`
     );
     await pool.query(
@@ -1355,7 +1358,7 @@ async function adjustPaperBalance(deltaUsd) {
   try {
     const { rows } = await pool.query(
       `UPDATE global_balance
-       SET current_usdc = COALESCE(current_usdc, $2) + $1
+       SET current_usdc = GREATEST(0, COALESCE(current_usdc, $2) + $1)
        WHERE id=1
        RETURNING current_usdc`,
       [deltaUsd, INITIAL_PAPER_BALANCE]
@@ -1474,6 +1477,23 @@ function extraerTxDeRespuestaParsedEvents(data) {
 
 // Parsea una transacción vía Helius Parsed Events API.
 // Devuelve { direction, mint, solAmount, tokenAmount, protocol } o null si falla.
+// Cuenta eventos de webhook por wallet: sirve para saber cual consume los
+// creditos de Helius (el cobro es POR EVENTO entregado, no por webhook).
+async function registrarEventosWallet(aliases) {
+  if (!Array.isArray(aliases) || aliases.length === 0) return;
+  try {
+    for (const alias of new Set(aliases)) {
+      await pool.query(
+        `INSERT INTO bot_metricas_eventos (fecha, alias, eventos) VALUES (CURRENT_DATE, $1, 1)
+         ON CONFLICT (fecha, alias) DO UPDATE SET eventos = bot_metricas_eventos.eventos + 1`,
+        [alias]
+      );
+    }
+  } catch (e) {
+    log('debug', `metricas: no se pudo registrar (${e.message})`);
+  }
+}
+
 async function parsearTransaccionViaHeliusAPI(signature) {
   if (!signature || typeof signature !== 'string') return null;
 
@@ -1634,6 +1654,21 @@ const MIN_PAGO_PROPIO_SOL = parseFloat(process.env.MIN_PAGO_PROPIO_SOL || '0.005
 // 0.25 USDC por ~$3.70 de acciones (7% del valor) — eso es una RECEPCION donde
 // pago otro (relayer de la app / bundle), no una compra suya.
 const MIN_PAGO_VS_MERCADO = parseFloat(process.env.MIN_PAGO_VS_MERCADO || '0.30');
+// Aviso (maximo 1 cada 30 min) cuando el bot deja de copiar por falta de caja.
+let ultimoAvisoSinCaja = 0;
+
+// Caja en PAPER: un saldo negativo cuenta como cero (nunca se copia en descubierto).
+function cajaNeta(valor) {
+  const n = Number(valor);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// true = alcanza para pagar la copia.
+function cajaAlcanza(caja, costo) {
+  const c = Number(costo);
+  if (!Number.isFinite(c) || c <= 0) return true;
+  return cajaNeta(caja) >= c;
+}
 
 // true = la wallet pago demasiado poco respecto al mercado -> no es su compra.
 function esPagoInsuficiente(precioTrade, precioMercado, minimo = MIN_PAGO_VS_MERCADO) {
@@ -2392,6 +2427,8 @@ async function procesarWebhookHelius(rawBody) {
     const walletsInvolucradas = cuentasDetectadas
       .filter((a) => trackedMap.has(a))
       .map((a) => trackedMap.get(a).alias);
+
+    await registrarEventosWallet(walletsInvolucradas);
 
     log(
       'info',
@@ -4308,6 +4345,31 @@ async function handleTrackedBuy(tracked, trade, origen = 'PumpPortal', horaDetec
       }
     }
   } else {
+    // CAJA (PAPER): sin dinero no se copia. Las posiciones abiertas NO son caja:
+    // su valor entra al saldo hasta que se cierran. Asi el saldo nunca queda
+    // negativo (antes seguia copiando en -7.09).
+    const costoEstimadoUsd = solPrice ? amountSol * solPrice : tracked.amount;
+    const { rows: filaCaja } = await pool.query('SELECT current_usdc FROM global_balance WHERE id=1');
+    const cajaDisponible = cajaNeta(filaCaja && filaCaja[0] && filaCaja[0].current_usdc);
+    if (!cajaAlcanza(cajaDisponible, costoEstimadoUsd)) {
+      log(
+        'info',
+        `🚫 ${tracked.alias} ${trade.mint.slice(0, 6)}... sin caja ($${cajaDisponible.toFixed(2)} < $${costoEstimadoUsd.toFixed(
+          2
+        )}) — no se copia`
+      );
+      if (CHAT_ID && Date.now() - ultimoAvisoSinCaja > 30 * 60 * 1000) {
+        ultimoAvisoSinCaja = Date.now();
+        bot.sendMessage(
+          CHAT_ID,
+          `Sin caja para copiar: $${cajaDisponible.toFixed(2)} disponibles (necesita ~$${costoEstimadoUsd.toFixed(
+            2
+          )}). Se reanuda cuando cierren las posiciones abiertas.`
+        );
+      }
+      return;
+    }
+
     await pool.query(
       'INSERT INTO bot_positions (token_mint,symbol,chain,amount,cost_basis_sol,wallet_alias,modo,origen_dex,precio_compra_native,pair_address) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
       [trade.mint, symbol, tracked.chain, tokensBought, amountSol, tracked.alias, MODO_ACTUAL, origenDex, precioCompraNative, pairAddress]
@@ -5784,6 +5846,36 @@ bot.onText(/\/logs(?:\s+(\d+))?/, async (msg, match) => {
     } catch (e) {
       log('warn', `No se pudo enviar un bloque de /logs: ${e.message}`);
     }
+  }
+});
+
+bot.onText(/\/metricas(?:\s+(\d+))?/, async (msg, match) => {
+  if (!esAdmin(msg)) return;
+  const dias = Math.min(30, Math.max(1, parseInt((match && match[1]) || '1', 10)));
+  try {
+    const { rows } = await pool.query(
+      `SELECT alias, SUM(eventos)::int AS eventos FROM bot_metricas_eventos
+        WHERE fecha >= CURRENT_DATE - ($1::int - 1)
+        GROUP BY alias ORDER BY eventos DESC`,
+      [dias]
+    );
+    if (rows.length === 0) {
+      bot.sendMessage(msg.chat.id, 'Sin eventos registrados todavía.');
+      return;
+    }
+    const total = rows.reduce((s, r) => s + Number(r.eventos), 0);
+    const lineas = rows.map((r, i) => {
+      const pct = total > 0 ? ((Number(r.eventos) / total) * 100).toFixed(1) : '0.0';
+      return `${i + 1}. ${r.alias}: ${Number(r.eventos).toLocaleString('en-US')} (${pct}%)`;
+    });
+    bot.sendMessage(
+      msg.chat.id,
+      `Eventos de webhook por wallet (últimos ${dias} día(s))\nTotal: ${total.toLocaleString(
+        'en-US'
+      )}\n\n${lineas.join('\n')}\n\n1 evento = 1 crédito de Helius`
+    );
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `Error leyendo métricas: ${e.message}`);
   }
 });
 
