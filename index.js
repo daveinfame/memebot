@@ -121,6 +121,20 @@ const OVERHEAD_RED_SOL = NETWORK_FEE_SOL + RENT_CUENTA_NUEVA_SOL;
 const CONFIRMACIONES_NECESARIAS = parseInt(process.env.CONFIRMACIONES_NECESARIAS || '2', 10);
 const ESPERA_LECTURA_SALDO_MS = parseInt(process.env.ESPERA_LECTURA_SALDO_MS || '1500', 10);
 const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '0.50');
+// Caida violenta: si el precio cae >=25% en <=3 min, se vende sin esperar el
+// -50%. El SL por umbral revisaba cada 60 s y en memecoins eso es una eternidad:
+// se disparaba en -50% pero salia en -60/-70% porque el precio seguia cayendo.
+const CAIDA_VIOLENTA_PCT = parseFloat(process.env.CAIDA_VIOLENTA_PCT || '0.25');
+const CAIDA_VENTANA_MS = 180_000;
+// Ultimo precio visto por token (para detectar el desplome entre ciclos).
+const preciosRecientes = new Map();
+
+function esCaidaViolenta(precioPrevio, precioActual, minimo = CAIDA_VIOLENTA_PCT) {
+  const a = Number(precioPrevio);
+  const b = Number(precioActual);
+  if (!(a > 0) || !(b > 0)) return false;
+  return b <= a * (1 - Number(minimo));
+}
 const RETRASO_AVISO_MS = parseInt(process.env.RETRASO_AVISO_MS || '10000', 10);
 const JUPITER_TIMEOUT_MS = parseInt(process.env.JUPITER_TIMEOUT_MS || '8000', 10);
 const JUPITER_MAX_INTENTOS = parseInt(process.env.JUPITER_MAX_INTENTOS || '3', 10);
@@ -1479,6 +1493,21 @@ function extraerTxDeRespuestaParsedEvents(data) {
 // Devuelve { direction, mint, solAmount, tokenAmount, protocol } o null si falla.
 // Cuenta eventos de webhook por wallet: sirve para saber cual consume los
 // creditos de Helius (el cobro es POR EVENTO entregado, no por webhook).
+// Cuenta TODAS las entregas del webhook (lo que Helius cobra), incluidas las
+// que el bot descarta. Va con alias reservado __entregas.
+async function registrarEntregas(n) {
+  if (!(n > 0)) return;
+  try {
+    await pool.query(
+      `INSERT INTO bot_metricas_eventos (fecha, alias, eventos) VALUES (CURRENT_DATE, '__entregas', $1)
+       ON CONFLICT (fecha, alias) DO UPDATE SET eventos = bot_metricas_eventos.eventos + $1`,
+      [n]
+    );
+  } catch (e) {
+    log('debug', `entregas: no se pudo registrar (${e.message})`);
+  }
+}
+
 async function registrarEventosWallet(aliases) {
   if (!Array.isArray(aliases) || aliases.length === 0) return;
   try {
@@ -2168,7 +2197,7 @@ function iniciarServidorWebhook() {
     const ip = req.socket.remoteAddress || 'unknown';
     const ahora = Date.now();
     const timestamps = (webhookRateMap.get(ip) || []).filter((t) => ahora - t < 1000);
-    if (timestamps.length >= 10) {
+    if (timestamps.length >= 200) {
       res.writeHead(429, { 'Content-Type': 'text/plain' });
       res.end('Too Many Requests');
       return;
@@ -2325,6 +2354,15 @@ function logRawTxCompacto(tx) {
 // ---------- Procesar webhook de Helius ----------
 async function procesarWebhookHelius(rawBody) {
   log('info', `📨 Webhook Helius recibido: ${rawBody.length} bytes`);
+
+  // Cada entrega cuesta 1 credito, se use o no. Se cuenta aparte para comparar
+  // con el panel de Helius y detectar duplicados o reintentos.
+  try {
+    const cuantos = JSON.parse(rawBody).length;
+    if (cuantos > 0) await registrarEntregas(cuantos);
+  } catch (e) {
+    /* el JSON se valida mas abajo */
+  }
 
   let eventos;
   try {
@@ -3726,6 +3764,28 @@ async function revisarStopLoss() {
       if (resultado.valorSol === null) {
         log('warn', `Sin precio para ${pos.symbol} (${resultado.error}). Saltando en este ciclo.`);
         return;
+      }
+
+      // --- Caida violenta (se evalua antes del umbral de -50%) ---
+      const precioUnit =
+        Number(resultado.precioSolUnitario) > 0
+          ? Number(resultado.precioSolUnitario)
+          : Number(resultado.valorSol) / Number(pos.amount || 1);
+      const previo = preciosRecientes.get(pos.token_mint);
+      preciosRecientes.set(pos.token_mint, { precio: precioUnit, ts: Date.now() });
+      if (previo && precioUnit > 0 && Date.now() - previo.ts <= CAIDA_VENTANA_MS) {
+        if (esCaidaViolenta(previo.precio, precioUnit)) {
+          const caida = ((previo.precio - precioUnit) / previo.precio) * 100;
+          log(
+            'warn',
+            `⚡ CAIDA VIOLENTA: ${pos.wallet_alias} ${pos.symbol} · -${caida.toFixed(1)}% en ${(
+              (Date.now() - previo.ts) /
+              1000
+            ).toFixed(0)}s → se vende ya (sin esperar el -${(STOP_LOSS_PCT * 100).toFixed(0)}%)`
+          );
+          await ejecutarStopLoss(pos, resultado);
+          return;
+        }
       }
 
       const ratio = resultado.valorSol / pos.cost_basis_sol;
@@ -5866,7 +5926,8 @@ bot.onText(/\/metricas(?:\s+(\d+))?/, async (msg, match) => {
     const total = rows.reduce((s, r) => s + Number(r.eventos), 0);
     const lineas = rows.map((r, i) => {
       const pct = total > 0 ? ((Number(r.eventos) / total) * 100).toFixed(1) : '0.0';
-      return `${i + 1}. ${r.alias}: ${Number(r.eventos).toLocaleString('en-US')} (${pct}%)`;
+      const nombre = r.alias === '__entregas' ? 'ENTREGAS COBRADAS' : r.alias;
+      return `${i + 1}. ${nombre}: ${Number(r.eventos).toLocaleString('en-US')} (${pct}%)`;
     });
     bot.sendMessage(
       msg.chat.id,
@@ -5953,7 +6014,7 @@ setInterval(() => {
 // no se puedan valorar por la tx se cierran por aquí, y cada minuto cuenta en
 // estos tokens. El doble cierre está cubierto por el reclamo atómico.
   intervals.push(setInterval(reconciliarPosiciones, 20_000));
-  intervals.push(setInterval(revisarStopLoss, 60_000));
+  intervals.push(setInterval(revisarStopLoss, 15_000));
   intervals.push(setInterval(monitoreoAutomaticoWebhook, 600_000));
   intervals.push(setInterval(detectarVentasManuales, 120_000));
 
